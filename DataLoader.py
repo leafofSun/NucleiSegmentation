@@ -83,7 +83,28 @@ class TestingDataset(Dataset):
             except Exception as e:
                 print(f"警告: 无法加载属性信息文件 {attribute_info_path}: {e}")
 
-        json_file = open(os.path.join(data_path, f'image2label_{mode}.json'), "r")
+        # 处理 data_path：如果是相对路径且包含项目名，需要修正
+        # 例如：如果 data_path 是 "SAM-Med2D-main/data/cpm17"，但当前目录已经是 SAM-Med2D-main
+        # 则需要去掉重复的 "SAM-Med2D-main" 前缀
+        if not os.path.isabs(data_path):
+            # 获取当前工作目录的绝对路径
+            current_dir = os.path.abspath(os.getcwd())
+            # 如果 data_path 以项目名开头，但当前目录已经包含项目名，则去掉重复部分
+            if 'SAM-Med2D-main' in data_path and 'SAM-Med2D-main' in current_dir:
+                # 找到 data_path 中 "SAM-Med2D-main" 之后的部分
+                parts = data_path.split('SAM-Med2D-main/')
+                if len(parts) > 1:
+                    data_path = parts[-1]  # 取最后一部分，例如 "data/cpm17"
+        
+        json_file_path = os.path.join(data_path, f'image2label_{mode}.json')
+        if not os.path.exists(json_file_path):
+            raise FileNotFoundError(
+                f"找不到数据文件: {json_file_path}\n"
+                f"请检查 data_path 是否正确。当前 data_path: {data_path}\n"
+                f"当前工作目录: {os.getcwd()}\n"
+                f"尝试的完整路径: {os.path.abspath(json_file_path)}"
+            )
+        json_file = open(json_file_path, "r")
         dataset = json.load(json_file)
         
         # 将 JSON 中的路径从 data_demo 转换为实际的数据目录路径
@@ -138,8 +159,10 @@ class TestingDataset(Dataset):
             if mask is None:
                 raise ValueError(f"无法读取掩码文件: {mask_path}")
             
-            if mask.max() == 255:
-                mask = mask / 255
+            # 修复：无论 mask 的最大值是多少，都将其转换为二值 mask (0 或 1)
+            # 这是因为 CPM17 等数据集可能使用 Instance Mask（每个细胞核有不同的像素值，如 1, 2, 3, ... N）
+            # 对于二类分割任务，我们需要将所有非0值都转为1
+            mask = (mask > 0).astype(np.float32)
             
             # 合并所有mask（使用逻辑或操作）
             if ori_np_mask is None:
@@ -325,8 +348,10 @@ class TrainingDataset(Dataset):
             pre_mask = cv2.imread(m, 0)
             if pre_mask is None:
                 raise ValueError(f"无法读取掩码文件: {m}")
-            if pre_mask.max() == 255:
-                pre_mask = pre_mask / 255
+            # 修复：无论 mask 的最大值是多少，都将其转换为二值 mask (0 或 1)
+            # 这是因为 CPM17 等数据集可能使用 Instance Mask（每个细胞核有不同的像素值）
+            # 对于二类分割任务，我们需要将所有非0值都转为1
+            pre_mask = (pre_mask > 0).astype(np.float32)
 
             augments = transforms(image=image, mask=pre_mask)
             image_tensor, mask_tensor = augments['image'], augments['mask'].to(torch.int64)
