@@ -70,12 +70,16 @@ class PromptEncoder(nn.Module):
         self.no_mask_embed = nn.Embedding(1, embed_dim)
         
         # --- 新增：文本特征投影层 ---
-        # 将 CLIP/CoOp 的文本特征维度映射到 SAM 的 embed_dim (256)
-        # 如果提供了 text_embed_dim，则创建投影层；否则设为 None，在 forward 中动态创建
+        # 将 CLIP/CoOp/PNuRL 的文本特征维度映射到 SAM 的 embed_dim (256)
+        # 如果提供了 text_embed_dim，则创建投影层；否则创建一个可扩展的投影层
+        # 注意：不能在 forward 中动态创建，否则优化器无法更新参数
         if text_embed_dim is not None:
             self.text_projection = nn.Linear(text_embed_dim, embed_dim)
         else:
+            # 默认使用 256 作为输入维度（PNuRL 的 learnable_context 是 [B, 256]）
+            # 如果后续需要其他维度，会在 Sam.__init__ 中更新
             self.text_projection = None
+            self._text_proj_dim = None  # 记录当前投影层的输入维度
         
         # 多模态提示编码器（使用SAM ViT）
         if use_multimodal_prompt:
@@ -218,17 +222,25 @@ class PromptEncoder(nn.Module):
         # --- 新增：处理文本嵌入（来自 CoOp/PNuRL）---
         if text_embeddings is not None:
             # text_embeddings shape 假设为 [B, L, C] 或 [B, C]
-            # L 是文本 token 长度，C 是 CLIP 维度
+            # L 是文本 token 长度，C 是 CLIP 维度或 PNuRL 的 feat_dim (256)
             if text_embeddings.dim() == 2:
                 text_embeddings = text_embeddings.unsqueeze(1)  # [B, 1, C]
             
             # 获取文本维度
             text_dim = text_embeddings.shape[-1]
             
-            # 如果投影层不存在或维度不匹配，动态创建
-            if self.text_projection is None or self.text_projection.in_features != text_dim:
-                device = text_embeddings.device
-                self.text_projection = nn.Linear(text_dim, self.embed_dim).to(device)
+            # 如果投影层不存在或维度不匹配，抛出错误（应该在初始化时创建）
+            # 这确保优化器能够正确跟踪参数
+            if self.text_projection is None:
+                raise RuntimeError(
+                    f"text_projection 未初始化！请在 Sam.__init__ 中初始化，或通过 PromptEncoder.__init__ 的 text_embed_dim 参数初始化。"
+                    f"当前 text_embeddings 维度: {text_dim}"
+                )
+            if self.text_projection.in_features != text_dim:
+                raise RuntimeError(
+                    f"text_projection 输入维度不匹配！期望 {self.text_projection.in_features}，但得到 {text_dim}。"
+                    f"请在初始化时正确设置 text_embed_dim 参数。"
+                )
             
             # 投影到 SAM 维度
             text_embeddings_proj = self.text_projection(text_embeddings)  # [B, L, embed_dim]
