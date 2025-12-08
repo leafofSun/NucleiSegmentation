@@ -112,7 +112,15 @@ def postprocess_masks(low_res_masks, image_size, original_size):
     return masks, pad
 
 
-def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings):
+def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_embeddings=None):
+    """
+    Args:
+        args: 测试参数
+        batched_input: 批次输入数据
+        ddp_model: SAM 模型
+        image_embeddings: 图像嵌入特征
+        text_embeddings: 文本嵌入（来自 PNuRL 的 learnable_context），shape: [B, feat_dim] 或 [B, 1, feat_dim]
+    """
     if  batched_input["point_coords"] is not None:
         points = (batched_input["point_coords"], batched_input["point_labels"])
     else:
@@ -123,6 +131,7 @@ def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings):
             points=points,
             boxes=batched_input.get("boxes", None),
             masks=batched_input.get("mask_inputs", None),
+            text_embeddings=text_embeddings,  # 传递文本嵌入
         )
 
         low_res_masks, iou_predictions = ddp_model.mask_decoder(
@@ -221,11 +230,12 @@ def main(args):
             image_embeddings = model.image_encoder(batched_input["image"])
             
             # 如果使用PNuRL，对图像特征进行加权
+            pnurl_context = None
             if args.use_pnurl:
                 attribute_prompts = batched_input.get("attribute_prompts", None)
                 # 测试时不需要计算损失，所以不传入attribute_labels
                 if attribute_prompts is not None:
-                    weighted_image_embeddings, _, _, _ = model.pnurl(
+                    weighted_image_embeddings, pnurl_context, _, _ = model.pnurl(
                         image_features=image_embeddings,
                         attribute_prompts=attribute_prompts,
                         attribute_labels=None,
@@ -234,10 +244,19 @@ def main(args):
                     # 使用加权后的ViT特征
                     image_embeddings = weighted_image_embeddings
 
+        # 处理 pnurl_context 为 text_embeddings 格式
+        text_embeddings_input = None
+        if pnurl_context is not None:
+            # pnurl_context shape: [B, feat_dim] -> [B, 1, feat_dim] 以匹配 sparse_embeddings 格式
+            text_embeddings_input = pnurl_context.unsqueeze(1)
+        
         if args.boxes_prompt:
             save_path = os.path.join(args.work_dir, args.run_name, "boxes_prompt")
             batched_input["point_coords"], batched_input["point_labels"] = None, None
-            masks, low_res_masks, iou_predictions = prompt_and_decoder(args, batched_input, model, image_embeddings)
+            masks, low_res_masks, iou_predictions = prompt_and_decoder(
+                args, batched_input, model, image_embeddings, 
+                text_embeddings=text_embeddings_input  # 传递 PNuRL 的文本提示
+            )
             points_show = None
 
         else:
@@ -246,7 +265,10 @@ def main(args):
             point_coords, point_labels = [batched_input["point_coords"]], [batched_input["point_labels"]]
      
             for iter_idx in range(args.iter_point):
-                masks, low_res_masks, iou_predictions = prompt_and_decoder(args, batched_input, model, image_embeddings)
+                masks, low_res_masks, iou_predictions = prompt_and_decoder(
+                    args, batched_input, model, image_embeddings,
+                    text_embeddings=text_embeddings_input  # 传递 PNuRL 的文本提示
+                )
                 if iter_idx != args.iter_point-1:
                     batched_input = generate_point(masks, labels, low_res_masks, batched_input, args.point_num)
                     batched_input = to_device(batched_input, args.device)

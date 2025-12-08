@@ -8,11 +8,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
+from .pnurl import PNuRL
 
 
 class Sam(nn.Module):
@@ -26,6 +27,10 @@ class Sam(nn.Module):
         mask_decoder: MaskDecoder,
         pixel_mean: List[float] = [123.675, 116.28, 103.53],
         pixel_std: List[float] = [58.395, 57.12, 57.375],
+        use_pnurl: bool = False,
+        pnurl_config: Optional[Dict[str, Any]] = None,
+        use_coop_prompt: bool = False,
+        coop_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         SAM predicts object masks from an image and input prompts.
@@ -43,8 +48,26 @@ class Sam(nn.Module):
         self.image_encoder = image_encoder
         self.prompt_encoder = prompt_encoder
         self.mask_decoder = mask_decoder
+        self.use_pnurl = use_pnurl
+        self.use_coop_prompt = use_coop_prompt
         self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
+        
+        # 初始化 PNuRL 模块
+        if self.use_pnurl and pnurl_config is not None:
+            # PNuRL 期望的 feat_dim 通常为 256 (与 prompt_encoder.embed_dim 一致)
+            self.pnurl = PNuRL(
+                feat_dim=prompt_encoder.embed_dim,
+                embed_dim=prompt_encoder.embed_dim,
+                clip_model_path=pnurl_config.get('clip_model_path'),
+                num_classes_per_attr=pnurl_config.get('num_classes_per_attr', [3, 5, 4, 3, 3]),
+                attr_loss_weight=pnurl_config.get('attr_loss_weight', 1.0)
+            )
+            # 初始化 prompt_encoder 的 text_projection（用于 PNuRL 的 learnable_context）
+            if self.prompt_encoder.text_projection is None:
+                self.prompt_encoder.text_projection = nn.Linear(prompt_encoder.embed_dim, prompt_encoder.embed_dim)
+        else:
+            self.pnurl = None
 
     @property
     def device(self) -> Any:
