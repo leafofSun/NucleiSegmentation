@@ -74,6 +74,12 @@ class Sam(nn.Module):
                 num_classes_per_attr=pnurl_config.get('num_classes_per_attr', [3, 5, 4, 3, 3]),
                 attr_loss_weight=pnurl_config.get('attr_loss_weight', 1.0),
             )
+            
+            # 初始化 prompt_encoder 的 text_projection（用于 PNuRL 的 learnable_context）
+            # PNuRL 的 learnable_context 输出维度是 feat_dim (通常是 256)
+            if self.prompt_encoder.text_projection is None:
+                self.prompt_encoder.text_projection = nn.Linear(feat_dim, self.prompt_encoder.embed_dim)
+                print(f"✓ 已初始化 PromptEncoder.text_projection 用于 PNuRL (输入维度: {feat_dim})")
         else:
             self.pnurl = None
         

@@ -85,7 +85,16 @@ def to_device(batch_input, device):
     return device_input
 
 
-def prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_iter = False):
+def prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_iter = False, text_embeddings = None):
+    """
+    Args:
+        args: 训练参数
+        batched_input: 批次输入数据
+        model: SAM 模型
+        image_embeddings: 图像嵌入特征
+        decoder_iter: 是否为 decoder 迭代模式
+        text_embeddings: 文本嵌入（来自 PNuRL 的 learnable_context），shape: [B, feat_dim] 或 [B, 1, feat_dim]
+    """
     if  batched_input["point_coords"] is not None:
         points = (batched_input["point_coords"], batched_input["point_labels"])
     else:
@@ -97,6 +106,7 @@ def prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_ite
                 points=points,
                 boxes=batched_input.get("boxes", None),
                 masks=batched_input.get("mask_inputs", None),
+                text_embeddings=text_embeddings,  # 传递文本嵌入
             )
 
     else:
@@ -104,6 +114,7 @@ def prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_ite
             points=points,
             boxes=batched_input.get("boxes", None),
             masks=batched_input.get("mask_inputs", None),
+            text_embeddings=text_embeddings,  # 传递文本嵌入
         )
 
     low_res_masks, iou_predictions = model.mask_decoder(
@@ -157,6 +168,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
             image_embeddings = model.image_encoder(batched_input["image"])
         
         # 如果使用PNuRL，PNuRL会对ViT图像特征进行加权
+        pnurl_context = None  # 初始化，确保后续可以使用
         if args.use_pnurl:
             # PNuRL处理：使用属性提示词对ViT特征进行加权
             attribute_prompts = batched_input.get("attribute_prompts", None)
@@ -184,7 +196,25 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
             image_embeddings_repeat.append(image_embed)
         image_embeddings = torch.cat(image_embeddings_repeat, dim=0)
         
-        masks, low_res_masks, iou_predictions = prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_iter = False)
+        # 如果使用PNuRL，需要将 pnurl_context 也扩展到相同的 batch 大小
+        # pnurl_context shape: [B, feat_dim] -> [B * mask_num, feat_dim]
+        text_embeddings_for_prompt = None
+        if args.use_pnurl and pnurl_context is not None:
+            B_original = pnurl_context.shape[0]  # 原始 batch size
+            text_embeddings_repeat = []
+            for i in range(B_original):
+                text_embed = pnurl_context[i]  # [feat_dim]
+                text_embed = text_embed.repeat(args.mask_num, 1)  # [mask_num, feat_dim]
+                text_embeddings_repeat.append(text_embed)
+            text_embeddings_for_prompt = torch.cat(text_embeddings_repeat, dim=0)  # [B * mask_num, feat_dim]
+            # 添加一个维度以匹配 sparse_embeddings 的格式 [B * mask_num, 1, feat_dim]
+            text_embeddings_for_prompt = text_embeddings_for_prompt.unsqueeze(1)
+        
+        masks, low_res_masks, iou_predictions = prompt_and_decoder(
+            args, batched_input, model, image_embeddings, 
+            decoder_iter=False, 
+            text_embeddings=text_embeddings_for_prompt  # 传递 PNuRL 的文本提示
+        )
         
         loss = criterion(masks, labels, iou_predictions)
         if pnurl_loss is not None:
@@ -223,13 +253,23 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
             if iter == init_mask_num or iter == args.iter_point - 1:
                 batched_input = setting_prompt_none(batched_input)
 
+            # 在迭代过程中，也需要传递文本嵌入（如果使用PNuRL）
+            # 注意：在迭代过程中，image_embeddings 已经被扩展过了，所以 text_embeddings_for_prompt 也需要匹配
             if args.use_amp:
-                masks, low_res_masks, iou_predictions = prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_iter=True)
+                masks, low_res_masks, iou_predictions = prompt_and_decoder(
+                    args, batched_input, model, image_embeddings, 
+                    decoder_iter=True,
+                    text_embeddings=text_embeddings_for_prompt  # 传递 PNuRL 的文本提示
+                )
                 loss = criterion(masks, labels, iou_predictions)
                 with amp.scale_loss(loss,  optimizer) as scaled_loss:
                     scaled_loss.backward(retain_graph=True)
             else:
-                masks, low_res_masks, iou_predictions = prompt_and_decoder(args, batched_input, model, image_embeddings, decoder_iter=True)
+                masks, low_res_masks, iou_predictions = prompt_and_decoder(
+                    args, batched_input, model, image_embeddings, 
+                    decoder_iter=True,
+                    text_embeddings=text_embeddings_for_prompt  # 传递 PNuRL 的文本提示
+                )
                 loss = criterion(masks, labels, iou_predictions)
                 loss.backward(retain_graph=True)
                 
