@@ -186,7 +186,16 @@ class TestingDataset(Dataset):
         image, mask = augments['image'], augments['mask'].to(torch.int64)
 
         if self.prompt_path is None:
-            boxes = get_boxes_from_mask(mask, max_pixel = 0)
+            # 修复：先统计mask中的连通区域数量，然后设置 box_num 为实际数量（但不超过合理上限）
+            # 这样可以避免生成过多不必要的框，同时确保获取所有细胞核
+            from skimage.measure import label, regionprops
+            label_img = label(mask.numpy() if isinstance(mask, torch.Tensor) else mask)
+            regions = regionprops(label_img)
+            num_regions = len(regions)
+            # 设置一个合理的上限（例如500），但使用实际数量
+            # 根据CPM17数据集，每个图像通常有45-202个细胞核，所以500是一个安全的上限
+            box_num = min(num_regions, 500) if num_regions > 0 else 1
+            boxes = get_boxes_from_mask(mask, box_num=box_num, max_pixel=0)
             point_coords, point_labels = init_point_sampling(mask, self.point_num)
         else:
             # 使用第一张图片的路径作为prompt key
@@ -210,7 +219,13 @@ class TestingDataset(Dataset):
             else:
                 # JSON 文件中没有 prompt 数据，从 mask 生成
                 # 这通常发生在 JSON 文件只包含属性信息（如 global_label）时
-                boxes = get_boxes_from_mask(mask, max_pixel = 0)
+                # 修复：先统计mask中的连通区域数量，然后设置 box_num 为实际数量（但不超过合理上限）
+                from skimage.measure import label, regionprops
+                label_img = label(mask.numpy() if isinstance(mask, torch.Tensor) else mask)
+                regions = regionprops(label_img)
+                num_regions = len(regions)
+                box_num = min(num_regions, 500) if num_regions > 0 else 1
+                boxes = get_boxes_from_mask(mask, box_num=box_num, max_pixel=0)
                 point_coords, point_labels = init_point_sampling(mask, self.point_num)
                 if prompt_data is None:
                     print(f"警告: 在 prompt_list 中未找到图片 {prompt_key} 的 prompt 数据，将从 mask 生成")

@@ -126,10 +126,40 @@ def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_em
     else:
         points = None
 
+    # 修复：处理多个框的情况
+    # 如果 boxes 的形状是 [1, N, 4]，需要 reshape 为 [N, 4] 以便 prompt_encoder 正确处理
+    boxes = batched_input.get("boxes", None)
+    num_boxes = 1  # 默认 batch size
+    if boxes is not None:
+        if len(boxes.shape) == 3 and boxes.shape[0] == 1:
+            # [1, N, 4] -> [N, 4]
+            num_boxes = boxes.shape[1]
+            boxes = boxes.squeeze(0)
+        elif len(boxes.shape) == 2:
+            # [N, 4] 已经是正确格式
+            num_boxes = boxes.shape[0]
+        else:
+            # 其他情况，尝试 flatten
+            boxes = boxes.reshape(-1, 4)
+            num_boxes = boxes.shape[0]
+    
+    # 如果有多于1个框，需要扩展 image_embeddings 以匹配 batch size
+    if num_boxes > 1:
+        # image_embeddings: [1, C, H, W] -> [N, C, H, W]
+        image_embeddings = image_embeddings.repeat(num_boxes, 1, 1, 1)
+        # text_embeddings 也需要扩展（如果存在）
+        if text_embeddings is not None:
+            if len(text_embeddings.shape) == 2:
+                # [1, feat_dim] -> [N, feat_dim]
+                text_embeddings = text_embeddings.repeat(num_boxes, 1)
+            elif len(text_embeddings.shape) == 3:
+                # [1, 1, feat_dim] -> [N, 1, feat_dim]
+                text_embeddings = text_embeddings.repeat(num_boxes, 1, 1)
+
     with torch.no_grad():
         sparse_embeddings, dense_embeddings = ddp_model.prompt_encoder(
             points=points,
-            boxes=batched_input.get("boxes", None),
+            boxes=boxes,  # 使用处理后的 boxes
             masks=batched_input.get("mask_inputs", None),
             text_embeddings=text_embeddings,  # 传递文本嵌入
         )
@@ -294,8 +324,21 @@ def main(args):
 
         # 后处理 masks：将低分辨率 masks 调整到原始图像尺寸
         masks, pad = postprocess_masks(low_res_masks, args.image_size, original_size)
+        
+        # ================== [新增修复] 合并多个 Prompt 的预测结果 ==================
+        # 如果输入有 N 个框，masks 的形状会是 [N, 1, H, W]
+        # 我们需要将其合并为 [1, 1, H, W] 才能和 ori_labels 对比
+        if masks.shape[0] > 1:
+            # 使用 max 进行合并 (逻辑或：只要有一个预测为前景，就认为是前景)
+            masks, _ = torch.max(masks, dim=0, keepdim=True)
+            
+            # 同时处理 iou_predictions：如果有多个，取最大值（表示最好的预测）
+            if iou_predictions is not None and iou_predictions.shape[0] > 1:
+                iou_predictions, _ = torch.max(iou_predictions, dim=0, keepdim=True)
+        
         if args.save_pred:
             save_masks(masks, save_path, img_name, args.image_size, original_size, pad, batched_input.get("boxes", None), points_show)
+        # ================== [结束修复] ==================
 
         # 确保ori_labels的形状与masks匹配：[B, 1, H, W]
         # ori_labels从DataLoader返回时是[1, H, W]，需要添加batch和channel维度
