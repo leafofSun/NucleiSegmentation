@@ -400,9 +400,13 @@ def stack_dict_batched(batched_input):
     out_dict = {}
     for k,v in batched_input.items():
         if isinstance(v, list):
-            # 对于文本提示和全局标签，保持列表格式
-            if k == 'text_prompts':
+            # 对于文本提示、属性提示和全局标签，保持列表格式
+            if k == 'text_prompts' or k == 'attribute_prompts':
                 # 如果每个样本都有文本提示列表，合并或保持
+                out_dict[k] = v
+            elif k == 'attribute_labels':
+                # attribute_labels 是列表的列表，每个元素是一个属性的标签列表
+                # 保持列表格式，不进行stack
                 out_dict[k] = v
             elif k == 'global_labels':
                 # 如果是全局标签列表，尝试stack成tensor
