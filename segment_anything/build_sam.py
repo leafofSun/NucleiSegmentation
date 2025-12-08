@@ -89,6 +89,10 @@ def _build_sam(
     image_size = image_size
     vit_patch_size = 16
     image_embedding_size = image_size // vit_patch_size
+    
+    # 确定 text_embed_dim：如果使用了 PNuRL，其输出维度通常与 embed_dim 一致 (256)
+    text_embed_dim = prompt_embed_dim if use_pnurl else None
+    
     sam = Sam(
         image_encoder=ImageEncoderViT(
             depth=encoder_depth,
@@ -113,6 +117,7 @@ def _build_sam(
             use_multimodal_prompt=use_multimodal_prompt,
             clip_model_path=clip_model_path,
             num_classes=num_classes,
+            text_embed_dim=text_embed_dim,  # 传入 text_embed_dim
         ),
         mask_decoder=MaskDecoder(
             num_multimask_outputs=3,
