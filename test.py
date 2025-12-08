@@ -163,6 +163,19 @@ def is_not_saved(save_path, mask_name):
 
 
 def main(args):
+    # 如果启用PNuRL，设置相关参数
+    if args.use_pnurl:
+        args.pnurl_config = {
+            'clip_model_path': args.pnurl_clip_path,
+            'num_classes_per_attr': args.pnurl_num_classes,
+            'attr_loss_weight': 1.0,  # 测试时不需要损失权重，但需要设置
+        }
+        print(f"启用PNuRL测试")
+        print(f"  - CLIP模型路径: {args.pnurl_clip_path}")
+        print(f"  - 属性类别数: {args.pnurl_num_classes}")
+    else:
+        args.pnurl_config = None
+    
     print('*'*100)
     for key, value in vars(args).items():
         print(key + ': ' + str(value))
@@ -170,19 +183,19 @@ def main(args):
 
     model = sam_model_registry[args.model_type](args).to(args.device) 
     
-    # 调试：检查模型是否加载了checkpoint
-    if args.sam_checkpoint and os.path.exists(args.sam_checkpoint):
-        print(f"\n[调试] 检查checkpoint加载:")
-        print(f"  Checkpoint路径: {args.sam_checkpoint}")
-        # 检查模型参数是否已更新（不是随机初始化）
-        first_param = next(iter(model.parameters()))
-        print(f"  模型第一个参数统计: mean={first_param.data.mean().item():.6f}, std={first_param.data.std().item():.6f}")
-        # 检查mask_decoder的输出层参数
-        if hasattr(model, 'mask_decoder'):
-            output_hypernetworks = model.mask_decoder.output_hypernetworks_mlps
-            if len(output_hypernetworks) > 0:
-                first_mlp_param = next(iter(output_hypernetworks[0].parameters()))
-                print(f"  Mask decoder输出层参数: mean={first_mlp_param.data.mean().item():.6f}, std={first_mlp_param.data.std().item():.6f}")
+    # # 调试：检查模型是否加载了checkpoint
+    # if args.sam_checkpoint and os.path.exists(args.sam_checkpoint):
+    #     print(f"\n[调试] 检查checkpoint加载:")
+    #     print(f"  Checkpoint路径: {args.sam_checkpoint}")
+    #     # 检查模型参数是否已更新（不是随机初始化）
+    #     first_param = next(iter(model.parameters()))
+    #     print(f"  模型第一个参数统计: mean={first_param.data.mean().item():.6f}, std={first_param.data.std().item():.6f}")
+    #     # 检查mask_decoder的输出层参数
+    #     if hasattr(model, 'mask_decoder'):
+    #         output_hypernetworks = model.mask_decoder.output_hypernetworks_mlps
+    #         if len(output_hypernetworks) > 0:
+    #             first_mlp_param = next(iter(output_hypernetworks[0].parameters()))
+    #             print(f"  Mask decoder输出层参数: mean={first_mlp_param.data.mean().item():.6f}, std={first_mlp_param.data.std().item():.6f}")
 
     criterion = FocalDiceloss_IoULoss()
     test_dataset = TestingDataset(
@@ -279,21 +292,7 @@ def main(args):
   
             points_show = (torch.concat(point_coords, dim=1), torch.concat(point_labels, dim=1))
 
-        # 调试信息：检查low_res_masks的值域（在postprocess之前）
-        if i == 0:  # 只打印第一张图片的信息
-            print(f"\n[调试] 图片: {img_name}")
-            print(f"  low_res_masks shape: {low_res_masks.shape}, min: {low_res_masks.min().item():.4f}, max: {low_res_masks.max().item():.4f}, mean: {low_res_masks.mean().item():.4f}")
-            print(f"  original_size: {original_size}")
-            # 检查prompt信息
-            if batched_input.get("boxes") is not None:
-                boxes = batched_input["boxes"]
-                print(f"  boxes: shape={boxes.shape}, min={boxes.min().item():.2f}, max={boxes.max().item():.2f}")
-            if batched_input.get("point_coords") is not None:
-                point_coords = batched_input["point_coords"]
-                print(f"  point_coords: shape={point_coords.shape}")
-            # 检查image_embeddings
-            print(f"  image_embeddings: shape={image_embeddings.shape}, min={image_embeddings.min().item():.4f}, max={image_embeddings.max().item():.4f}, mean={image_embeddings.mean().item():.4f}")
-        
+        # 后处理 masks：将低分辨率 masks 调整到原始图像尺寸
         masks, pad = postprocess_masks(low_res_masks, args.image_size, original_size)
         if args.save_pred:
             save_masks(masks, save_path, img_name, args.image_size, original_size, pad, batched_input.get("boxes", None), points_show)
@@ -307,22 +306,27 @@ def main(args):
             # [H, W] -> [1, 1, H, W]
             ori_labels = ori_labels.unsqueeze(0).unsqueeze(0)
         
-        # 调试信息：检查尺寸和值域（postprocess之后）
-        if i == 0:  # 只打印第一张图片的信息
-            print(f"  masks shape (postprocess后): {masks.shape}, min: {masks.min().item():.4f}, max: {masks.max().item():.4f}, mean: {masks.mean().item():.4f}")
-            print(f"  ori_labels shape: {ori_labels.shape}, min: {ori_labels.min().item():.4f}, max: {ori_labels.max().item():.4f}")
-            print(f"  original_size: {original_size}")
-            print(f"  iou_predictions: {iou_predictions.shape}, min: {iou_predictions.min().item():.4f}, max: {iou_predictions.max().item():.4f}")
-            # 检查masks的值域是否异常
-            if abs(masks.min().item()) > 50 or abs(masks.max().item()) > 50:
-                print(f"  ⚠️ masks值域异常大！可能是模型未正确加载或数据预处理问题")
-            if masks.shape != ori_labels.shape:
-                print(f"  ⚠️ 尺寸不匹配！需要调整")
-                # 如果尺寸不匹配，尝试调整
-                if masks.shape[2:] != ori_labels.shape[2:]:
-                    print(f"  尝试将ori_labels调整到masks的尺寸...")
-                    ori_labels = F.interpolate(ori_labels, size=masks.shape[2:], mode='nearest')
-                    print(f"  调整后 ori_labels shape: {ori_labels.shape}")
+        # 确保 masks 和 ori_labels 的空间尺寸匹配
+        if masks.shape[2:] != ori_labels.shape[2:]:
+            # 将 ori_labels 调整到 masks 的尺寸
+            ori_labels = F.interpolate(ori_labels, size=masks.shape[2:], mode='nearest')
+        
+        # ================== [开始] 标签值域检查和修复 ==================
+        # 调试：检查标签值域（只打印第一张图）
+        if i == 0:
+            print(f"\n[DEBUG] 标签值域检查: Image {img_name}")
+            print(f"  - ori_labels Min: {ori_labels.min().item():.4f}, Max: {ori_labels.max().item():.4f}")
+            print(f"  - masks (Pred) Min: {masks.min().item():.4f}, Max: {masks.max().item():.4f}")
+        
+        # 强制二值化修复：如果标签值大于 1，强制转为 0/1
+        # 这是因为 CPM17 等数据集可能使用 Instance Mask（每个细胞核有不同的像素值）
+        if ori_labels.max() > 1:
+            if i == 0:
+                print(f"  >>> 检测到标签值 > 1 (Max={ori_labels.max().item():.2f})，正在执行强制二值化 (Label > 0 -> 1)...")
+            ori_labels = (ori_labels > 0).float()
+            if i == 0:
+                print(f"  >>> 二值化后: Min={ori_labels.min().item():.4f}, Max={ori_labels.max().item():.4f}")
+        # ================== [结束] 标签值域检查和修复 ==================
         
         loss = criterion(masks, ori_labels, iou_predictions)
         test_loss.append(loss.item())
