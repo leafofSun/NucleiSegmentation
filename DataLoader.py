@@ -31,7 +31,38 @@ class TestingDataset(Dataset):
         self.image_size = image_size
         self.return_ori_mask = return_ori_mask
         self.prompt_path = prompt_path
-        self.prompt_list = {} if prompt_path is None else json.load(open(prompt_path, "r"))
+        # 加载 prompt_list，可能是字典或列表格式
+        if prompt_path is None:
+            self.prompt_list = {}
+            self.prompt_list_type = None
+        else:
+            loaded_data = json.load(open(prompt_path, "r"))
+            if isinstance(loaded_data, dict):
+                # 字典格式：{"image_name": {"boxes": [...], "point_coords": [...], ...}}
+                self.prompt_list = loaded_data
+                self.prompt_list_type = "dict"
+            elif isinstance(loaded_data, list):
+                # 列表格式：[{"id": "image_name", "boxes": [...], ...}, ...]
+                # 转换为字典格式以便快速查找
+                self.prompt_list = {}
+                self.prompt_list_type = "list"
+                for item in loaded_data:
+                    # 支持多种可能的键名
+                    if "id" in item:
+                        # id 可能是列表或字符串
+                        ids = item["id"] if isinstance(item["id"], list) else [item["id"]]
+                        for img_id in ids:
+                            # 移除可能的扩展名
+                            img_id = img_id.split('.')[0] if '.' in img_id else img_id
+                            self.prompt_list[img_id] = item
+                    elif "image_name" in item:
+                        img_id = item["image_name"]
+                        img_id = img_id.split('.')[0] if '.' in img_id else img_id
+                        self.prompt_list[img_id] = item
+            else:
+                self.prompt_list = {}
+                self.prompt_list_type = None
+                print(f"警告: prompt_path 文件格式不支持: {type(loaded_data)}")
         self.requires_name = requires_name
         self.point_num = point_num
         
@@ -137,9 +168,31 @@ class TestingDataset(Dataset):
         else:
             # 使用第一张图片的路径作为prompt key
             prompt_key = self.image_paths[index].split('/')[-1]
-            boxes = torch.as_tensor(self.prompt_list[prompt_key]["boxes"], dtype=torch.float)
-            point_coords = torch.as_tensor(self.prompt_list[prompt_key]["point_coords"], dtype=torch.float)
-            point_labels = torch.as_tensor(self.prompt_list[prompt_key]["point_labels"], dtype=torch.int)
+            # 移除可能的扩展名
+            prompt_key_no_ext = prompt_key.split('.')[0] if '.' in prompt_key else prompt_key
+            
+            # 尝试查找对应的 prompt 数据
+            prompt_data = None
+            if prompt_key_no_ext in self.prompt_list:
+                prompt_data = self.prompt_list[prompt_key_no_ext]
+            elif prompt_key in self.prompt_list:
+                prompt_data = self.prompt_list[prompt_key]
+            
+            # 检查是否有 boxes、point_coords、point_labels 字段
+            if prompt_data is not None and "boxes" in prompt_data and "point_coords" in prompt_data and "point_labels" in prompt_data:
+                # 使用 JSON 文件中的 prompt 数据
+                boxes = torch.as_tensor(prompt_data["boxes"], dtype=torch.float)
+                point_coords = torch.as_tensor(prompt_data["point_coords"], dtype=torch.float)
+                point_labels = torch.as_tensor(prompt_data["point_labels"], dtype=torch.int)
+            else:
+                # JSON 文件中没有 prompt 数据，从 mask 生成
+                # 这通常发生在 JSON 文件只包含属性信息（如 global_label）时
+                boxes = get_boxes_from_mask(mask, max_pixel = 0)
+                point_coords, point_labels = init_point_sampling(mask, self.point_num)
+                if prompt_data is None:
+                    print(f"警告: 在 prompt_list 中未找到图片 {prompt_key} 的 prompt 数据，将从 mask 生成")
+                else:
+                    print(f"警告: 图片 {prompt_key} 的 prompt 数据缺少必要字段（boxes/point_coords/point_labels），将从 mask 生成")
 
         image_input["image"] = image
         image_input["label"] = mask.unsqueeze(0)
