@@ -1,0 +1,1250 @@
+{
+  "image_00": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_01": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_02": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_03": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_04": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_05": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_07": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_12": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_28": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_06": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_08": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_09": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_10": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "medium",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_11": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_13": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_14": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_15": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_16": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_17": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_18": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_19": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_20": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_21": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_22": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_23": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_24": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_25": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_26": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_27": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  "image_29": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_30": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "sparsely distributed"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ]
+  },
+  "image_31": {
+    "attribute_prompts": [
+      "deep purple",
+      "elliptical/oval",
+      "scattered",
+      "small",
+      "moderately dense"
+    ],
+    "attribute_labels": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  }
+}
