@@ -397,20 +397,26 @@ def main(args):
             print(f"  - ori_labels Min: {ori_labels.min().item():.4f}, Max: {ori_labels.max().item():.4f}")
             print(f"  - masks (Pred) Min: {masks.min().item():.4f}, Max: {masks.max().item():.4f}")
         
-        # 强制二值化修复：如果标签值大于 1，强制转为 0/1
-        # 这是因为 CPM17 等数据集可能使用 Instance Mask（每个细胞核有不同的像素值）
+        # 【修复】不再强制二值化，保持实例信息用于 Metrics 计算
+        # ori_labels 应该是实例图（如果 DataLoader 正确返回了 ori_label）
+        # 如果 ori_labels 是实例图（max > 1），我们需要保持它用于 AJI/PQ 计算
+        # 但 Loss 计算需要二值图，所以创建一个二值副本
         if ori_labels.max() > 1:
             if i == 0:
-                print(f"  >>> 检测到标签值 > 1 (Max={ori_labels.max().item():.2f})，正在执行强制二值化 (Label > 0 -> 1)...")
-            ori_labels = (ori_labels > 0).float()
-            if i == 0:
-                print(f"  >>> 二值化后: Min={ori_labels.min().item():.4f}, Max={ori_labels.max().item():.4f}")
+                print(f"  >>> 检测到实例图 (Max={ori_labels.max().item():.2f})，保持实例信息用于 Metrics 计算")
+            # 创建二值副本用于 Loss 计算
+            ori_labels_binary = (ori_labels > 0).float()
+        else:
+            # 已经是二值图
+            ori_labels_binary = ori_labels
         # ================== [结束] 标签值域检查和修复 ==================
         
-        # 使用原始 logits 计算 loss（masks_for_loss 是 logits，masks 是实例图）
-        loss = criterion(masks_for_loss, ori_labels, iou_predictions)
+        # 计算 Loss 用二值
+        loss = criterion(masks_for_loss, ori_labels_binary, iou_predictions)
         test_loss.append(loss.item())
 
+        # 计算 Metrics 用实例 (masks 已经是实例图，ori_labels 也应该是实例图)
+        # 如果 ori_labels 是二值图，SegMetrics 内部会转换为实例图
         test_batch_metrics = SegMetrics(masks, ori_labels, args.metrics)
         # SegMetrics返回字典，需要转换为列表
         if isinstance(test_batch_metrics, dict):
