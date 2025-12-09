@@ -206,22 +206,27 @@ def SegMetrics(pred, label, metrics):
             pr_np = pr_bin.cpu().numpy().astype(int)
     
     # 处理 GT Label
-    # GT 通常是二值图 (0/1)，需要转连通域以计算实例指标
-    gt_bin = _threshold(gt_, threshold=0.5)
-    if gt_bin.ndim == 4:
-        gt_np_binary = gt_bin.squeeze(1).cpu().numpy().astype(int)
+    # 【修复】检查 GT 是否已经是实例图 (max > 1)
+    gt_max = gt_.max().item()
+    if gt_max > 1:
+        # GT 已经是实例图，直接转换
+        if gt_.ndim == 4:
+            gt_np = gt_.squeeze(1).cpu().numpy().astype(int)
+        else:
+            gt_np = gt_.cpu().numpy().astype(int)
     else:
-        gt_np_binary = gt_bin.cpu().numpy().astype(int)
-    
-    # 关键：如果 GT 是二值的，必须在这里做 measure.label 转换为实例图
-    # 这样 AJI 和 PQ 才能正确计算
-    if gt_np_binary.max() <= 1:
+        # GT 是二值图 (0/1)，需要转连通域以计算实例指标
+        gt_bin = _threshold(gt_, threshold=0.5)
+        if gt_bin.ndim == 4:
+            gt_np_binary = gt_bin.squeeze(1).cpu().numpy().astype(int)
+        else:
+            gt_np_binary = gt_bin.cpu().numpy().astype(int)
+        
+        # 关键：如果 GT 是二值的，必须在这里做 measure.label 转换为实例图
+        # 这样 AJI 和 PQ 才能正确计算
         gt_np = np.zeros_like(gt_np_binary, dtype=int)
         for i in range(gt_np_binary.shape[0]):
             gt_np[i] = measure.label(gt_np_binary[i])
-    else:
-        # GT 已经是实例图
-        gt_np = gt_np_binary.astype(int)
     
     # 确保维度一致
     if pr_np.ndim == 2:
