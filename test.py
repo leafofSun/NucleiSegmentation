@@ -415,22 +415,63 @@ def main(args):
         loss = criterion(masks_for_loss, ori_labels_binary, iou_predictions)
         test_loss.append(loss.item())
 
-        # 计算 Metrics 用实例 (masks 已经是实例图，ori_labels 也应该是实例图)
-        # 如果 ori_labels 是二值图，SegMetrics 内部会转换为实例图
-        test_batch_metrics = SegMetrics(masks, ori_labels, args.metrics)
-        # SegMetrics返回字典，需要转换为列表
-        if isinstance(test_batch_metrics, dict):
-            # 按照args.metrics的顺序提取值，处理键名映射（dice/mDice统一为dice）
+        # ================== [开始修复] 数据对齐与清洗 ==================
+        # 1. 重新映射 ori_labels 的 ID，使其从 1 开始连续排列
+        #    解决 Max=11730 的问题，把它变成 1...N
+        #    注意：ori_labels 是 tensor [1, 1, H, W]
+        gt_numpy = ori_labels.squeeze().cpu().numpy().astype(int)
+        
+        # 使用 skimage.segmentation.relabel_sequential 重新编号
+        from skimage.segmentation import relabel_sequential
+        gt_relabelled, _, _ = relabel_sequential(gt_numpy)
+        
+        # 转回 Tensor
+        ori_labels_clean = torch.tensor(gt_relabelled).unsqueeze(0).unsqueeze(0).to(args.device).float()
+        
+        # 2. 确保 Pred 也是干净的实例图
+        #    masks 已经是我们自己构建的实例图，通常从 1 开始，问题不大
+        #    但为了保险，也可以转一下类型
+        masks_clean = masks.round().float()
+        
+        # ================== [修改 SegMetrics 调用] ==================
+        # 我们现在有两个版本的 GT：
+        # 1. ori_labels_clean: 实例图 (0, 1, 2...) -> 用于 AJI, PQ
+        # 2. ori_labels_binary: 二值图 (0, 1) -> 用于 Dice
+        
+        # 临时方案：直接在这里计算 Dice，绕过 SegMetrics 的潜在 Bug
+        # 手动计算 Batch Dice (Binary)
+        pred_bin = (masks_clean > 0).float()
+        gt_bin = (ori_labels_clean > 0).float()
+        inter = (pred_bin * gt_bin).sum()
+        union = pred_bin.sum() + gt_bin.sum()
+        dice_val = 2.0 * inter / (union + 1e-7)
+        
+        # 调用 SegMetrics 计算 AJI/PQ (传入清洗后的实例图)
+        # 注意：metrics.py 里的 AJI/PQ 计算能处理实例图输入
+        metrics_results = SegMetrics(masks_clean, ori_labels_clean, args.metrics)
+        
+        # 覆盖 Dice 结果
+        if isinstance(metrics_results, dict):
+            metrics_results['dice'] = dice_val.item()
+            metrics_results['mDice'] = dice_val.item()  # 双保险
+            
+            # 将结果转为列表，适配后续代码
             metric_values = []
             for metric in args.metrics:
-                # 处理dice和mDice的键名映射
-                if metric == 'mDice' or metric == 'dice':
-                    value = test_batch_metrics.get('dice', test_batch_metrics.get('mDice', 0.0))
+                if metric in ['mDice', 'dice']:
+                    metric_values.append(dice_val.item())
                 else:
-                    value = test_batch_metrics.get(metric, 0.0)
-                metric_values.append(value)
+                    # 获取其他指标 (AJI, PQ)
+                    val = metrics_results.get(metric, 0.0)
+                    metric_values.append(val)
             test_batch_metrics = metric_values
+        else:
+            # 如果 SegMetrics 返回的是列表，可能需要手动替换第一个元素
+            # 但根据你的代码，它应该返回字典
+            test_batch_metrics = metrics_results
+        
         test_batch_metrics = [float('{:.4f}'.format(metric)) for metric in test_batch_metrics]
+        # ================== [结束修复] ==================
 
         for j in range(len(args.metrics)):
             test_iter_metrics[j] += test_batch_metrics[j]
