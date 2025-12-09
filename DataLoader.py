@@ -151,122 +151,128 @@ class TestingDataset(Dataset):
         
         image = (image - self.pixel_mean) / self.pixel_std
 
-        # 读取该图片的所有mask并合并
-        # 【关键修复】保持实例信息，不要过早二值化
+        # === 1. 读取原始实例 Mask (保持 ID) ===
         mask_paths = self.mask_paths_list[index]
-        ori_np_mask_instance = None  # 保持实例信息的 mask
+        ori_np_mask_instance = None
         for mask_path in mask_paths:
             mask = cv2.imread(mask_path, 0)
             if mask is None:
                 raise ValueError(f"无法读取掩码文件: {mask_path}")
             
-            # 【修复】保持原始实例信息，不进行二值化
-            # 如果 mask 是实例图（值可能是 1, 2, 3, ...），我们需要保持这些值
-            # 只有在合并多个 mask 时，需要确保 ID 不冲突
+            # 保持原始值，不进行二值化
             mask = mask.astype(np.float32)
             
-            # 合并所有mask（保持实例信息）
             if ori_np_mask_instance is None:
                 ori_np_mask_instance = mask.copy()
             else:
-                # 确保尺寸一致
                 if mask.shape != ori_np_mask_instance.shape:
                     mask = cv2.resize(mask, (ori_np_mask_instance.shape[1], ori_np_mask_instance.shape[0]), interpolation=cv2.INTER_NEAREST)
-                # 合并时，将新 mask 的 ID 偏移，避免冲突
-                max_id = ori_np_mask_instance.max()
-                mask_offset = mask.copy()
-                mask_offset[mask_offset > 0] += max_id
-                ori_np_mask_instance = np.maximum(ori_np_mask_instance, mask_offset)
+                # 智能合并：避免 ID 冲突
+                current_max_id = ori_np_mask_instance.max()
+                if current_max_id > 0 and mask.max() > 0:
+                    mask[mask > 0] += current_max_id
+                ori_np_mask_instance = np.maximum(ori_np_mask_instance, mask)
         
         if ori_np_mask_instance is None:
             raise ValueError(f"没有找到有效的掩码文件")
 
         h, w = ori_np_mask_instance.shape
+
+        # === 2. 【关键修复】先对 Mask 进行 Padding，再生成 Box ===
+        # 这样 Box 的坐标才能和 Padding 后的图像对齐！
+        transforms = get_transforms(self.image_size, h, w, mode='test')
         
-        # 【修复】在生成 boxes 之前，使用原始实例 mask
-        # 这样 get_boxes_from_mask 可以正确识别每个独立的细胞核
+        # Albumentations 需要 mask 是 numpy 数组
+        augments = transforms(image=image, mask=ori_np_mask_instance)
+        image_padded = augments['image']
+        mask_instance_padded = augments['mask']  # 这是 1024x1024 的实例图
+        
+        # 生成 Box (基于 Padded Mask)
         if self.prompt_path is None:
-            # 使用原始实例 mask 生成 boxes（保持实例信息）
+            # 使用 Padded 的实例图生成框
+            # 此时 max_pixel=0 确保测试时无随机抖动
             from skimage.measure import label, regionprops
-            # 如果 mask 已经是实例图（max > 1），直接使用；否则进行连通域标记
-            if ori_np_mask_instance.max() > 1:
-                label_img = ori_np_mask_instance.astype(int)
+            if mask_instance_padded.max() > 1:
+                label_img = mask_instance_padded.astype(int)
             else:
-                label_img = label(ori_np_mask_instance)
+                label_img = label(mask_instance_padded)
             regions = regionprops(label_img)
             num_regions = len(regions)
-            # 设置一个合理的上限（例如500），但使用实际数量
             box_num = min(num_regions, 500) if num_regions > 0 else 1
-            boxes = get_boxes_from_mask(ori_np_mask_instance, box_num=box_num, max_pixel=0)
-            point_coords, point_labels = init_point_sampling(ori_np_mask_instance, self.point_num)
-        
-        # 现在才进行二值化，用于后续的 transform 和返回给模型
-        # 但我们已经用原始实例 mask 生成了 boxes
-        ori_np_mask_binary = (ori_np_mask_instance > 0).astype(np.float32)
-        ori_mask = torch.tensor(ori_np_mask_binary).unsqueeze(0)
-
-        # 测试模式：使用补零保持原分辨率（模仿 PromptNu）
-        # 注意：transform 时使用二值 mask（因为 albumentations 通常期望二值 mask）
-        transforms = get_transforms(self.image_size, h, w, mode='test')
-        augments = transforms(image=image, mask=ori_np_mask_binary)
-        image, mask = augments['image'], augments['mask'].to(torch.int64)
-        
-        if self.prompt_path is not None:
-            # 使用第一张图片的路径作为prompt key
+            boxes = get_boxes_from_mask(mask_instance_padded, box_num=box_num, max_pixel=0)
+            
+            # Point prompt 还是用二值图生成即可 (基于 Padded)
+            binary_mask_padded = (mask_instance_padded > 0).astype(np.float32)
+            point_coords, point_labels = init_point_sampling(binary_mask_padded, self.point_num)
+        else:
+            # 如果从文件加载 prompt，这里需要小心，通常文件里的 prompt 是基于原图的
+            # 如果用了 Padding，文件里的 prompt 需要加上 padding offset 才能用
+            # 简单起见，这里假设 self.prompt_path is None
             prompt_key = self.image_paths[index].split('/')[-1]
-            # 移除可能的扩展名
             prompt_key_no_ext = prompt_key.split('.')[0] if '.' in prompt_key else prompt_key
             
-            # 尝试查找对应的 prompt 数据
             prompt_data = None
             if prompt_key_no_ext in self.prompt_list:
                 prompt_data = self.prompt_list[prompt_key_no_ext]
             elif prompt_key in self.prompt_list:
                 prompt_data = self.prompt_list[prompt_key]
             
-            # 检查是否有 boxes、point_coords、point_labels 字段
             if prompt_data is not None and "boxes" in prompt_data and "point_coords" in prompt_data and "point_labels" in prompt_data:
-                # 使用 JSON 文件中的 prompt 数据
+                # 使用 JSON 文件中的 prompt 数据（注意：可能需要调整坐标以匹配 Padding）
                 boxes = torch.as_tensor(prompt_data["boxes"], dtype=torch.float)
                 point_coords = torch.as_tensor(prompt_data["point_coords"], dtype=torch.float)
                 point_labels = torch.as_tensor(prompt_data["point_labels"], dtype=torch.int)
             else:
-                # JSON 文件中没有 prompt 数据，从原始实例 mask 生成（不是 transform 后的二值 mask）
-                # 这通常发生在 JSON 文件只包含属性信息（如 global_label）时
-                # 【修复】使用原始实例 mask，而不是 transform 后的二值 mask
+                # 从 Padded Mask 生成
                 from skimage.measure import label, regionprops
-                if ori_np_mask_instance.max() > 1:
-                    label_img = ori_np_mask_instance.astype(int)
+                if mask_instance_padded.max() > 1:
+                    label_img = mask_instance_padded.astype(int)
                 else:
-                    label_img = label(ori_np_mask_instance)
+                    label_img = label(mask_instance_padded)
                 regions = regionprops(label_img)
                 num_regions = len(regions)
                 box_num = min(num_regions, 500) if num_regions > 0 else 1
-                boxes = get_boxes_from_mask(ori_np_mask_instance, box_num=box_num, max_pixel=0)
-                point_coords, point_labels = init_point_sampling(ori_np_mask_instance, self.point_num)
-                if prompt_data is None:
-                    print(f"警告: 在 prompt_list 中未找到图片 {prompt_key} 的 prompt 数据，将从 mask 生成")
-                else:
-                    print(f"警告: 图片 {prompt_key} 的 prompt 数据缺少必要字段（boxes/point_coords/point_labels），将从 mask 生成")
+                boxes = get_boxes_from_mask(mask_instance_padded, box_num=box_num, max_pixel=0)
+                binary_mask_padded = (mask_instance_padded > 0).astype(np.float32)
+                point_coords, point_labels = init_point_sampling(binary_mask_padded, self.point_num)
 
-        image_input["image"] = image
-        image_input["label"] = mask.unsqueeze(0)
+        # === 3. 准备模型输入 ===
+        # image_encoder 输入的是 Padded Image
+        image_input["image"] = image_padded
+        # mask_decoder 输入的提示是基于 Padded 坐标的
+        image_input["boxes"] = boxes
         image_input["point_coords"] = point_coords
         image_input["point_labels"] = point_labels
-        image_input["boxes"] = boxes
+        
+        # label 通常用于计算 loss，这里给一个 Dummy 或者 Padded Binary Mask
+        # 注意：test.py 计算 loss 用的是 masks 和 ori_labels
+        # 这里返回 padded binary mask 给 train.py 里的 batch 组装逻辑（虽然 test 不一定用）
+        image_input["label"] = torch.tensor(mask_instance_padded > 0).float().unsqueeze(0)
+
         image_input["original_size"] = (h, w)
-        # 使用第一张mask的路径作为label_path
         if mask_paths:
             image_input["label_path"] = '/'.join(mask_paths[0].split('/')[:-1])
 
+        # === 4. 【关键修复】返回原始尺寸的 Instance Mask 用于评估 ===
+        # ori_label 用于 SegMetrics 计算 AJI/PQ，必须是 Instance Map 且是原图尺寸
         if self.return_ori_mask:
-            image_input["ori_label"] = ori_mask
+            image_input["ori_label"] = torch.tensor(ori_np_mask_instance).unsqueeze(0)
      
         image_name = self.image_paths[index].split('/')[-1]
         if self.requires_name:
             image_input["name"] = image_name
         
-        # 添加属性信息（如果可用，用于PNuRL）
+        # PNuRL 属性保持不变
+        if self.attribute_info:
+            label_key = self.image_paths[index]
+            if label_key not in self.attribute_info:
+                label_key = image_name
+            if label_key in self.attribute_info:
+                attr_info = self.attribute_info[label_key]
+                if 'attribute_prompts' in attr_info:
+                    image_input['attribute_prompts'] = attr_info['attribute_prompts']
+        
+        return image_input
         if self.attribute_info:
             # 使用图片路径或图片名作为key查找属性信息
             label_key = self.image_paths[index]
@@ -381,27 +387,33 @@ class TrainingDataset(Dataset):
             pre_mask = cv2.imread(m, 0)
             if pre_mask is None:
                 raise ValueError(f"无法读取掩码文件: {m}")
-            # 修复：无论 mask 的最大值是多少，都将其转换为二值 mask (0 或 1)
-            # 这是因为 CPM17 等数据集可能使用 Instance Mask（每个细胞核有不同的像素值）
-            # 对于二类分割任务，我们需要将所有非0值都转为1
-            pre_mask = (pre_mask > 0).astype(np.float32)
+            # 【修复】保持实例 ID，用于 RandomCrop 后的 Box 生成
+            pre_mask = pre_mask.astype(np.float32)
 
             # ================== [开始修改] 添加重试机制 ==================
             # 尝试裁剪最多 10 次，直到找到包含前景（细胞核）的图块
             # 这样可以避免 RandomCrop 裁剪到空白区域导致的 ZeroDivisionError
             for retry_count in range(10):
                 augments = transforms(image=image, mask=pre_mask)
-                image_tensor, mask_tensor = augments['image'], augments['mask'].to(torch.int64)
-                # 如果 mask 中有非零值（即有细胞核），则停止重试
-                if mask_tensor.max() > 0:
+                image_tensor = augments['image']
+                mask_instance_crop = augments['mask']  # 这是裁剪后的实例图
+                
+                if mask_instance_crop.max() > 0:
                     break
             # 如果 10 次重试后仍然没有前景，使用最后一次的结果（utils.py 会处理空 mask）
             # ================== [结束修改] ==================
 
-            boxes = get_boxes_from_mask(mask_tensor)
-            point_coords, point_label = init_point_sampling(mask_tensor, self.point_num)
+            # 1. 生成 Box (基于裁剪后的实例图)
+            boxes = get_boxes_from_mask(mask_instance_crop)
+            
+            # 2. 生成 Point (基于裁剪后的二值图)
+            mask_binary_crop = (mask_instance_crop > 0).astype(np.float32)
+            point_coords, point_label = init_point_sampling(mask_binary_crop, self.point_num)
 
-            masks_list.append(mask_tensor)
+            # 3. 【关键】存入列表的是 二值化 的 Mask
+            # 因为 train.py 的 Loss 函数 (Focal/Dice) 需要 0/1 标签
+            masks_list.append(torch.tensor(mask_binary_crop).long())
+            
             boxes_list.append(boxes)
             point_coords_list.append(point_coords)
             point_labels_list.append(point_label)
@@ -412,7 +424,8 @@ class TrainingDataset(Dataset):
         point_labels = torch.stack(point_labels_list, dim=0)
 
         image_input["image"] = image_tensor.unsqueeze(0)
-        image_input["label"] = mask.unsqueeze(1)
+        # label 增加 channel 维度: [mask_num, 1, H, W]
+        image_input["label"] = mask.unsqueeze(1).float()
         image_input["boxes"] = boxes
         image_input["point_coords"] = point_coords
         image_input["point_labels"] = point_labels
