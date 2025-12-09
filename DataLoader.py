@@ -187,22 +187,29 @@ class TestingDataset(Dataset):
         image_padded = augments['image']
         mask_instance_padded = augments['mask']  # 这是 1024x1024 的实例图
         
+        # 【修复】处理 mask_instance_padded 可能是 Tensor 的情况
+        # ToTensorV2 会将 numpy 转换为 Tensor，需要转换回 numpy
+        if isinstance(mask_instance_padded, torch.Tensor):
+            mask_instance_padded_np = mask_instance_padded.cpu().numpy()
+        else:
+            mask_instance_padded_np = mask_instance_padded
+        
         # 生成 Box (基于 Padded Mask)
         if self.prompt_path is None:
             # 使用 Padded 的实例图生成框
             # 此时 max_pixel=0 确保测试时无随机抖动
             from skimage.measure import label, regionprops
-            if mask_instance_padded.max() > 1:
-                label_img = mask_instance_padded.astype(int)
+            if mask_instance_padded_np.max() > 1:
+                label_img = mask_instance_padded_np.astype(int)
             else:
-                label_img = label(mask_instance_padded)
+                label_img = label(mask_instance_padded_np)
             regions = regionprops(label_img)
             num_regions = len(regions)
             box_num = min(num_regions, 500) if num_regions > 0 else 1
-            boxes = get_boxes_from_mask(mask_instance_padded, box_num=box_num, max_pixel=0)
+            boxes = get_boxes_from_mask(mask_instance_padded_np, box_num=box_num, max_pixel=0)
             
             # Point prompt 还是用二值图生成即可 (基于 Padded)
-            binary_mask_padded = (mask_instance_padded > 0).astype(np.float32)
+            binary_mask_padded = (mask_instance_padded_np > 0).astype(np.float32)
             point_coords, point_labels = init_point_sampling(binary_mask_padded, self.point_num)
         else:
             # 如果从文件加载 prompt，这里需要小心，通常文件里的 prompt 是基于原图的
@@ -225,15 +232,15 @@ class TestingDataset(Dataset):
             else:
                 # 从 Padded Mask 生成
                 from skimage.measure import label, regionprops
-                if mask_instance_padded.max() > 1:
-                    label_img = mask_instance_padded.astype(int)
+                if mask_instance_padded_np.max() > 1:
+                    label_img = mask_instance_padded_np.astype(int)
                 else:
-                    label_img = label(mask_instance_padded)
+                    label_img = label(mask_instance_padded_np)
                 regions = regionprops(label_img)
                 num_regions = len(regions)
                 box_num = min(num_regions, 500) if num_regions > 0 else 1
-                boxes = get_boxes_from_mask(mask_instance_padded, box_num=box_num, max_pixel=0)
-                binary_mask_padded = (mask_instance_padded > 0).astype(np.float32)
+                boxes = get_boxes_from_mask(mask_instance_padded_np, box_num=box_num, max_pixel=0)
+                binary_mask_padded = (mask_instance_padded_np > 0).astype(np.float32)
                 point_coords, point_labels = init_point_sampling(binary_mask_padded, self.point_num)
 
         # === 3. 准备模型输入 ===
@@ -247,7 +254,10 @@ class TestingDataset(Dataset):
         # label 通常用于计算 loss，这里给一个 Dummy 或者 Padded Binary Mask
         # 注意：test.py 计算 loss 用的是 masks 和 ori_labels
         # 这里返回 padded binary mask 给 train.py 里的 batch 组装逻辑（虽然 test 不一定用）
-        image_input["label"] = torch.tensor(mask_instance_padded > 0).float().unsqueeze(0)
+        if isinstance(mask_instance_padded, torch.Tensor):
+            image_input["label"] = (mask_instance_padded > 0).float().unsqueeze(0)
+        else:
+            image_input["label"] = torch.tensor(mask_instance_padded_np > 0).float().unsqueeze(0)
 
         image_input["original_size"] = (h, w)
         if mask_paths:
@@ -398,16 +408,25 @@ class TrainingDataset(Dataset):
                 image_tensor = augments['image']
                 mask_instance_crop = augments['mask']  # 这是裁剪后的实例图
                 
-                if mask_instance_crop.max() > 0:
+                # 【修复】处理 mask_instance_crop 可能是 Tensor 的情况
+                if isinstance(mask_instance_crop, torch.Tensor):
+                    mask_instance_crop_np = mask_instance_crop.cpu().numpy()
+                    mask_max = mask_instance_crop.max().item()
+                else:
+                    mask_instance_crop_np = mask_instance_crop
+                    mask_max = mask_instance_crop.max()
+                
+                if mask_max > 0:
                     break
             # 如果 10 次重试后仍然没有前景，使用最后一次的结果（utils.py 会处理空 mask）
             # ================== [结束修改] ==================
 
             # 1. 生成 Box (基于裁剪后的实例图)
-            boxes = get_boxes_from_mask(mask_instance_crop)
+            # 使用 numpy 版本的 mask
+            boxes = get_boxes_from_mask(mask_instance_crop_np)
             
             # 2. 生成 Point (基于裁剪后的二值图)
-            mask_binary_crop = (mask_instance_crop > 0).astype(np.float32)
+            mask_binary_crop = (mask_instance_crop_np > 0).astype(np.float32)
             point_coords, point_label = init_point_sampling(mask_binary_crop, self.point_num)
 
             # 3. 【关键】存入列表的是 二值化 的 Mask
