@@ -185,36 +185,55 @@ def SegMetrics(pred, label, metrics):
     if isinstance(metrics, str):
         metrics = [metrics, ]
     
-    # 预处理数据，转换为 NumPy 格式以便进行实例计算
-    pr_, gt_ = _list_tensor(pred, label)
-    
-    # [修改] 检查 pred 是否已经是实例图 (max > 1)
-    # 如果是实例图，跳过 sigmoid 和 threshold
-    pr_max = pr_.max().item()
-    if pr_max > 1:
-        # 已经是实例图，直接转换
-        if pr_.ndim == 4:
-            pr_np = pr_.squeeze(1).cpu().numpy().astype(int)
-        else:
-            pr_np = pr_.cpu().numpy().astype(int)
+    # ================== [关键修复] 先检查是否是实例图，避免 _list_tensor 破坏实例信息 ==================
+    # 如果输入已经是实例 ID 图 (Max > 1)，直接转 numpy，不要调用 _list_tensor（它会应用 Sigmoid）
+    # 先转换为 tensor 以便检查
+    if isinstance(pred, (list, np.ndarray)):
+        pred_tmp = torch.tensor(np.array(pred)) if isinstance(pred, list) else torch.from_numpy(pred)
     else:
+        pred_tmp = pred
+    
+    if isinstance(label, (list, np.ndarray)):
+        label_tmp = torch.tensor(np.array(label)) if isinstance(label, list) else torch.from_numpy(label)
+    else:
+        label_tmp = label
+    
+    # 检查是否是实例图
+    pred_max = pred_tmp.max().item() if hasattr(pred_tmp, 'max') else float(pred_tmp.max())
+    label_max = label_tmp.max().item() if hasattr(label_tmp, 'max') else float(label_tmp.max())
+    
+    if pred_max > 1 or label_max > 1:
+        # 输入已经是实例图，直接转换，不要调用 _list_tensor
+        if isinstance(pred, torch.Tensor):
+            if pred.ndim == 4:
+                pr_np = pred.squeeze(1).cpu().numpy().astype(int)
+            else:
+                pr_np = pred.cpu().numpy().astype(int)
+        else:
+            pr_np = np.array(pred).astype(int)
+            if pr_np.ndim == 4:
+                pr_np = pr_np.squeeze(1)
+        
+        if isinstance(label, torch.Tensor):
+            if label.ndim == 4:
+                gt_np = label.squeeze(1).cpu().numpy().astype(int)
+            else:
+                gt_np = label.cpu().numpy().astype(int)
+        else:
+            gt_np = np.array(label).astype(int)
+            if gt_np.ndim == 4:
+                gt_np = gt_np.squeeze(1)
+    else:
+        # 输入是二值 logits，需要走正常的处理流程
+        pr_, gt_ = _list_tensor(pred, label)
+        
         # 旧逻辑：如果是二值 logits，需要 sigmoid 和 threshold
         pr_bin = _threshold(pr_, threshold=0.5)
         if pr_bin.ndim == 4:
             pr_np = pr_bin.squeeze(1).cpu().numpy().astype(int)
         else:
             pr_np = pr_bin.cpu().numpy().astype(int)
-    
-    # 处理 GT Label
-    # 【修复】检查 GT 是否已经是实例图 (max > 1)
-    gt_max = gt_.max().item()
-    if gt_max > 1:
-        # GT 已经是实例图，直接转换
-        if gt_.ndim == 4:
-            gt_np = gt_.squeeze(1).cpu().numpy().astype(int)
-        else:
-            gt_np = gt_.cpu().numpy().astype(int)
-    else:
+        
         # GT 是二值图 (0/1)，需要转连通域以计算实例指标
         gt_bin = _threshold(gt_, threshold=0.5)
         if gt_bin.ndim == 4:
@@ -227,6 +246,9 @@ def SegMetrics(pred, label, metrics):
         gt_np = np.zeros_like(gt_np_binary, dtype=int)
         for i in range(gt_np_binary.shape[0]):
             gt_np[i] = measure.label(gt_np_binary[i])
+    
+    # 更新 pr_max 用于后续 Dice 计算
+    pr_max = pr_np.max() if isinstance(pr_np, np.ndarray) else float(pr_np.max())
     
     # 确保维度一致
     if pr_np.ndim == 2:
