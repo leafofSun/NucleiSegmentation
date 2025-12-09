@@ -155,7 +155,12 @@ def _build_sam(
                     sam.load_state_dict(state_dict)
         except:
             print('*******interpolate')
-            new_state_dict = load_from(sam, state_dict, image_size, vit_patch_size)   
+            # 修复：如果 state_dict 包含 'model' 键，先提取它
+            if 'model' in state_dict.keys():
+                actual_state_dict = state_dict['model']
+            else:
+                actual_state_dict = state_dict
+            new_state_dict = load_from(sam, actual_state_dict, image_size, vit_patch_size)   
             sam.load_state_dict(new_state_dict)
         print(f"*******load {checkpoint}")
         
@@ -168,6 +173,14 @@ def load_from(sam, state_dicts, image_size, vit_patch_size):
     except_keys = ['mask_tokens', 'output_hypernetworks_mlps', 'iou_prediction_head']
     new_state_dict = {k: v for k, v in state_dicts.items() if
                       k in sam_dict.keys() and except_keys[0] not in k and except_keys[1] not in k and except_keys[2] not in k}
+    
+    # 修复：检查 'image_encoder.pos_embed' 是否存在，如果不存在则跳过位置编码的插值
+    if 'image_encoder.pos_embed' not in new_state_dict:
+        print(f"Warning: 'image_encoder.pos_embed' not found in checkpoint. Available keys: {list(new_state_dict.keys())[:10]}...")
+        # 如果缺少关键键，直接返回能匹配的键
+        sam_dict.update(new_state_dict)
+        return sam_dict
+    
     pos_embed = new_state_dict['image_encoder.pos_embed']
     token_size = int(image_size // vit_patch_size)
     if pos_embed.shape[1] != token_size:

@@ -49,9 +49,15 @@ class Adapter_Layer(nn.Module):
     def forward(self, x):
         #x -> （B, H, W, C）-> （B, C, H, W）
         x = x.permute(0,3,1,2)
-        B, C, _, _ = x.size()
+        B, C, H_orig, W_orig = x.size()
         x_channel = self.channel(self.avg_pool(x).view(B, C)).view(B, C, 1, 1) * x
         x_spatial = self.spatial(x_channel)
+        
+        # 修复：确保 x_spatial 的尺寸与原始 x 匹配
+        # 由于 Conv2d(stride=2) + ConvTranspose2d(stride=2) 可能无法完全恢复原始尺寸（特别是奇数尺寸）
+        if x_spatial.shape[2] != H_orig or x_spatial.shape[3] != W_orig:
+            # 使用插值或裁剪来匹配原始尺寸
+            x_spatial = F.interpolate(x_spatial, size=(H_orig, W_orig), mode='bilinear', align_corners=False)
         
         if self.skip_connect:
             x = x + x_spatial
@@ -224,7 +230,16 @@ class ImageEncoderViT(nn.Module):
         # Default ViT pipeline
         x = self.patch_embed(x)
         if self.pos_embed is not None:
-            x = x + self.pos_embed
+            # 修复：动态调整 pos_embed 尺寸以匹配实际输入
+            # x 的形状是 [B, H, W, C]，pos_embed 的形状是 [1, H_pos, W_pos, C]
+            B, H, W, C = x.shape
+            pos_embed = self.pos_embed
+            if pos_embed.shape[1] != H or pos_embed.shape[2] != W:
+                # 需要插值 pos_embed 以匹配实际输入尺寸
+                pos_embed = pos_embed.permute(0, 3, 1, 2)  # [1, C, H_pos, W_pos]
+                pos_embed = F.interpolate(pos_embed, (H, W), mode='bilinear', align_corners=False)
+                pos_embed = pos_embed.permute(0, 2, 3, 1)  # [1, H, W, C]
+            x = x + pos_embed
 
         for blk in self.blocks:
             x = blk(x)

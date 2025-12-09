@@ -12,8 +12,10 @@ import logging
 import os
 
 
-def get_boxes_from_mask(mask, box_num=1, std = 0.1, max_pixel = 5):
+def get_boxes_from_mask(mask, box_num=1, std=0.1, max_pixel=5):
     """
+    从 mask 中提取边界框，支持空 mask 的健壮处理
+    
     Args:
         mask: Mask, can be a torch.Tensor or a numpy array of binary mask.
         box_num: Number of bounding boxes, default is 1.
@@ -24,34 +26,39 @@ def get_boxes_from_mask(mask, box_num=1, std = 0.1, max_pixel = 5):
     """
     if isinstance(mask, torch.Tensor):
         mask = mask.numpy()
-        
+
     label_img = label(mask)
     regions = regionprops(label_img)
 
-    # Iterate through all regions and get the bounding box coordinates
+    # 获取所有区域的框
     boxes = [tuple(region.bbox) for region in regions]
 
-    # If the generated number of boxes is greater than the number of categories,
-    # sort them by region area and select the top n regions
+    # 1. 处理没有区域的情况 (空 Mask) - 优先处理，避免后续除以零
+    if len(boxes) == 0:
+        # 如果没有找到任何细胞，返回 box_num 个默认框 (0,0,1,1)
+        # 或者返回全图框 (0, 0, h, w)
+        h, w = mask.shape
+        # 这里返回全图框作为负样本提示可能更好，或者返回微小框
+        return torch.tensor([[0, 0, 1, 1]] * box_num, dtype=torch.float)
+
+    # 2. 处理区域过多的情况
     if len(boxes) >= box_num:
+        # 按面积排序取前 box_num 个
         sorted_regions = sorted(regions, key=lambda x: x.area, reverse=True)[:box_num]
         boxes = [tuple(region.bbox) for region in sorted_regions]
 
-    # If the generated number of boxes is less than the number of categories,
-    # duplicate the existing boxes
+    # 3. 处理区域不足的情况 (补齐)
     elif len(boxes) < box_num:
         num_duplicates = box_num - len(boxes)
         boxes += [boxes[i % len(boxes)] for i in range(num_duplicates)]
 
-    # Perturb each bounding box with noise
+    # 4. 添加噪声扰动
     noise_boxes = []
     for box in boxes:
-        y0, x0,  y1, x1  = box
+        y0, x0, y1, x1 = box
         width, height = abs(x1 - x0), abs(y1 - y0)
-        # Calculate the standard deviation and maximum noise value
         noise_std = min(width, height) * std
         max_noise = min(max_pixel, int(noise_std * 5))
-         # Add random noise to each coordinate
         try:
             noise_x = np.random.randint(-max_noise, max_noise)
         except:
@@ -63,6 +70,7 @@ def get_boxes_from_mask(mask, box_num=1, std = 0.1, max_pixel = 5):
         x0, y0 = x0 + noise_x, y0 + noise_y
         x1, y1 = x1 + noise_x, y1 + noise_y
         noise_boxes.append((x0, y0, x1, y1))
+        
     return torch.as_tensor(noise_boxes, dtype=torch.float)
 
 
@@ -181,7 +189,7 @@ def get_transforms(img_size, ori_h, ori_w, mode='train'):
                 min_height=img_size, 
                 min_width=img_size, 
                 border_mode=cv2.BORDER_CONSTANT, 
-                value=(0, 0, 0)
+                fill=0  # 修复：使用 fill 参数（对于 RGB 图像，可以是单个值或 (R, G, B) 元组）
             ))
         
         # 2. 核心修改：使用 RandomCrop 代替 Resize
@@ -197,7 +205,7 @@ def get_transforms(img_size, ori_h, ori_w, mode='train'):
             min_height=img_size, 
             min_width=img_size, 
             border_mode=cv2.BORDER_CONSTANT, 
-            value=(0, 0, 0)
+            fill=0  # 修复：使用 fill 参数（对于 RGB 图像，可以是单个值或 (R, G, B) 元组）
         ))
         
         # 如果原图真的比 image_size 还大（极少数情况），才被迫缩放

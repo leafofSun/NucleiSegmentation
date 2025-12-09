@@ -370,8 +370,17 @@ class TrainingDataset(Dataset):
             # 对于二类分割任务，我们需要将所有非0值都转为1
             pre_mask = (pre_mask > 0).astype(np.float32)
 
-            augments = transforms(image=image, mask=pre_mask)
-            image_tensor, mask_tensor = augments['image'], augments['mask'].to(torch.int64)
+            # ================== [开始修改] 添加重试机制 ==================
+            # 尝试裁剪最多 10 次，直到找到包含前景（细胞核）的图块
+            # 这样可以避免 RandomCrop 裁剪到空白区域导致的 ZeroDivisionError
+            for retry_count in range(10):
+                augments = transforms(image=image, mask=pre_mask)
+                image_tensor, mask_tensor = augments['image'], augments['mask'].to(torch.int64)
+                # 如果 mask 中有非零值（即有细胞核），则停止重试
+                if mask_tensor.max() > 0:
+                    break
+            # 如果 10 次重试后仍然没有前景，使用最后一次的结果（utils.py 会处理空 mask）
+            # ================== [结束修改] ==================
 
             boxes = get_boxes_from_mask(mask_tensor)
             point_coords, point_label = init_point_sampling(mask_tensor, self.point_num)
