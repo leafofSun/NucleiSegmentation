@@ -152,53 +152,66 @@ class TestingDataset(Dataset):
         image = (image - self.pixel_mean) / self.pixel_std
 
         # 读取该图片的所有mask并合并
+        # 【关键修复】保持实例信息，不要过早二值化
         mask_paths = self.mask_paths_list[index]
-        ori_np_mask = None
+        ori_np_mask_instance = None  # 保持实例信息的 mask
         for mask_path in mask_paths:
             mask = cv2.imread(mask_path, 0)
             if mask is None:
                 raise ValueError(f"无法读取掩码文件: {mask_path}")
             
-            # 修复：无论 mask 的最大值是多少，都将其转换为二值 mask (0 或 1)
-            # 这是因为 CPM17 等数据集可能使用 Instance Mask（每个细胞核有不同的像素值，如 1, 2, 3, ... N）
-            # 对于二类分割任务，我们需要将所有非0值都转为1
-            mask = (mask > 0).astype(np.float32)
+            # 【修复】保持原始实例信息，不进行二值化
+            # 如果 mask 是实例图（值可能是 1, 2, 3, ...），我们需要保持这些值
+            # 只有在合并多个 mask 时，需要确保 ID 不冲突
+            mask = mask.astype(np.float32)
             
-            # 合并所有mask（使用逻辑或操作）
-            if ori_np_mask is None:
-                ori_np_mask = mask.copy()
+            # 合并所有mask（保持实例信息）
+            if ori_np_mask_instance is None:
+                ori_np_mask_instance = mask.copy()
             else:
                 # 确保尺寸一致
-                if mask.shape != ori_np_mask.shape:
-                    mask = cv2.resize(mask, (ori_np_mask.shape[1], ori_np_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
-                ori_np_mask = np.maximum(ori_np_mask, mask)  # 合并mask（逻辑或）
+                if mask.shape != ori_np_mask_instance.shape:
+                    mask = cv2.resize(mask, (ori_np_mask_instance.shape[1], ori_np_mask_instance.shape[0]), interpolation=cv2.INTER_NEAREST)
+                # 合并时，将新 mask 的 ID 偏移，避免冲突
+                max_id = ori_np_mask_instance.max()
+                mask_offset = mask.copy()
+                mask_offset[mask_offset > 0] += max_id
+                ori_np_mask_instance = np.maximum(ori_np_mask_instance, mask_offset)
         
-        if ori_np_mask is None:
+        if ori_np_mask_instance is None:
             raise ValueError(f"没有找到有效的掩码文件")
 
-        assert np.array_equal(ori_np_mask, ori_np_mask.astype(bool)), f"Mask should only contain binary values 0 and 1. Image: {self.image_paths[index]}"
-
-        h, w = ori_np_mask.shape
-        ori_mask = torch.tensor(ori_np_mask).unsqueeze(0)
-
-        # 测试模式：使用补零保持原分辨率（模仿 PromptNu）
-        transforms = get_transforms(self.image_size, h, w, mode='test')
-        augments = transforms(image=image, mask=ori_np_mask)
-        image, mask = augments['image'], augments['mask'].to(torch.int64)
-
+        h, w = ori_np_mask_instance.shape
+        
+        # 【修复】在生成 boxes 之前，使用原始实例 mask
+        # 这样 get_boxes_from_mask 可以正确识别每个独立的细胞核
         if self.prompt_path is None:
-            # 修复：先统计mask中的连通区域数量，然后设置 box_num 为实际数量（但不超过合理上限）
-            # 这样可以避免生成过多不必要的框，同时确保获取所有细胞核
+            # 使用原始实例 mask 生成 boxes（保持实例信息）
             from skimage.measure import label, regionprops
-            label_img = label(mask.numpy() if isinstance(mask, torch.Tensor) else mask)
+            # 如果 mask 已经是实例图（max > 1），直接使用；否则进行连通域标记
+            if ori_np_mask_instance.max() > 1:
+                label_img = ori_np_mask_instance.astype(int)
+            else:
+                label_img = label(ori_np_mask_instance)
             regions = regionprops(label_img)
             num_regions = len(regions)
             # 设置一个合理的上限（例如500），但使用实际数量
-            # 根据CPM17数据集，每个图像通常有45-202个细胞核，所以500是一个安全的上限
             box_num = min(num_regions, 500) if num_regions > 0 else 1
-            boxes = get_boxes_from_mask(mask, box_num=box_num, max_pixel=0)
-            point_coords, point_labels = init_point_sampling(mask, self.point_num)
-        else:
+            boxes = get_boxes_from_mask(ori_np_mask_instance, box_num=box_num, max_pixel=0)
+            point_coords, point_labels = init_point_sampling(ori_np_mask_instance, self.point_num)
+        
+        # 现在才进行二值化，用于后续的 transform 和返回给模型
+        # 但我们已经用原始实例 mask 生成了 boxes
+        ori_np_mask_binary = (ori_np_mask_instance > 0).astype(np.float32)
+        ori_mask = torch.tensor(ori_np_mask_binary).unsqueeze(0)
+
+        # 测试模式：使用补零保持原分辨率（模仿 PromptNu）
+        # 注意：transform 时使用二值 mask（因为 albumentations 通常期望二值 mask）
+        transforms = get_transforms(self.image_size, h, w, mode='test')
+        augments = transforms(image=image, mask=ori_np_mask_binary)
+        image, mask = augments['image'], augments['mask'].to(torch.int64)
+        
+        if self.prompt_path is not None:
             # 使用第一张图片的路径作为prompt key
             prompt_key = self.image_paths[index].split('/')[-1]
             # 移除可能的扩展名
@@ -218,16 +231,19 @@ class TestingDataset(Dataset):
                 point_coords = torch.as_tensor(prompt_data["point_coords"], dtype=torch.float)
                 point_labels = torch.as_tensor(prompt_data["point_labels"], dtype=torch.int)
             else:
-                # JSON 文件中没有 prompt 数据，从 mask 生成
+                # JSON 文件中没有 prompt 数据，从原始实例 mask 生成（不是 transform 后的二值 mask）
                 # 这通常发生在 JSON 文件只包含属性信息（如 global_label）时
-                # 修复：先统计mask中的连通区域数量，然后设置 box_num 为实际数量（但不超过合理上限）
+                # 【修复】使用原始实例 mask，而不是 transform 后的二值 mask
                 from skimage.measure import label, regionprops
-                label_img = label(mask.numpy() if isinstance(mask, torch.Tensor) else mask)
+                if ori_np_mask_instance.max() > 1:
+                    label_img = ori_np_mask_instance.astype(int)
+                else:
+                    label_img = label(ori_np_mask_instance)
                 regions = regionprops(label_img)
                 num_regions = len(regions)
                 box_num = min(num_regions, 500) if num_regions > 0 else 1
-                boxes = get_boxes_from_mask(mask, box_num=box_num, max_pixel=0)
-                point_coords, point_labels = init_point_sampling(mask, self.point_num)
+                boxes = get_boxes_from_mask(ori_np_mask_instance, box_num=box_num, max_pixel=0)
+                point_coords, point_labels = init_point_sampling(ori_np_mask_instance, self.point_num)
                 if prompt_data is None:
                     print(f"警告: 在 prompt_list 中未找到图片 {prompt_key} 的 prompt 数据，将从 mask 生成")
                 else:
