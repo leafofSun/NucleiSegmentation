@@ -181,10 +181,10 @@ class TestingDataset(Dataset):
         # === 2. 【关键修复】先进行 Padding Transform ===
         # 注意：这里我们传入 instance mask，这样 padding 后的 mask 依然保留 ID
         transforms = get_transforms(self.image_size, h, w, mode='test')
-        augments = transforms(image=image, mask=ori_np_mask_instance)
-        
-        image_padded = augments['image']  # 这是喂给 SAM 的图 (1024x1024)
-        mask_instance_padded = augments['mask']  # 这是对应的 mask (1024x1024)
+        augments_instance = transforms(image=image, mask=ori_np_mask_instance)
+        mask_instance_padded = augments_instance['mask']
+        image_padded = augments_instance['image']
+        mask_binary_padded = (mask_instance_padded > 0).astype(np.int64)
 
         # 【修复】处理 mask_instance_padded 可能是 Tensor 的情况
         if isinstance(mask_instance_padded, torch.Tensor):
@@ -197,16 +197,8 @@ class TestingDataset(Dataset):
         if self.prompt_path is None:
             # 只有 max > 0 (有前景) 才生成
             if mask_instance_padded_np.max() > 0:
-                # 传入 padded 的 mask
-                from skimage.measure import label, regionprops
-                if mask_instance_padded_np.max() > 1:
-                    label_img = mask_instance_padded_np.astype(int)
-                else:
-                    label_img = label(mask_instance_padded_np)
-                regions = regionprops(label_img)
-                num_regions = len(regions)
-                box_num = min(num_regions, 500) if num_regions > 0 else 1
-                boxes = get_boxes_from_mask(mask_instance_padded_np, box_num=box_num, max_pixel=0)
+                # 传入 padded 的 mask (确保是 numpy 格式)
+                boxes = get_boxes_from_mask(mask_instance_padded_np, box_num=500, max_pixel=0)
                 
                 # Point 同理，基于 padded
                 mask_binary_padded = (mask_instance_padded_np > 0).astype(np.float32)

@@ -430,8 +430,10 @@ def main(args):
         
         # 2. 确保 Pred 也是干净的实例图
         #    masks 已经是我们自己构建的实例图，通常从 1 开始，问题不大
-        #    但为了保险，也可以转一下类型
-        masks_clean = masks.round().float()
+        #    但为了保险，也进行 ID 重排，防止内存溢出
+        pred_numpy = masks.squeeze().cpu().numpy().astype(int)
+        pred_relabelled, _, _ = relabel_sequential(pred_numpy)
+        masks_clean = torch.tensor(pred_relabelled).unsqueeze(0).unsqueeze(0).to(args.device).float()
         
         # ================== [修改 SegMetrics 调用] ==================
         # 我们现在有两个版本的 GT：
