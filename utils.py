@@ -189,7 +189,8 @@ def get_transforms(img_size, ori_h, ori_w, mode='train'):
                 min_height=img_size, 
                 min_width=img_size, 
                 border_mode=cv2.BORDER_CONSTANT, 
-                fill=0  # 修复：使用 fill 参数（对于 RGB 图像，可以是单个值或 (R, G, B) 元组）
+                fill=0,      # 对于图像的填充值 (0通常是黑色或标准化后的均值)
+                fill_mask=0  # 对于掩码的填充值 (0代表背景)
             ))
         
         # 2. 核心修改：使用 RandomCrop 代替 Resize
@@ -205,7 +206,8 @@ def get_transforms(img_size, ori_h, ori_w, mode='train'):
             min_height=img_size, 
             min_width=img_size, 
             border_mode=cv2.BORDER_CONSTANT, 
-            fill=0  # 修复：使用 fill 参数（对于 RGB 图像，可以是单个值或 (R, G, B) 元组）
+            fill=0,      # 对于图像的填充值 (0通常是黑色或标准化后的均值)
+            fill_mask=0  # 对于掩码的填充值 (0代表背景)
         ))
         
         # 如果原图真的比 image_size 还大（极少数情况），才被迫缩放
