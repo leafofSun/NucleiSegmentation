@@ -158,14 +158,62 @@ def init_point_sampling(mask, get_point=1):
         return coords, labels
     
 
-def train_transforms(img_size, ori_h, ori_w):
+def get_transforms(img_size, ori_h, ori_w, mode='train'):
+    """
+    获取图像变换，区分训练和测试模式（模仿 PromptNu 策略）
+    
+    Args:
+        img_size: 目标图像尺寸
+        ori_h: 原始图像高度
+        ori_w: 原始图像宽度
+        mode: 'train' 使用随机裁剪（PromptNu风格），'test' 使用补零保持原分辨率
+    
+    Returns:
+        A.Compose: Albumentations 变换组合
+    """
     transforms = []
-    if ori_h < img_size and ori_w < img_size:
-        transforms.append(A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=cv2.BORDER_CONSTANT, value=(0, 0, 0)))
-    else:
-        transforms.append(A.Resize(int(img_size), int(img_size), interpolation=cv2.INTER_NEAREST))
+    
+    if mode == 'train':
+        # === 训练策略：模仿 PromptNu 的随机裁剪 ===
+        # 1. 如果图片比目标尺寸小，先补零到目标尺寸，防止裁剪报错
+        if ori_h < img_size or ori_w < img_size:
+            transforms.append(A.PadIfNeeded(
+                min_height=img_size, 
+                min_width=img_size, 
+                border_mode=cv2.BORDER_CONSTANT, 
+                value=(0, 0, 0)
+            ))
+        
+        # 2. 核心修改：使用 RandomCrop 代替 Resize
+        # 这样模型看到的是 100% 原始分辨率的局部细节
+        transforms.append(A.RandomCrop(height=img_size, width=img_size))
+        
+    elif mode == 'test':
+        # === 测试策略：保持原分辨率 ===
+        # 1. 只进行补零 (Padding)，绝不进行缩放 (Resize)
+        # 注意：这要求我们在运行 test.py 时设置一个足够大的 image_size (如 1024)
+        # 以确保整张原图都能放进去
+        transforms.append(A.PadIfNeeded(
+            min_height=img_size, 
+            min_width=img_size, 
+            border_mode=cv2.BORDER_CONSTANT, 
+            value=(0, 0, 0)
+        ))
+        
+        # 如果原图真的比 image_size 还大（极少数情况），才被迫缩放
+        # 注意：这行代码保留作为保险，但通常不会执行（因为 image_size 应该设置得足够大）
+        # transforms.append(A.Resize(img_size, img_size))  # 注释掉，保持原分辨率
+    
     transforms.append(ToTensorV2(p=1.0))
     return A.Compose(transforms, p=1.)
+
+
+# 为了兼容旧代码调用，保留 train_transforms 作为别名（默认使用训练模式）
+def train_transforms(img_size, ori_h, ori_w):
+    """
+    向后兼容的别名，默认使用训练模式（随机裁剪）
+    """
+    return get_transforms(img_size, ori_h, ori_w, mode='train')
 
 
 def get_logger(filename, verbosity=1, name=None):
