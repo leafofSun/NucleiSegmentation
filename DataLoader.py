@@ -184,9 +184,9 @@ class TestingDataset(Dataset):
         augments_instance = transforms(image=image, mask=ori_np_mask_instance)
         mask_instance_padded = augments_instance['mask']
         image_padded = augments_instance['image']
-        mask_binary_padded = (mask_instance_padded > 0).astype(np.int64)
 
         # 【修复】处理 mask_instance_padded 可能是 Tensor 的情况
+        # 必须先转换为 numpy，才能使用 .astype() 方法
         if isinstance(mask_instance_padded, torch.Tensor):
             mask_instance_padded_np = mask_instance_padded.cpu().numpy()
         else:
