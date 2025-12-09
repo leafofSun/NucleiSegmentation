@@ -8,7 +8,7 @@ import numpy as np
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from utils import train_transforms, get_boxes_from_mask, init_point_sampling
+from utils import train_transforms, get_transforms, get_boxes_from_mask, init_point_sampling
 import json
 import random
 
@@ -181,7 +181,8 @@ class TestingDataset(Dataset):
         h, w = ori_np_mask.shape
         ori_mask = torch.tensor(ori_np_mask).unsqueeze(0)
 
-        transforms = train_transforms(self.image_size, h, w)
+        # 测试模式：使用补零保持原分辨率（模仿 PromptNu）
+        transforms = get_transforms(self.image_size, h, w, mode='test')
         augments = transforms(image=image, mask=ori_np_mask)
         image, mask = augments['image'], augments['mask'].to(torch.int64)
 
@@ -353,7 +354,8 @@ class TrainingDataset(Dataset):
         
         image = (image - self.pixel_mean) / self.pixel_std
         h, w, _ = image.shape
-        transforms = train_transforms(self.image_size, h, w)
+        # 训练模式：使用随机裁剪（模仿 PromptNu）
+        transforms = get_transforms(self.image_size, h, w, mode='train')
     
         masks_list = []
         boxes_list = []
