@@ -177,8 +177,8 @@ def dice(pr, gt, eps=1e-7, threshold=0.5):
 def SegMetrics(pred, label, metrics):
     """
     计算分割指标。
-    pred: (B, C, H, W) 或 (B, H, W) 的预测结果（logits 或 binary）
-    label: (B, C, H, W) 或 (B, H, W) 的真实标签
+    pred: (B, C, H, W) 或 (B, H, W) 的预测结果（logits、binary 或 instance map）
+    label: (B, C, H, W) 或 (B, H, W) 的真实标签（binary 或 instance map）
     metrics: 字符串列表，如 ['mDice', 'mAJI', 'mPQ', 'mDQ', 'mSQ']
     """
     results = {}
@@ -187,17 +187,47 @@ def SegMetrics(pred, label, metrics):
     
     # 预处理数据，转换为 NumPy 格式以便进行实例计算
     pr_, gt_ = _list_tensor(pred, label)
-    # 语义分割二值化
-    pr_bin = _threshold(pr_, threshold=0.5)
-    gt_bin = _threshold(gt_, threshold=0.5)
     
-    # 转换为 Numpy (B, H, W) 假设单通道或多通道合并
-    if pr_bin.ndim == 4:
-        pr_np = pr_bin.squeeze(1).cpu().numpy().astype(int)
-        gt_np = gt_bin.squeeze(1).cpu().numpy().astype(int)
+    # [修改] 检查 pred 是否已经是实例图 (max > 1)
+    # 如果是实例图，跳过 sigmoid 和 threshold
+    pr_max = pr_.max().item()
+    if pr_max > 1:
+        # 已经是实例图，直接转换
+        if pr_.ndim == 4:
+            pr_np = pr_.squeeze(1).cpu().numpy().astype(int)
+        else:
+            pr_np = pr_.cpu().numpy().astype(int)
     else:
-        pr_np = pr_bin.cpu().numpy().astype(int)
-        gt_np = gt_bin.cpu().numpy().astype(int)
+        # 旧逻辑：如果是二值 logits，需要 sigmoid 和 threshold
+        pr_bin = _threshold(pr_, threshold=0.5)
+        if pr_bin.ndim == 4:
+            pr_np = pr_bin.squeeze(1).cpu().numpy().astype(int)
+        else:
+            pr_np = pr_bin.cpu().numpy().astype(int)
+    
+    # 处理 GT Label
+    # GT 通常是二值图 (0/1)，需要转连通域以计算实例指标
+    gt_bin = _threshold(gt_, threshold=0.5)
+    if gt_bin.ndim == 4:
+        gt_np_binary = gt_bin.squeeze(1).cpu().numpy().astype(int)
+    else:
+        gt_np_binary = gt_bin.cpu().numpy().astype(int)
+    
+    # 关键：如果 GT 是二值的，必须在这里做 measure.label 转换为实例图
+    # 这样 AJI 和 PQ 才能正确计算
+    if gt_np_binary.max() <= 1:
+        gt_np = np.zeros_like(gt_np_binary, dtype=int)
+        for i in range(gt_np_binary.shape[0]):
+            gt_np[i] = measure.label(gt_np_binary[i])
+    else:
+        # GT 已经是实例图
+        gt_np = gt_np_binary.astype(int)
+    
+    # 确保维度一致
+    if pr_np.ndim == 2:
+        pr_np = pr_np[np.newaxis, ...]
+    if gt_np.ndim == 2:
+        gt_np = gt_np[np.newaxis, ...]
         
     batch_size = pr_np.shape[0]
 
@@ -206,8 +236,19 @@ def SegMetrics(pred, label, metrics):
             results['iou'] = np.mean(iou(pred, label))
             
         elif metric == 'dice' or metric == 'mDice':
-            # 统一使用'dice'作为键名，保持兼容性
-            results['dice'] = np.mean(dice(pred, label))
+            # Dice 计算：如果 pred 是实例图，需要先转二值
+            if pr_max > 1:
+                # 临时转二值计算 Dice
+                pr_bin_tmp = (pr_np > 0).astype(int)
+                gt_bin_tmp = (gt_np > 0).astype(int)
+                # 计算 Dice
+                intersection = (pr_bin_tmp * gt_bin_tmp).sum(axis=(1, 2))
+                union = pr_bin_tmp.sum(axis=(1, 2)) + gt_bin_tmp.sum(axis=(1, 2))
+                dice_scores = (2.0 * intersection + 1e-7) / (union + 1e-7)
+                results['dice'] = np.mean(dice_scores)
+            else:
+                # 统一使用'dice'作为键名，保持兼容性
+                results['dice'] = np.mean(dice(pred, label))
             
         elif metric == 'mAJI':
             aji_sum = 0.0

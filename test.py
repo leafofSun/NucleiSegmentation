@@ -325,16 +325,52 @@ def main(args):
         # 后处理 masks：将低分辨率 masks 调整到原始图像尺寸
         masks, pad = postprocess_masks(low_res_masks, args.image_size, original_size)
         
-        # ================== [新增修复] 合并多个 Prompt 的预测结果 ==================
-        # 如果输入有 N 个框，masks 的形状会是 [N, 1, H, W]
-        # 我们需要将其合并为 [1, 1, H, W] 才能和 ori_labels 对比
+        # ================== [修复] 构建实例图 (Instance Map) 而不是简单合并 ==================
+        # 原逻辑: masks, _ = torch.max(masks, dim=0, keepdim=True) (导致粘连)
+        # 新逻辑: 为每个 box 的预测分配唯一 ID，构建实例索引图
+        
+        # 保存原始 logits 用于 loss 计算
+        masks_for_loss = masks.clone()
         if masks.shape[0] > 1:
-            # 使用 max 进行合并 (逻辑或：只要有一个预测为前景，就认为是前景)
-            masks, _ = torch.max(masks, dim=0, keepdim=True)
+            # 对于 loss 计算，使用 max 合并（保持原有逻辑）
+            masks_for_loss, _ = torch.max(masks_for_loss, dim=0, keepdim=True)
+        
+        N, _, H, W = masks.shape
+        
+        if N > 1:
+            # 构建实例图：为每个预测分配唯一 ID
+            full_instance_map = torch.zeros((H, W), dtype=torch.int32, device=masks.device)
             
-            # 同时处理 iou_predictions：如果有多个，取最大值（表示最好的预测）
+            # 将 logits 转为概率
+            probs = torch.sigmoid(masks)
+            
+            # 逐个叠加实例 (Painter's Algorithm)
+            # 注意：如果有重叠，后一个会覆盖前一个
+            # 更高级的做法是比较重叠区域的置信度，但对于细胞核，这种简单做法通常够用
+            for idx in range(N):
+                # 获取第 idx 个实例的 mask (阈值 0.5)
+                # shape: [1, H, W]
+                single_mask = probs[idx] > 0.5
+                
+                # 赋值 ID (idx + 1)，因为 0 是背景
+                # 只在 mask 为 True 的地方赋值
+                full_instance_map[single_mask.squeeze()] = idx + 1
+            
+            # 调整维度以适配后续代码 [H, W] -> [1, 1, H, W]
+            # 注意：现在 masks 里面存的是 int32 的 ID，不再是 logits
+            masks = full_instance_map.unsqueeze(0).unsqueeze(0).float()
+            
+            # iou_predictions 也取最大值或者平均值，仅用于 loss 计算
             if iou_predictions is not None and iou_predictions.shape[0] > 1:
                 iou_predictions, _ = torch.max(iou_predictions, dim=0, keepdim=True)
+        else:
+            # 如果只有一个预测，仍然需要转换为实例图格式（ID=1）
+            probs = torch.sigmoid(masks)
+            single_mask = (probs > 0.5).squeeze()
+            full_instance_map = torch.zeros((H, W), dtype=torch.int32, device=masks.device)
+            full_instance_map[single_mask] = 1
+            masks = full_instance_map.unsqueeze(0).unsqueeze(0).float()
+        # ================== [结束修复] ==================
         
         if args.save_pred:
             save_masks(masks, save_path, img_name, args.image_size, original_size, pad, batched_input.get("boxes", None), points_show)
@@ -371,7 +407,8 @@ def main(args):
                 print(f"  >>> 二值化后: Min={ori_labels.min().item():.4f}, Max={ori_labels.max().item():.4f}")
         # ================== [结束] 标签值域检查和修复 ==================
         
-        loss = criterion(masks, ori_labels, iou_predictions)
+        # 使用原始 logits 计算 loss（masks_for_loss 是 logits，masks 是实例图）
+        loss = criterion(masks_for_loss, ori_labels, iou_predictions)
         test_loss.append(loss.item())
 
         test_batch_metrics = SegMetrics(masks, ori_labels, args.metrics)
