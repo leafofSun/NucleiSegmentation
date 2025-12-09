@@ -130,6 +130,8 @@ def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_em
     # 如果 boxes 的形状是 [1, N, 4]，需要 reshape 为 [N, 4] 以便 prompt_encoder 正确处理
     boxes = batched_input.get("boxes", None)
     num_boxes = 1  # 默认 batch size
+    max_boxes = 50  # 限制最大 boxes 数量以避免显存溢出
+    
     if boxes is not None:
         if len(boxes.shape) == 3 and boxes.shape[0] == 1:
             # [1, N, 4] -> [N, 4]
@@ -142,6 +144,11 @@ def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_em
             # 其他情况，尝试 flatten
             boxes = boxes.reshape(-1, 4)
             num_boxes = boxes.shape[0]
+    
+    # 【显存保护】如果 boxes 数量过多，只取前 max_boxes 个
+    if num_boxes > max_boxes:
+        boxes = boxes[:max_boxes]
+        num_boxes = max_boxes
     
     # 如果有多于1个框，需要扩展 image_embeddings 以匹配 batch size
     if num_boxes > 1:
