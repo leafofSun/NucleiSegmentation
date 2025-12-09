@@ -151,7 +151,7 @@ class TestingDataset(Dataset):
         
         image = (image - self.pixel_mean) / self.pixel_std
 
-        # === 1. 读取原始实例 Mask (保持 ID) ===
+        # === 1. 读取并合并实例 Mask ===
         mask_paths = self.mask_paths_list[index]
         ori_np_mask_instance = None
         for mask_path in mask_paths:
@@ -159,7 +159,6 @@ class TestingDataset(Dataset):
             if mask is None:
                 raise ValueError(f"无法读取掩码文件: {mask_path}")
             
-            # 保持原始值，不进行二值化
             mask = mask.astype(np.float32)
             
             if ori_np_mask_instance is None:
@@ -168,69 +167,37 @@ class TestingDataset(Dataset):
                 if mask.shape != ori_np_mask_instance.shape:
                     mask = cv2.resize(mask, (ori_np_mask_instance.shape[1], ori_np_mask_instance.shape[0]), interpolation=cv2.INTER_NEAREST)
                 # 智能合并：避免 ID 冲突
-                current_max_id = ori_np_mask_instance.max()
-                if current_max_id > 0 and mask.max() > 0:
-                    mask[mask > 0] += current_max_id
-                ori_np_mask_instance = np.maximum(ori_np_mask_instance, mask)
+                max_id = ori_np_mask_instance.max()
+                mask_offset = mask.copy()
+                if max_id > 0 and mask.max() > 0:
+                    mask_offset[mask_offset > 0] += max_id
+                ori_np_mask_instance = np.maximum(ori_np_mask_instance, mask_offset)
         
         if ori_np_mask_instance is None:
             raise ValueError(f"没有找到有效的掩码文件")
 
         h, w = ori_np_mask_instance.shape
 
-        # === 2. 【关键修复】先对 Mask 进行 Padding，再生成 Box ===
-        # 这样 Box 的坐标才能和 Padding 后的图像对齐！
+        # === 2. 【关键修复】先进行 Padding Transform ===
+        # 注意：这里我们传入 instance mask，这样 padding 后的 mask 依然保留 ID
         transforms = get_transforms(self.image_size, h, w, mode='test')
-        
-        # Albumentations 需要 mask 是 numpy 数组
         augments = transforms(image=image, mask=ori_np_mask_instance)
-        image_padded = augments['image']
-        mask_instance_padded = augments['mask']  # 这是 1024x1024 的实例图
         
+        image_padded = augments['image']  # 这是喂给 SAM 的图 (1024x1024)
+        mask_instance_padded = augments['mask']  # 这是对应的 mask (1024x1024)
+
         # 【修复】处理 mask_instance_padded 可能是 Tensor 的情况
-        # ToTensorV2 会将 numpy 转换为 Tensor，需要转换回 numpy
         if isinstance(mask_instance_padded, torch.Tensor):
             mask_instance_padded_np = mask_instance_padded.cpu().numpy()
         else:
             mask_instance_padded_np = mask_instance_padded
-        
-        # 生成 Box (基于 Padded Mask)
+
+        # === 3. 【关键修复】基于 Padded Mask 生成 Box ===
+        # 这样 Box 的坐标才能和 image_padded 对齐
         if self.prompt_path is None:
-            # 使用 Padded 的实例图生成框
-            # 此时 max_pixel=0 确保测试时无随机抖动
-            from skimage.measure import label, regionprops
-            if mask_instance_padded_np.max() > 1:
-                label_img = mask_instance_padded_np.astype(int)
-            else:
-                label_img = label(mask_instance_padded_np)
-            regions = regionprops(label_img)
-            num_regions = len(regions)
-            box_num = min(num_regions, 500) if num_regions > 0 else 1
-            boxes = get_boxes_from_mask(mask_instance_padded_np, box_num=box_num, max_pixel=0)
-            
-            # Point prompt 还是用二值图生成即可 (基于 Padded)
-            binary_mask_padded = (mask_instance_padded_np > 0).astype(np.float32)
-            point_coords, point_labels = init_point_sampling(binary_mask_padded, self.point_num)
-        else:
-            # 如果从文件加载 prompt，这里需要小心，通常文件里的 prompt 是基于原图的
-            # 如果用了 Padding，文件里的 prompt 需要加上 padding offset 才能用
-            # 简单起见，这里假设 self.prompt_path is None
-            prompt_key = self.image_paths[index].split('/')[-1]
-            prompt_key_no_ext = prompt_key.split('.')[0] if '.' in prompt_key else prompt_key
-            
-            prompt_data = None
-            if prompt_key_no_ext in self.prompt_list:
-                prompt_data = self.prompt_list[prompt_key_no_ext]
-            elif prompt_key in self.prompt_list:
-                prompt_data = self.prompt_list[prompt_key]
-            
-            if prompt_data is not None and "boxes" in prompt_data and "point_coords" in prompt_data and "point_labels" in prompt_data:
-                # 使用 JSON 文件中的 prompt 数据（注意：可能需要调整坐标以匹配 Padding）
-                boxes = torch.as_tensor(prompt_data["boxes"], dtype=torch.float)
-                point_coords = torch.as_tensor(prompt_data["point_coords"], dtype=torch.float)
-                point_labels = torch.as_tensor(prompt_data["point_labels"], dtype=torch.int)
-            else:
-                # 从 Padded Mask 生成
+            # 只有 max > 0 (有前景) 才生成
+            if mask_instance_padded_np.max() > 0:
+                # 传入 padded 的 mask
                 from skimage.measure import label, regionprops
                 if mask_instance_padded_np.max() > 1:
                     label_img = mask_instance_padded_np.astype(int)
@@ -240,31 +207,47 @@ class TestingDataset(Dataset):
                 num_regions = len(regions)
                 box_num = min(num_regions, 500) if num_regions > 0 else 1
                 boxes = get_boxes_from_mask(mask_instance_padded_np, box_num=box_num, max_pixel=0)
-                binary_mask_padded = (mask_instance_padded_np > 0).astype(np.float32)
-                point_coords, point_labels = init_point_sampling(binary_mask_padded, self.point_num)
+                
+                # Point 同理，基于 padded
+                mask_binary_padded = (mask_instance_padded_np > 0).astype(np.float32)
+                point_coords, point_labels = init_point_sampling(mask_binary_padded, self.point_num)
+            else:
+                # 兜底：全是背景
+                boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
+                point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
+                point_labels = torch.tensor([[0]], dtype=torch.int)
+        else:
+            # 如果加载 json prompt，需要手动加 padding offset，这里暂略
+            # 从 Padded Mask 生成作为兜底
+            if mask_instance_padded_np.max() > 0:
+                from skimage.measure import label, regionprops
+                if mask_instance_padded_np.max() > 1:
+                    label_img = mask_instance_padded_np.astype(int)
+                else:
+                    label_img = label(mask_instance_padded_np)
+                regions = regionprops(label_img)
+                num_regions = len(regions)
+                box_num = min(num_regions, 500) if num_regions > 0 else 1
+                boxes = get_boxes_from_mask(mask_instance_padded_np, box_num=box_num, max_pixel=0)
+                mask_binary_padded = (mask_instance_padded_np > 0).astype(np.float32)
+                point_coords, point_labels = init_point_sampling(mask_binary_padded, self.point_num)
+            else:
+                boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
+                point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
+                point_labels = torch.tensor([[0]], dtype=torch.int)
 
-        # === 3. 准备模型输入 ===
-        # image_encoder 输入的是 Padded Image
+        # === 4. 组装输入 ===
         image_input["image"] = image_padded
-        # mask_decoder 输入的提示是基于 Padded 坐标的
         image_input["boxes"] = boxes
         image_input["point_coords"] = point_coords
         image_input["point_labels"] = point_labels
-        
-        # label 通常用于计算 loss，这里给一个 Dummy 或者 Padded Binary Mask
-        # 注意：test.py 计算 loss 用的是 masks 和 ori_labels
-        # 这里返回 padded binary mask 给 train.py 里的 batch 组装逻辑（虽然 test 不一定用）
-        if isinstance(mask_instance_padded, torch.Tensor):
-            image_input["label"] = (mask_instance_padded > 0).float().unsqueeze(0)
-        else:
-            image_input["label"] = torch.tensor(mask_instance_padded_np > 0).float().unsqueeze(0)
-
+        # label 用于 train batch 组装，给个 padded binary 即可
+        image_input["label"] = torch.tensor(mask_instance_padded_np > 0).float().unsqueeze(0)
         image_input["original_size"] = (h, w)
         if mask_paths:
             image_input["label_path"] = '/'.join(mask_paths[0].split('/')[:-1])
 
-        # === 4. 【关键修复】返回原始尺寸的 Instance Mask 用于评估 ===
-        # ori_label 用于 SegMetrics 计算 AJI/PQ，必须是 Instance Map 且是原图尺寸
+        # === 5. 返回原始尺寸的实例 Mask (用于 metrics 计算) ===
         if self.return_ori_mask:
             image_input["ori_label"] = torch.tensor(ori_np_mask_instance).unsqueeze(0)
      
@@ -272,27 +255,13 @@ class TestingDataset(Dataset):
         if self.requires_name:
             image_input["name"] = image_name
         
-        # PNuRL 属性保持不变
+        # PNuRL 属性信息
         if self.attribute_info:
             label_key = self.image_paths[index]
             if label_key not in self.attribute_info:
                 label_key = image_name
             if label_key in self.attribute_info:
                 attr_info = self.attribute_info[label_key]
-                if 'attribute_prompts' in attr_info:
-                    image_input['attribute_prompts'] = attr_info['attribute_prompts']
-        
-        return image_input
-        if self.attribute_info:
-            # 使用图片路径或图片名作为key查找属性信息
-            label_key = self.image_paths[index]
-            # 也尝试使用文件名作为key
-            if label_key not in self.attribute_info:
-                label_key = image_name
-            
-            if label_key in self.attribute_info:
-                attr_info = self.attribute_info[label_key]
-                # 测试时只需要attribute_prompts，不需要attribute_labels
                 if 'attribute_prompts' in attr_info:
                     image_input['attribute_prompts'] = attr_info['attribute_prompts']
         
