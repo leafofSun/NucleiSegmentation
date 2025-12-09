@@ -133,13 +133,13 @@ class AttributeAttention(nn.Module):
 class PNuRL(nn.Module):
     """
     Prompting Nuclei Representation Learning 模块
-    使用 SAM 的 ViT 编码器替代 ResNet-50
+    架构融合：SAM ViT Image Encoder + CLIP ViT Text Encoder
     """
     def __init__(
         self,
         feat_dim: int = 256,  # SAM ViT 的 out_chans
         embed_dim: int = 256,  # 嵌入维度
-        clip_model_path: Optional[str] = None,
+        clip_model_path: Optional[str] = "ViT-B/16",  # 默认改为 ViT-B/16
         num_classes_per_attr: List[int] = [3, 5, 4, 3, 3],
         attr_loss_weight: float = 1.0,
     ):
@@ -147,7 +147,7 @@ class PNuRL(nn.Module):
         Args:
             feat_dim: 图像特征维度（SAM ViT 输出维度）
             embed_dim: 文本嵌入维度
-            clip_model_path: CLIP 模型路径（用于文本编码）
+            clip_model_path: CLIP 模型名称 (如 "ViT-B/16") 或 本地权重路径
             num_classes_per_attr: 每个属性的类别数量 [颜色, 形状, 排列, 大小, 分布]
             attr_loss_weight: 属性损失权重
         """
@@ -162,50 +162,44 @@ class PNuRL(nn.Module):
             num_classes_per_attr=num_classes_per_attr
         )
         
-        # CLIP 文本编码器（用于属性感知提示）
+        # === 修改部分开始：CLIP 文本编码器加载逻辑 ===
+        self.clip_model = None
         if CLIP_AVAILABLE:
             try:
-                # 检查 clip_model_path 是否是有效的文件路径
-                if clip_model_path and os.path.isfile(clip_model_path):
-                    # 如果提供了有效的模型文件路径，尝试加载自定义权重
-                    self.clip_model, _ = clip.load("ViT-B/16", device="cpu", jit=False)
-                    try:
-                        # 尝试加载预训练权重（.pt 文件）
-                        checkpoint = torch.jit.load(clip_model_path, map_location='cpu')
-                        state_dict = checkpoint.state_dict()
-                        # 只加载文本编码器部分
-                        text_state_dict = {}
-                        for k, v in state_dict.items():
-                            if k.startswith('transformer.') or k.startswith('token_embedding') or k.startswith('text_projection'):
-                                text_state_dict[k] = v
-                        if text_state_dict:
-                            self.clip_model.load_state_dict(text_state_dict, strict=False)
-                            print(f"✓ 成功加载 CLIP 文本编码器权重: {clip_model_path}")
-                    except Exception as e:
-                        print(f"Warning: 无法从 {clip_model_path} 加载 CLIP 文本编码器权重: {e}")
-                        print("  将使用默认的 CLIP 预训练模型")
-                elif clip_model_path and os.path.isdir(clip_model_path):
-                    # 如果是目录，忽略它并使用默认模型
-                    print(f"Warning: {clip_model_path} 是目录而非文件，将使用默认的 CLIP 预训练模型")
-                    self.clip_model, _ = clip.load("ViT-B/16", device="cpu", jit=False)
-                else:
-                    # 使用默认的 CLIP 预训练模型（会自动下载或从缓存加载）
-                    self.clip_model, _ = clip.load("ViT-B/16", device="cpu", jit=False)
-                    if clip_model_path:
-                        print(f"Warning: clip_model_path '{clip_model_path}' 不存在，使用默认 CLIP 模型")
+                model_name = clip_model_path if clip_model_path else "ViT-B/16"
+                print(f"Loading CLIP Text Encoder: {model_name}...")
+                
+                # 1. 尝试直接加载标准 CLIP 模型 (自动下载或读取缓存)
+                # jit=False 是为了支持后续的微调或梯度传播
+                model, _ = clip.load(model_name, device="cpu", jit=False)
+                self.clip_model = model
+                
+                # 2. 【关键优化】为了节省显存，我们只需要 CLIP 的 Text Encoder
+                # PNuRL 的图像特征来自 SAM，不需要 CLIP 的 Visual Encoder
+                if hasattr(self.clip_model, 'visual'):
+                    del self.clip_model.visual
+                    print("  - 已移除 CLIP Visual Encoder 以节省显存")
+                
+                # 3. 冻结 CLIP 参数 (通常不需要训练 CLIP 本身，除非显存足够且数据量巨大)
+                for param in self.clip_model.parameters():
+                    param.requires_grad = False
+                
+                print(f"✓ 成功加载 CLIP (Text-Only): {model_name}")
+
             except Exception as e:
                 print(f"Warning: 加载 CLIP 模型失败: {e}")
-                print("  将无法使用文本编码功能，PNuRL 将使用随机文本特征")
+                print("  试图加载本地路径失败，或者网络无法下载 ViT-B/16。")
                 self.clip_model = None
         else:
-            self.clip_model = None
-            print("Warning: CLIP 包未安装，PNuRL 将使用随机文本特征")
+            print("Warning: CLIP 包未安装。")
+        # === 修改部分结束 ===
         
-        # 文本特征投影层
+        # 文本特征投影层 (CLIP输出通常是512或768，需要投影到 embed_dim=256)
         if self.clip_model is not None:
             text_dim = self.clip_model.text_projection.shape[1] if hasattr(self.clip_model, 'text_projection') else 512
             self.text_proj = nn.Linear(text_dim, embed_dim)
         else:
+            # 如果没有 CLIP，使用随机层兜底
             self.text_proj = nn.Linear(512, embed_dim)
         
         # 属性注意力机制
@@ -233,11 +227,17 @@ class PNuRL(nn.Module):
             with torch.no_grad():
                 # 将多个属性提示合并为一个句子
                 combined_prompt = ", ".join(attribute_prompts)
-                text_tokens = clip.tokenize([combined_prompt]).to(next(self.parameters()).device)
+                # 确保 token 在正确的 device 上
+                device = next(self.parameters()).device
+                text_tokens = clip.tokenize([combined_prompt], truncate=True).to(device)
+                
+                # 调用 CLIP 的 encode_text
                 text_features = self.clip_model.encode_text(text_tokens)
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                
+                # 转换为 float (CLIP 可能是 float16)
+                text_features = text_features.float()
         else:
-            # 如果没有 CLIP，使用随机特征
             batch_size = 1
             text_features = torch.randn(batch_size, 512, device=next(self.parameters()).device)
         
