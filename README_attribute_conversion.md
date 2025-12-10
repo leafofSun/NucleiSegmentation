@@ -113,3 +113,4 @@ ATTRIBUTE_MAPPINGS = {
 2. **类别数量**：必须与 PNuRL 的 `num_classes_per_attr` 参数匹配（默认 `[3, 5, 4, 3, 3]`）
 3. **图像ID格式**：转换脚本会自动移除图像ID的扩展名（如 `image_00.png` → `image_00`）
 
+

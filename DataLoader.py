@@ -198,8 +198,8 @@ class TestingDataset(Dataset):
             # 只有 max > 0 (有前景) 才生成
             if mask_instance_padded_np.max() > 0:
                 # 传入 padded 的 mask (确保是 numpy 格式)
-                # 限制 box_num 以避免显存溢出（500 个 boxes 会导致 OOM）
-                # 根据实际细胞核数量动态调整，但不超过 100
+                # 在显存允许的情况下（Batch Size=1时通常没问题），提高上限到 500
+                # 根据实际细胞核数量动态调整，但不超过 500
                 from skimage.measure import label, regionprops
                 if mask_instance_padded_np.max() > 1:
                     label_img = mask_instance_padded_np.astype(int)
@@ -207,7 +207,7 @@ class TestingDataset(Dataset):
                     label_img = label(mask_instance_padded_np)
                 regions = regionprops(label_img)
                 num_regions = len(regions)
-                box_num = min(num_regions, 100) if num_regions > 0 else 1
+                box_num = min(num_regions, 500) if num_regions > 0 else 1
                 boxes = get_boxes_from_mask(mask_instance_padded_np, box_num=box_num, max_pixel=0)
                 
                 # Point 同理，基于 padded

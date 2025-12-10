@@ -17,7 +17,7 @@ def get_boxes_from_mask(mask, box_num=1, std=0.1, max_pixel=5):
     从 mask 中提取边界框，支持空 mask 的健壮处理
     
     Args:
-        mask: Mask, can be a torch.Tensor or a numpy array of binary mask.
+        mask: Mask, can be a torch.Tensor or a numpy array of binary mask or instance mask.
         box_num: Number of bounding boxes, default is 1.
         std: Standard deviation of the noise, default is 0.1.
         max_pixel: Maximum noise pixel value, default is 5.
@@ -27,7 +27,12 @@ def get_boxes_from_mask(mask, box_num=1, std=0.1, max_pixel=5):
     if isinstance(mask, torch.Tensor):
         mask = mask.numpy()
 
-    label_img = label(mask)
+    # === [修复] 智能判断：如果是实例图，不要重新 label ===
+    # 这样能保留原本紧贴着的独立实例
+    if mask.max() > 1:
+        label_img = mask.astype(int)
+    else:
+        label_img = label(mask)
     regions = regionprops(label_img)
 
     # 获取所有区域的框
