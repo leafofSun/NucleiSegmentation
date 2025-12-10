@@ -380,7 +380,14 @@ def main(args):
         # ================== [结束修复] ==================
         
         if args.save_pred:
-            save_masks(masks, save_path, img_name, args.image_size, original_size, pad, batched_input.get("boxes", None), points_show)
+            # 处理 boxes 的形状：可能是 [B, N, 4] 或 [N, 4]
+            boxes_for_vis = None
+            if batched_input.get("boxes", None) is not None:
+                boxes_for_vis = batched_input["boxes"]
+                # 去掉 batch 维度（如果有）
+                if boxes_for_vis.dim() == 3:
+                    boxes_for_vis = boxes_for_vis.squeeze(0)
+            save_masks(masks, save_path, img_name, args.image_size, original_size, pad, boxes_for_vis, points_show)
         # ================== [结束修复] ==================
 
         # 确保ori_labels的形状与masks匹配：[B, 1, H, W]
