@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument("--save_pred", type=bool, default=False, help="save reslut")
     # PNuRL相关参数
     parser.add_argument("--use_pnurl", action='store_true', help="启用PNuRL（使用属性提示词增强图像特征）")
-    parser.add_argument("--pnurl_clip_path", type=str, default=None, help="CLIP模型路径（用于PNuRL文本编码）")
+    parser.add_argument("--pnurl_clip_path", type=str, default="ViT-B/16", help="CLIP模型路径（用于PNuRL文本编码）")
     parser.add_argument("--pnurl_num_classes", type=str, default="3,5,4,3,3", help="PNuRL每个属性的类别数量，格式：颜色,形状,排列,大小,分布（默认：3,5,4,3,3）")
     parser.add_argument("--attribute_info_path", type=str, default=None, help="属性信息文件路径（如果不在data_dir中）")
     args = parser.parse_args()
@@ -397,6 +397,14 @@ def main(args):
             # 将 ori_labels 调整到 masks 的尺寸
             ori_labels = F.interpolate(ori_labels, size=masks.shape[2:], mode='nearest')
         
+        # [新增] 清洗 GT 标签，将 ID 重排为 1, 2, 3...
+        # 解决 ori_labels max=11730 的问题
+        from skimage.segmentation import relabel_sequential
+        gt_numpy = ori_labels.squeeze().cpu().numpy().astype(int)
+        gt_relabelled, _, _ = relabel_sequential(gt_numpy)
+        # 更新 ori_labels
+        ori_labels = torch.tensor(gt_relabelled).unsqueeze(0).unsqueeze(0).to(args.device).float()
+        
         # ================== [开始] 标签值域检查和修复 ==================
         # 调试：检查标签值域（只打印第一张图）
         if i == 0:
@@ -423,17 +431,9 @@ def main(args):
         test_loss.append(loss.item())
 
         # ================== [开始修复] 数据对齐与清洗 ==================
-        # 1. 重新映射 ori_labels 的 ID，使其从 1 开始连续排列
-        #    解决 Max=11730 的问题，把它变成 1...N
-        #    注意：ori_labels 是 tensor [1, 1, H, W]
-        gt_numpy = ori_labels.squeeze().cpu().numpy().astype(int)
-        
-        # 使用 skimage.segmentation.relabel_sequential 重新编号
-        from skimage.segmentation import relabel_sequential
-        gt_relabelled, _, _ = relabel_sequential(gt_numpy)
-        
-        # 转回 Tensor
-        ori_labels_clean = torch.tensor(gt_relabelled).unsqueeze(0).unsqueeze(0).to(args.device).float()
+        # 注意：ori_labels 已经在前面进行了重排（在形状调整之后）
+        # 直接使用已经重排过的 ori_labels
+        ori_labels_clean = ori_labels
         
         # 2. 确保 Pred 也是干净的实例图
         #    masks 已经是我们自己构建的实例图，通常从 1 开始，问题不大
