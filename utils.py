@@ -282,7 +282,7 @@ def draw_boxes(img, boxes):
     return img_copy
 
 
-def save_masks(preds, save_path, mask_name, image_size, original_size, pad=None,  boxes=None, points=None, visual_prompt=False):
+def save_masks(preds, save_path, mask_name, image_size, original_size, pad=None,  boxes=None, points=None, visual_prompt=True):
     ori_h, ori_w = original_size
 
     preds = torch.sigmoid(preds)
@@ -290,40 +290,79 @@ def save_masks(preds, save_path, mask_name, image_size, original_size, pad=None,
     preds[preds <= 0.5] = int(0)
 
     mask = preds.squeeze().cpu().numpy()
+    
+    # 确保 mask 的尺寸与 original_size 匹配
+    if mask.shape[0] != ori_h or mask.shape[1] != ori_w:
+        mask = cv2.resize(mask, (ori_w, ori_h), interpolation=cv2.INTER_NEAREST)
+    
     mask = cv2.cvtColor(mask * 255, cv2.COLOR_GRAY2BGR)
 
     if visual_prompt: #visualize the prompt
         if boxes is not None:
-            boxes = boxes.squeeze().cpu().numpy()
-
-            x0, y0, x1, y1 = boxes
-            if pad is not None:
-                x0_ori = int((x0 - pad[1]) + 0.5)
-                y0_ori = int((y0 - pad[0]) + 0.5)
-                x1_ori = int((x1 - pad[1]) + 0.5)
-                y1_ori = int((y1 - pad[0]) + 0.5)
-            else:
-                x0_ori = int(x0 * ori_w / image_size) 
-                y0_ori = int(y0 * ori_h / image_size) 
-                x1_ori = int(x1 * ori_w / image_size) 
-                y1_ori = int(y1 * ori_h / image_size)
-
-            boxes = [(x0_ori, y0_ori, x1_ori, y1_ori)]
-            mask = draw_boxes(mask, boxes)
+            # 处理 boxes：可能是 [N, 4] 或 [4] 的形状
+            boxes_np = boxes.cpu().numpy() if isinstance(boxes, torch.Tensor) else boxes
+            if boxes_np.ndim == 1:
+                boxes_np = boxes_np.reshape(1, -1)
+            elif boxes_np.ndim > 2:
+                boxes_np = boxes_np.reshape(-1, 4)
+            
+            # 转换每个 box 的坐标：从 padded 图像坐标到原图坐标
+            boxes_ori = []
+            for box in boxes_np:
+                x0, y0, x1, y1 = box
+                if pad is not None:
+                    # pad 格式是 (top, left)，boxes 是在 padded 图像上的坐标
+                    # 需要减去 padding 才能回到原图坐标
+                    x0_ori = max(0, int(x0 - pad[1] + 0.5))
+                    y0_ori = max(0, int(y0 - pad[0] + 0.5))
+                    x1_ori = min(ori_w, int(x1 - pad[1] + 0.5))
+                    y1_ori = min(ori_h, int(y1 - pad[0] + 0.5))
+                else:
+                    # 如果没有 padding，说明图像被缩放了，需要按比例转换
+                    x0_ori = int(x0 * ori_w / image_size) 
+                    y0_ori = int(y0 * ori_h / image_size) 
+                    x1_ori = int(x1 * ori_w / image_size) 
+                    y1_ori = int(y1 * ori_h / image_size)
+                
+                # 确保坐标有效
+                if x1_ori > x0_ori and y1_ori > y0_ori:
+                    boxes_ori.append((x0_ori, y0_ori, x1_ori, y1_ori))
+            
+            if boxes_ori:
+                mask = draw_boxes(mask, boxes_ori)
 
         if points is not None:
-            point_coords, point_labels = points[0].squeeze(0).cpu().numpy(),  points[1].squeeze(0).cpu().numpy()
-            point_coords = point_coords.tolist()
-            if pad is not None:
-                ori_points = [[int((x * ori_w / image_size)) , int((y * ori_h / image_size))]if l==0 else [x - pad[1], y - pad[0]]  for (x, y), l in zip(point_coords, point_labels)]
-            else:
-                ori_points = [[int((x * ori_w / image_size)) , int((y * ori_h / image_size))] for x, y in point_coords]
-
-            for point, label in zip(ori_points, point_labels):
-                x, y = map(int, point)
+            point_coords, point_labels = points[0], points[1]
+            # 处理 point_coords 和 point_labels 的形状
+            if isinstance(point_coords, torch.Tensor):
+                point_coords = point_coords.squeeze(0).cpu().numpy()
+            if isinstance(point_labels, torch.Tensor):
+                point_labels = point_labels.squeeze(0).cpu().numpy()
+            
+            # 确保 point_coords 是 [N, 2] 形状
+            if point_coords.ndim == 1:
+                point_coords = point_coords.reshape(1, -1)
+            elif point_coords.ndim > 2:
+                point_coords = point_coords.reshape(-1, 2)
+            
+            # 确保 point_labels 是 [N] 形状
+            if point_labels.ndim > 1:
+                point_labels = point_labels.flatten()
+            
+            # 转换每个点的坐标：从 padded 图像坐标到原图坐标
+            for (x, y), label in zip(point_coords, point_labels):
+                if pad is not None:
+                    # pad 格式是 (top, left)，points 是在 padded 图像上的坐标
+                    x_ori = max(0, min(ori_w - 1, int(x - pad[1] + 0.5)))
+                    y_ori = max(0, min(ori_h - 1, int(y - pad[0] + 0.5)))
+                else:
+                    # 如果没有 padding，说明图像被缩放了，需要按比例转换
+                    x_ori = max(0, min(ori_w - 1, int(x * ori_w / image_size)))
+                    y_ori = max(0, min(ori_h - 1, int(y * ori_h / image_size)))
+                
                 color = (0, 255, 0) if label == 1 else (0, 0, 255)
-                mask[y, x] = color
-                cv2.drawMarker(mask, (x, y), color, markerType=cv2.MARKER_CROSS , markerSize=7, thickness=2)  
+                mask[y_ori, x_ori] = color
+                cv2.drawMarker(mask, (x_ori, y_ori), color, markerType=cv2.MARKER_CROSS, markerSize=7, thickness=2)  
     os.makedirs(save_path, exist_ok=True)
     mask_path = os.path.join(save_path, f"{mask_name}")
     cv2.imwrite(mask_path, np.uint8(mask))
