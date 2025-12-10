@@ -230,7 +230,9 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
         optimizer.zero_grad()
 
         if int(batch+1) % 50 == 0:
-            batch_metrics = SegMetrics(masks, labels, args.metrics)
+            # 将 Logits 转为 0/1 二值图
+            masks_binary = (masks > 0.0).float()
+            batch_metrics = SegMetrics(masks_binary, labels, args.metrics)
             if isinstance(batch_metrics, dict):
                 metrics_str = ', '.join([f"{k}: {v:.4f}" for k, v in batch_metrics.items()])
             else:
@@ -282,7 +284,9 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
                 batched_input = to_device(batched_input, args.device)
        
             if int(batch+1) % 50 == 0:
-                batch_metrics = SegMetrics(masks, labels, args.metrics)
+                # 将 Logits 转为 0/1 二值图
+                masks_binary = (masks > 0.0).float()
+                batch_metrics = SegMetrics(masks_binary, labels, args.metrics)
                 if isinstance(batch_metrics, dict):
                     metrics_str = ', '.join([f"{k}: {v:.4f}" for k, v in batch_metrics.items()])
                 else:
@@ -304,7 +308,9 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion):
         gpu_info['gpu_name'] = args.device 
         train_loader.set_postfix(train_loss=loss.item(), gpu_info=gpu_info)
 
-        train_batch_metrics = SegMetrics(masks, labels, args.metrics)
+        # 将 Logits 转为 0/1 二值图
+        masks_binary = (masks > 0.0).float()
+        train_batch_metrics = SegMetrics(masks_binary, labels, args.metrics)
         # SegMetrics返回字典，需要转换为列表格式
         if isinstance(train_batch_metrics, dict):
             # 处理metric名称映射：mDice -> dice（因为metrics.py中mDice返回的键是'dice'）
