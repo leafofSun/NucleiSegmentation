@@ -363,47 +363,82 @@ class TrainingDataset(Dataset):
         masks_list = []
         boxes_list = []
         point_coords_list, point_labels_list = [], []
+        
+        # 随机选择 mask_num 个样本进行训练
         mask_path = random.choices(self.label_paths[index], k=self.mask_num)
+        
         for m in mask_path:
             pre_mask = cv2.imread(m, 0)
             if pre_mask is None:
                 raise ValueError(f"无法读取掩码文件: {m}")
-            # 【修复】保持实例 ID，用于 RandomCrop 后的 Box 生成
             pre_mask = pre_mask.astype(np.float32)
 
-            # ================== [开始修改] 添加重试机制 ==================
-            # 尝试裁剪最多 10 次，直到找到包含前景（细胞核）的图块
-            # 这样可以避免 RandomCrop 裁剪到空白区域导致的 ZeroDivisionError
+            # 1. 随机裁剪并尝试找到有细胞的区域
             for retry_count in range(10):
                 augments = transforms(image=image, mask=pre_mask)
                 image_tensor = augments['image']
-                mask_instance_crop = augments['mask']  # 这是裁剪后的实例图
+                mask_instance_crop = augments['mask'] # 裁剪后的实例图
                 
-                # 【修复】处理 mask_instance_crop 可能是 Tensor 的情况
+                # 转换为 numpy
                 if isinstance(mask_instance_crop, torch.Tensor):
                     mask_instance_crop_np = mask_instance_crop.cpu().numpy()
-                    mask_max = mask_instance_crop.max().item()
                 else:
                     mask_instance_crop_np = mask_instance_crop
-                    mask_max = mask_instance_crop.max()
                 
-                if mask_max > 0:
+                if mask_instance_crop_np.max() > 0:
                     break
-            # 如果 10 次重试后仍然没有前景，使用最后一次的结果（utils.py 会处理空 mask）
-            # ================== [结束修改] ==================
-
-            # 1. 生成 Box (基于裁剪后的实例图)
-            # 使用 numpy 版本的 mask
-            boxes = get_boxes_from_mask(mask_instance_crop_np)
             
-            # 2. 生成 Point (基于裁剪后的二值图)
-            mask_binary_crop = (mask_instance_crop_np > 0).astype(np.float32)
-            point_coords, point_label = init_point_sampling(mask_binary_crop, self.point_num)
-
-            # 3. 【关键】存入列表的是 二值化 的 Mask
-            # 因为 train.py 的 Loss 函数 (Focal/Dice) 需要 0/1 标签
-            masks_list.append(torch.tensor(mask_binary_crop).long())
+            # 2. 【核心修复】分离目标实例
+            # 我们不能简单地用 mask > 0 作为标签，必须选出一个特定的实例
+            from skimage.measure import label, regionprops
             
+            # 获取所有连通域
+            if mask_instance_crop_np.max() > 1:
+                label_img = mask_instance_crop_np.astype(int)
+            else:
+                label_img = label(mask_instance_crop_np)
+                
+            regions = regionprops(label_img)
+            
+            if len(regions) > 0:
+                # 策略：随机选一个实例，或者选最大的
+                # 这里为了稳定，选最大的那个实例作为本次的训练目标
+                target_region = max(regions, key=lambda x: x.area)
+                
+                # A. 生成该实例的 Box
+                y0, x0, y1, x1 = target_region.bbox
+                # 添加一点噪声模拟真实提示
+                h_box, w_box = y1-y0, x1-x0
+                noise = 0.1
+                y0 += random.randint(int(-h_box*noise), int(h_box*noise))
+                x0 += random.randint(int(-w_box*noise), int(w_box*noise))
+                y1 += random.randint(int(-h_box*noise), int(h_box*noise))
+                x1 += random.randint(int(-w_box*noise), int(w_box*noise))
+                boxes = torch.tensor([[x0, y0, x1, y1]], dtype=torch.float)
+                
+                # B. 【关键】生成只包含该实例的 Mask
+                # 只有 ID 等于目标实例 ID 的像素才设为 1，其他设为 0
+                target_id = target_region.label
+                target_mask = (label_img == target_id).astype(np.float32)
+                
+                # Point 同理，基于 target_mask 生成
+                point_coords, point_label = init_point_sampling(target_mask, self.point_num)
+                # 确保 point_coords 形状为 [num_points, 2]（SAM 期望的格式，不需要额外的 batch 维度）
+                # init_point_sampling 返回的格式：
+                # - point_num == 1: [1, 2] 和 [1]
+                # - point_num > 1: [num_points, 2] 和 [num_points]
+                # 这些格式已经是 SAM 期望的格式，不需要修改
+                
+            else:
+                # 兜底：没有实例
+                target_mask = np.zeros_like(mask_instance_crop_np, dtype=np.float32)
+                boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
+                # 确保形状与正常情况一致：[num_points, 2] 和 [num_points]（SAM 期望的格式）
+                point_coords = torch.zeros((self.point_num, 2), dtype=torch.float)
+                point_label = torch.zeros((self.point_num,), dtype=torch.int)
+
+            # 3. 存入列表
+            masks_list.append(torch.tensor(target_mask).long()) # 现在 mask 只有这一个细胞了！
             boxes_list.append(boxes)
             point_coords_list.append(point_coords)
             point_labels_list.append(point_label)
@@ -490,7 +525,17 @@ def stack_dict_batched(batched_input):
             else:
                 out_dict[k] = v
         else:
-            out_dict[k] = v.reshape(-1, *v.shape[2:])
+            # 特殊处理 point_coords 和 point_labels
+            # 它们的形状应该是 [batch_size, mask_num, num_points, 2] 和 [batch_size, mask_num, num_points]
+            # 需要 reshape 成 [batch_size * mask_num, num_points, 2] 和 [batch_size * mask_num, num_points]
+            if k == 'point_coords' or k == 'point_labels':
+                # 如果已经是正确的形状 [batch_size, mask_num, num_points, ...]，直接 reshape
+                if v.dim() >= 3:
+                    out_dict[k] = v.reshape(-1, *v.shape[2:])
+                else:
+                    out_dict[k] = v
+            else:
+                out_dict[k] = v.reshape(-1, *v.shape[2:])
     return out_dict
 
 
