@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--use_amp", type=bool, default=False, help="use amp")
     # PNuRL相关参数
     parser.add_argument("--use_pnurl", action='store_true', help="启用PNuRL训练（使用属性提示词增强图像特征）")
-    parser.add_argument("--pnurl_clip_path", type=str, default=None, help="CLIP模型路径（用于PNuRL文本编码）")
+    parser.add_argument("--pnurl_clip_path", type=str, default="", help="CLIP模型路径（用于PNuRL文本编码）")
     parser.add_argument("--pnurl_num_classes", type=str, default="3,5,4,3,3", help="PNuRL每个属性的类别数量，格式：颜色,形状,排列,大小,分布（默认：3,5,4,3,3）")
     parser.add_argument("--pnurl_loss_weight", type=float, default=1.0, help="PNuRL属性损失的权重")
     parser.add_argument("--attribute_info_path", type=str, default=None, help="属性信息文件路径（如果不在data_dir中）")
