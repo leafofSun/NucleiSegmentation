@@ -137,13 +137,6 @@ class TestingDataset(Dataset):
         self.pixel_std = [58.395, 57.12, 57.375]
     
     def __getitem__(self, index):
-        """
-        Retrieves and preprocesses an item from the dataset.
-        Args:
-            index (int): The index of the item to retrieve.
-        Returns:
-            dict: A dictionary containing the preprocessed image and associated information.
-        """
         image_input = {}
         image = cv2.imread(self.image_paths[index])
         if image is None:
@@ -157,10 +150,8 @@ class TestingDataset(Dataset):
         for mask_path in mask_paths:
             mask = cv2.imread(mask_path, 0)
             if mask is None:
-                raise ValueError(f"无法读取掩码文件: {mask_path}")
-            
+                raise ValueError(f"无法读取: {mask_path}")
             mask = mask.astype(np.float32)
-            
             if ori_np_mask_instance is None:
                 ori_np_mask_instance = mask.copy()
             else:
@@ -173,31 +164,27 @@ class TestingDataset(Dataset):
         
         if ori_np_mask_instance is None:
             raise ValueError(f"没有找到有效的掩码文件")
-
+        
         h, w = ori_np_mask_instance.shape
         target_size = self.image_size  # 1024
 
-        # === 【关键修复】手动 Padding，确保与 test.py 的 postprocess_masks 逻辑完全一致 ===
-        # 计算 padding 大小 (使用与 test.py 相同的 int 除法)
+        # === 【关键修复】手动 Padding (替代 albumentations) ===
+        # 使用与 test.py 中 postprocess_masks 完全一致的计算逻辑
         pad_h = max(target_size - h, 0)
         pad_w = max(target_size - w, 0)
         
-        # test.py 使用的是 torch.div(..., rounding_mode='trunc')，等同于 // 2
         pad_top = pad_h // 2
         pad_bottom = pad_h - pad_top
         pad_left = pad_w // 2
         pad_right = pad_w - pad_left
         
-        # 对 Image 进行 Padding
-        # cv2.copyMakeBorder(src, top, bottom, left, right, borderType, value)
+        # 使用 OpenCV 进行补零填充
         image_padded = cv2.copyMakeBorder(image, pad_top, pad_bottom, pad_left, pad_right, 
                                           cv2.BORDER_CONSTANT, value=0)
-        
-        # 对 Mask 进行 Padding (保持实例 ID)
         mask_instance_padded = cv2.copyMakeBorder(ori_np_mask_instance, pad_top, pad_bottom, pad_left, pad_right, 
                                                   cv2.BORDER_CONSTANT, value=0)
 
-        # 转换为 Tensor (H, W, C) -> (C, H, W)
+        # 转换为 Tensor: HWC -> CHW
         image_tensor = torch.from_numpy(image_padded).permute(2, 0, 1).float()
         
         # 3. 基于 Padded Mask 生成 Box
@@ -213,6 +200,7 @@ class TestingDataset(Dataset):
                 point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
                 point_labels = torch.tensor([[0]], dtype=torch.int)
         else:
+            # 如果使用 json prompt，这里需要非常小心，暂不处理 padding 偏移
             boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
             point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
             point_labels = torch.tensor([[0]], dtype=torch.int)
@@ -227,15 +215,13 @@ class TestingDataset(Dataset):
         if mask_paths:
             image_input["label_path"] = '/'.join(mask_paths[0].split('/')[:-1])
 
-        # 5. 返回原始实例 Mask
+        # 5. 返回原始尺寸的实例 Mask (用于 metrics 计算)
         if self.return_ori_mask:
             image_input["ori_label"] = torch.tensor(ori_np_mask_instance).unsqueeze(0)
      
-        image_name = self.image_paths[index].split('/')[-1]
         if self.requires_name:
-            image_input["name"] = image_name
+            image_input["name"] = self.image_paths[index].split('/')[-1]
         
-        # PNuRL 部分
         if self.attribute_info:
             label_key = self.image_paths[index]
             if label_key not in self.attribute_info:
