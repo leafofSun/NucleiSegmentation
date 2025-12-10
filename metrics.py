@@ -182,85 +182,100 @@ def SegMetrics(pred, label, metrics):
     metrics: 字符串列表，如 ['mDice', 'mAJI', 'mPQ', 'mDQ', 'mSQ']
     """
     results = {}
+
     if isinstance(metrics, str):
         metrics = [metrics, ]
     
-    # [修复] 智能判断：如果输入是实例图 (Max ID > 1)，直接转 numpy，跳过 sigmoid
-    # 先转换为 tensor 以便检查
-    if isinstance(pred, (list, np.ndarray)):
-        pred_tmp = torch.tensor(np.array(pred)) if isinstance(pred, list) else torch.from_numpy(pred)
-    else:
-        pred_tmp = pred
-    
-    if isinstance(label, (list, np.ndarray)):
-        label_tmp = torch.tensor(np.array(label)) if isinstance(label, list) else torch.from_numpy(label)
-    else:
-        label_tmp = label
-    
-    # 检查是否是实例图
-    pred_max = pred_tmp.max().item() if hasattr(pred_tmp, 'max') else float(pred_tmp.max())
-    label_max = label_tmp.max().item() if hasattr(label_tmp, 'max') else float(label_tmp.max())
-    
-    if pred_max > 1 or label_max > 1:
-        # 输入已经是实例图，直接转换，不要调用 _list_tensor
-        if isinstance(pred, torch.Tensor):
-            pr_np = pred.squeeze().cpu().numpy().astype(int)
-        else:
-            pr_np = np.array(pred).astype(int)
-            if pr_np.ndim == 4:
-                pr_np = pr_np.squeeze(1)
+
+    # 1. 统一转换为 Tensor/Numpy 并在 CPU 上操作
+    if isinstance(pred, list):
+        pred = np.array(pred)
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
         
-        if isinstance(label, torch.Tensor):
-            gt_np = label.squeeze().cpu().numpy().astype(int)
-        else:
-            gt_np = np.array(label).astype(int)
-            if gt_np.ndim == 4:
-                gt_np = gt_np.squeeze(1)
+
+    if isinstance(label, list):
+        label = np.array(label)
+    if isinstance(label, torch.Tensor):
+        label = label.detach().cpu().numpy()
         
-        # 补齐 batch 维度
-        if pr_np.ndim == 2: pr_np = pr_np[np.newaxis, ...]
-        if gt_np.ndim == 2: gt_np = gt_np[np.newaxis, ...]
+
+    # 2. 判断是否为实例图 (Max > 1)
+    is_instance_map = (pred.max() > 1) or (label.max() > 1)
+    
+
+    if is_instance_map:
+        # 如果已经是实例图，直接取整
+        pr_np = pred.astype(int)
+        gt_np = label.astype(int)
     else:
-        # 旧逻辑：处理二值 Logits
-        pr_, gt_ = _list_tensor(pred, label)
-        pr_bin = _threshold(pr_, threshold=0.5)
-        gt_bin = _threshold(gt_, threshold=0.5)
-        if pr_bin.ndim == 4:
-            pr_np = pr_bin.squeeze(1).cpu().numpy().astype(int)
-            gt_np = gt_bin.squeeze(1).cpu().numpy().astype(int)
-        else:
-            pr_np = pr_bin.cpu().numpy().astype(int)
-            gt_np = gt_bin.cpu().numpy().astype(int)
-        
-        # 如果 GT 是二值图，需要转连通域以计算实例指标
-        if gt_np.max() <= 1:
-            gt_np_clean = np.zeros_like(gt_np, dtype=int)
-            for i in range(gt_np.shape[0]):
-                gt_np_clean[i] = measure.label(gt_np[i])
-            gt_np = gt_np_clean
+        # 如果是二值 Logits (0~1 或 负数)，需要阈值化
+        # 注意：这里假设输入已经是 sigmoid 后的概率，或者 logits
+        # 为了保险，如果 max <= 1 且 min < 0，做 sigmoid
+        if pred.min() < 0:
+            pred = 1 / (1 + np.exp(-pred)) # Sigmoid
             
+
+        pr_np = (pred > 0.5).astype(int)
+        gt_np = (label > 0.5).astype(int)
+
+
+
+    # 3. 维度对齐 (B, H, W)
+    if pr_np.ndim == 4: pr_np = pr_np.squeeze(1)
+    if gt_np.ndim == 4: gt_np = gt_np.squeeze(1)
+    if pr_np.ndim == 2: pr_np = pr_np[np.newaxis, ...]
+    if gt_np.ndim == 2: gt_np = gt_np[np.newaxis, ...]
+    
+
+    # 4. 如果 GT 是二值图但 Pred 是实例图，需要对 GT 做连通域标记 (用于 AJI/PQ)
+    # 这种情况常见于测试集 GT 是二值 mask 的情况
+    if is_instance_map and gt_np.max() <= 1:
+        gt_np_instance = np.zeros_like(gt_np)
+        for i in range(gt_np.shape[0]):
+            gt_np_instance[i] = measure.label(gt_np[i])
+        gt_np = gt_np_instance
+
+
+
     batch_size = pr_np.shape[0]
+
+
 
     for metric in metrics:
         if metric == 'iou':
-            results['iou'] = np.mean(iou(pred, label))  # 注意：iou函数可能也需要类似的适配
+            # IoU 通常基于二值图
+            pr_bin = (pr_np > 0).astype(int)
+            gt_bin = (gt_np > 0).astype(int)
+            intersection = (pr_bin * gt_bin).sum()
+            union = pr_bin.sum() + gt_bin.sum() - intersection
+            results['iou'] = (intersection + 1e-7) / (union + 1e-7)
             
+
         elif metric == 'dice' or metric == 'mDice':
-            # Dice 需要二值图计算
-            pr_bin_tmp = (pr_np > 0).astype(int)
-            gt_bin_tmp = (gt_np > 0).astype(int)
-            intersection = (pr_bin_tmp * gt_bin_tmp).sum(axis=(1, 2))
-            union = pr_bin_tmp.sum(axis=(1, 2)) + gt_bin_tmp.sum(axis=(1, 2))
-            dice_score = (2. * intersection + 1e-7) / (union + 1e-7)
-            results['dice'] = np.mean(dice_score)
+            # Dice 基于二值图
+            pr_bin = (pr_np > 0).astype(int)
+            gt_bin = (gt_np > 0).astype(int)
             
+
+            dice_sum = 0.0
+            for i in range(batch_size):
+                inter = (pr_bin[i] * gt_bin[i]).sum()
+                union = pr_bin[i].sum() + gt_bin[i].sum()
+                dice_sum += (2. * inter + 1e-7) / (union + 1e-7)
+            results['dice'] = dice_sum / batch_size
+            
+
         elif metric == 'mAJI':
+            # AJI 必须基于实例图
             aji_sum = 0.0
             for i in range(batch_size):
                 aji_sum += compute_aji_single_image(pr_np[i], gt_np[i])
             results['mAJI'] = aji_sum / batch_size
             
+
         elif metric in ['mPQ', 'mDQ', 'mSQ']:
+            # PQ 必须基于实例图
             pq_list, dq_list, sq_list = [], [], []
             for i in range(batch_size):
                 tp, fp, fn, iou_sum = compute_pq_stats_single_image(pr_np[i], gt_np[i])
@@ -271,8 +286,11 @@ def SegMetrics(pred, label, metrics):
                 dq_list.append(dq)
                 sq_list.append(sq)
             
+
             if metric == 'mPQ': results['mPQ'] = np.mean(pq_list)
             if metric == 'mDQ': results['mDQ'] = np.mean(dq_list)
             if metric == 'mSQ': results['mSQ'] = np.mean(sq_list)
+
+
 
     return results
