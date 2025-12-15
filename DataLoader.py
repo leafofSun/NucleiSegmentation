@@ -15,7 +15,7 @@ import random
 
 class TestingDataset(Dataset):
     
-    def __init__(self, data_path, image_size=256, mode='test', requires_name=True, point_num=1, return_ori_mask=True, prompt_path=None, attribute_info_path=None):
+    def __init__(self, data_path, image_size=1024, mode='test', requires_name=True, point_num=1, return_ori_mask=True, prompt_path=None, attribute_info_path=None):
         """
         Initializes a TestingDataset object.
         Args:
@@ -149,8 +149,7 @@ class TestingDataset(Dataset):
         ori_np_mask_instance = None
         for mask_path in mask_paths:
             mask = cv2.imread(mask_path, 0)
-            if mask is None:
-                raise ValueError(f"无法读取: {mask_path}")
+            if mask is None: raise ValueError(f"无法读取: {mask_path}")
             mask = mask.astype(np.float32)
             if ori_np_mask_instance is None:
                 ori_np_mask_instance = mask.copy()
@@ -162,74 +161,61 @@ class TestingDataset(Dataset):
                     mask[mask > 0] += current_max_id
                 ori_np_mask_instance = np.maximum(ori_np_mask_instance, mask)
         
-        if ori_np_mask_instance is None:
-            raise ValueError(f"没有找到有效的掩码文件")
-        
         h, w = ori_np_mask_instance.shape
-        target_size = self.image_size  # 1024
+        target_size = self.image_size
 
-        # === 【关键修复】手动 Padding (替代 albumentations) ===
-        # 使用与 test.py 中 postprocess_masks 完全一致的计算逻辑
+        # === 手动 Padding ===
         pad_h = max(target_size - h, 0)
         pad_w = max(target_size - w, 0)
-        
         pad_top = pad_h // 2
         pad_bottom = pad_h - pad_top
         pad_left = pad_w // 2
         pad_right = pad_w - pad_left
         
-        # 使用 OpenCV 进行补零填充
-        image_padded = cv2.copyMakeBorder(image, pad_top, pad_bottom, pad_left, pad_right, 
-                                          cv2.BORDER_CONSTANT, value=0)
-        mask_instance_padded = cv2.copyMakeBorder(ori_np_mask_instance, pad_top, pad_bottom, pad_left, pad_right, 
-                                                  cv2.BORDER_CONSTANT, value=0)
+        image_padded = cv2.copyMakeBorder(image, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
+        mask_instance_padded = cv2.copyMakeBorder(ori_np_mask_instance, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
 
-        # 转换为 Tensor: HWC -> CHW
         image_tensor = torch.from_numpy(image_padded).permute(2, 0, 1).float()
         
-        # 3. 基于 Padded Mask 生成 Box
+        # 3. 基于 Padded Mask 生成 Box (不补齐！)
         if self.prompt_path is None:
-            if mask_instance_padded.max() > 0:
-                # === 【关键修复】测试模式下：不补齐 Box，只返回实际数量的框 ===
-                # 直接使用 regionprops 获取所有真实框，避免重复框导致 ID 不匹配
-                from skimage.measure import label, regionprops
-                
-                # 智能判断：如果是实例图，不要重新 label
-                if mask_instance_padded.max() > 1:
-                    label_img = mask_instance_padded.astype(int)
-                else:
-                    label_img = label(mask_instance_padded)
-                
-                regions = regionprops(label_img)
-                
-                # 直接获取所有真实框，不补齐，不截断
-                real_boxes = [tuple(region.bbox) for region in regions]
-                
-                # 转换为 (x0, y0, x1, y1) 格式（SAM 期望的格式）
-                boxes_coord = []
-                for box in real_boxes:
-                    y0, x0, y1, x1 = box  # regionprops 返回的是 (min_row, min_col, max_row, max_col) 即 (y0, x0, y1, x1)
-                    boxes_coord.append([x0, y0, x1, y1])
-                
-                if len(boxes_coord) == 0:
-                    # 兜底：如果没有找到任何框，返回一个默认框
-                    boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
-                else:
-                    boxes = torch.tensor(boxes_coord, dtype=torch.float)
-                
-                binary_mask_padded = (mask_instance_padded > 0).astype(np.float32)
-                point_coords, point_labels = init_point_sampling(binary_mask_padded, self.point_num)
+            from skimage.measure import label, regionprops
+            # 确保使用 int 类型
+            if mask_instance_padded.max() > 1:
+                label_img = mask_instance_padded.astype(int)
             else:
+                label_img = label(mask_instance_padded)
+            
+            regions = regionprops(label_img)
+            
+            # 获取所有真实框 (不设上限，不补齐)
+            real_boxes = []
+            # region.bbox 是 (min_row, min_col, max_row, max_col) -> (y0, x0, y1, x1)
+            # 我们需要转为 (x0, y0, x1, y1)
+            for region in regions:
+                y0, x0, y1, x1 = region.bbox
+                real_boxes.append([x0, y0, x1, y1])
+            
+            if len(real_boxes) == 0:
                 boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
                 point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
                 point_labels = torch.tensor([[0]], dtype=torch.int)
+            else:
+                boxes = torch.tensor(real_boxes, dtype=torch.float)
+                # 为每个box生成一个中心点
+                point_coords = []
+                point_labels = []
+                for box in real_boxes:
+                    x0, y0, x1, y1 = box
+                    point_coords.append([[(x0+x1)/2, (y0+y1)/2]])
+                    point_labels.append([1])
+                point_coords = torch.tensor(point_coords, dtype=torch.float)
+                point_labels = torch.tensor(point_labels, dtype=torch.int)
         else:
-            # 如果使用 json prompt，这里需要非常小心，暂不处理 padding 偏移
-            boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
-            point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
-            point_labels = torch.tensor([[0]], dtype=torch.int)
+             boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
+             point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
+             point_labels = torch.tensor([[0]], dtype=torch.int)
 
-        # 4. 组装输入
         image_input["image"] = image_tensor
         image_input["boxes"] = boxes
         image_input["point_coords"] = point_coords
@@ -239,33 +225,28 @@ class TestingDataset(Dataset):
         if mask_paths:
             image_input["label_path"] = '/'.join(mask_paths[0].split('/')[:-1])
 
-        # 5. 返回原始尺寸的实例 Mask (用于 metrics 计算)
         if self.return_ori_mask:
             image_input["ori_label"] = torch.tensor(ori_np_mask_instance).unsqueeze(0)
      
         if self.requires_name:
             image_input["name"] = self.image_paths[index].split('/')[-1]
         
+        # PNuRL 部分 (修复文件名匹配)
         if self.attribute_info:
-            # 尝试顺序: 
-            # 1. 完整路径 "data/cpm17/test/image_04.png"
-            # 2. 文件名 "image_04.png"
-            # 3. 无后缀文件名 "image_04" (这是 JSON 里的格式)
-            
-            full_path = self.image_paths[index]
-            file_name = full_path.split('/')[-1]
-            file_stem = file_name.split('.')[0]  # 去掉 .png
-            
-            attr_info = None
-            if full_path in self.attribute_info:
-                attr_info = self.attribute_info[full_path]
-            elif file_name in self.attribute_info:
-                attr_info = self.attribute_info[file_name]
-            elif file_stem in self.attribute_info:  # <--- 关键修复：匹配 image_04
-                attr_info = self.attribute_info[file_stem]
-                
-            if attr_info and 'attribute_prompts' in attr_info:
-                image_input['attribute_prompts'] = attr_info['attribute_prompts']
+             full_path = self.image_paths[index]
+             file_name = full_path.split('/')[-1] # image_04.png
+             file_stem = file_name.split('.')[0]  # image_04
+             
+             attr_info = None
+             if full_path in self.attribute_info:
+                 attr_info = self.attribute_info[full_path]
+             elif file_name in self.attribute_info:
+                 attr_info = self.attribute_info[file_name]
+             elif file_stem in self.attribute_info: # 命中!
+                 attr_info = self.attribute_info[file_stem]
+                 
+             if attr_info and 'attribute_prompts' in attr_info:
+                 image_input['attribute_prompts'] = attr_info['attribute_prompts']
         
         return image_input
 
@@ -464,10 +445,9 @@ class TrainingDataset(Dataset):
         if self.attribute_info:
             # 尝试多种key格式（包括无后缀文件名）
             attr_data = None
-            for key_format in [image_key, image_name, os.path.basename(image_key), file_stem]:
-                if key_format in self.attribute_info:
-                    attr_data = self.attribute_info[key_format]
-                    break
+            file_stem = image_name.split('.')[0]
+            potential_keys = [file_stem, image_name, self.image_paths[index]]
+            
             
             if attr_data is not None:
                 # 支持PNuRL格式: {"attribute_prompts": [...], "attribute_labels": [[...], [...], ...]}
