@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument("--model_type", type=str, default="vit_b", help="sam model_type")
     parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d/sam-med2d_b.pth", help="sam checkpoint")
     parser.add_argument("--iter_point", type=int, default=8, help="point iterations")
-    parser.add_argument('--lr_scheduler', type=str, default=None, help='lr scheduler')
+    parser.add_argument('--lr_scheduler', type=str, default="CosineAnnealingLR", help='lr scheduler')
     parser.add_argument("--point_list", type=list, default=[1, 3, 5, 9], help="point_list")
     parser.add_argument("--multimask", type=bool, default=True, help="ouput multimask")
     parser.add_argument("--encoder_adapter", type=bool, default=True, help="use adapter")

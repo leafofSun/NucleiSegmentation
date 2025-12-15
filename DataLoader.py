@@ -247,13 +247,25 @@ class TestingDataset(Dataset):
             image_input["name"] = self.image_paths[index].split('/')[-1]
         
         if self.attribute_info:
-            label_key = self.image_paths[index]
-            if label_key not in self.attribute_info:
-                label_key = image_input.get("name", "")
-            if label_key in self.attribute_info:
-                attr_info = self.attribute_info[label_key]
-                if 'attribute_prompts' in attr_info:
-                    image_input['attribute_prompts'] = attr_info['attribute_prompts']
+            # 尝试顺序: 
+            # 1. 完整路径 "data/cpm17/test/image_04.png"
+            # 2. 文件名 "image_04.png"
+            # 3. 无后缀文件名 "image_04" (这是 JSON 里的格式)
+            
+            full_path = self.image_paths[index]
+            file_name = full_path.split('/')[-1]
+            file_stem = file_name.split('.')[0]  # 去掉 .png
+            
+            attr_info = None
+            if full_path in self.attribute_info:
+                attr_info = self.attribute_info[full_path]
+            elif file_name in self.attribute_info:
+                attr_info = self.attribute_info[file_name]
+            elif file_stem in self.attribute_info:  # <--- 关键修复：匹配 image_04
+                attr_info = self.attribute_info[file_stem]
+                
+            if attr_info and 'attribute_prompts' in attr_info:
+                image_input['attribute_prompts'] = attr_info['attribute_prompts']
         
         return image_input
 
@@ -446,12 +458,13 @@ class TrainingDataset(Dataset):
         # 添加属性信息（用于PNuRL，如果可用）
         image_name = self.image_paths[index].split('/')[-1]
         image_key = self.image_paths[index]  # 使用完整路径作为key
+        file_stem = image_name.split('.')[0]  # 无后缀文件名（JSON 里的格式）
         
         # 尝试从attribute_info中获取属性信息
         if self.attribute_info:
-            # 尝试多种key格式
+            # 尝试多种key格式（包括无后缀文件名）
             attr_data = None
-            for key_format in [image_key, image_name, os.path.basename(image_key)]:
+            for key_format in [image_key, image_name, os.path.basename(image_key), file_stem]:
                 if key_format in self.attribute_info:
                     attr_data = self.attribute_info[key_format]
                     break
