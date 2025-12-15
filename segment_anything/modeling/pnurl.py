@@ -169,26 +169,24 @@ class PNuRL(nn.Module):
                 model_name = clip_model_path if clip_model_path else "ViT-B/16"
                 print(f"Loading CLIP Text Encoder: {model_name}...")
                 
-                # 1. 尝试直接加载标准 CLIP 模型 (自动下载或读取缓存)
-                # jit=False 是为了支持后续的微调或梯度传播
                 model, _ = clip.load(model_name, device="cpu", jit=False)
                 self.clip_model = model
                 
-                # 2. 【关键优化】为了节省显存，我们只需要 CLIP 的 Text Encoder
-                # PNuRL 的图像特征来自 SAM，不需要 CLIP 的 Visual Encoder
+                # 保留 visual 以维持 dtype 依赖，但放在 CPU 并冻结
                 if hasattr(self.clip_model, 'visual'):
-                    del self.clip_model.visual
-                    print("  - 已移除 CLIP Visual Encoder 以节省显存")
+                    self.clip_model.visual = self.clip_model.visual.cpu()
+                    for param in self.clip_model.visual.parameters():
+                        param.requires_grad = False
+                    print("  - CLIP Visual Encoder 已冻结并保留在 CPU (维持 dtype 依赖)")
                 
-                # 3. 冻结 CLIP 参数 (通常不需要训练 CLIP 本身，除非显存足够且数据量巨大)
+                # 冻结全部参数
                 for param in self.clip_model.parameters():
                     param.requires_grad = False
                 
-                print(f"✓ 成功加载 CLIP (Text-Only): {model_name}")
+                print(f"✓ 成功加载 CLIP: {model_name}")
 
             except Exception as e:
                 print(f"Warning: 加载 CLIP 模型失败: {e}")
-                print("  试图加载本地路径失败，或者网络无法下载 ViT-B/16。")
                 self.clip_model = None
         else:
             print("Warning: CLIP 包未安装。")
@@ -212,33 +210,39 @@ class PNuRL(nn.Module):
             nn.Linear(feat_dim, feat_dim)
         )
     
-    def encode_attribute_text(self, attribute_prompts: List[str]) -> torch.Tensor:
+    def encode_attribute_text(self, attribute_prompts) -> torch.Tensor:
         """
-        编码属性感知文本提示
-        
-        Args:
-            attribute_prompts: 属性提示列表，例如：
-                ["Deep Purple Stained", "Small Size", "Densely Packed", 
-                 "Uniform Arranged", "Spherical Shaped"]
-        Returns:
-            text_embed: [B, embed_dim] 文本嵌入
+        编码属性感知文本提示，支持 DataLoader collate 后的批量格式。
         """
         if self.clip_model is not None and CLIP_AVAILABLE:
             with torch.no_grad():
-                # 将多个属性提示合并为一个句子
-                combined_prompt = ", ".join(attribute_prompts)
-                # 确保 token 在正确的 device 上
                 device = next(self.parameters()).device
-                text_tokens = clip.tokenize([combined_prompt], truncate=True).to(device)
                 
-                # 调用 CLIP 的 encode_text
+                combined_prompts = []
+                if isinstance(attribute_prompts, list) and len(attribute_prompts) > 0 and isinstance(attribute_prompts[0], tuple):
+                    batch_size = len(attribute_prompts[0])
+                    for i in range(batch_size):
+                        sample_attrs = [str(row[i]) for row in attribute_prompts]
+                        combined_prompts.append(", ".join(sample_attrs))
+                else:
+                    combined_prompts = [", ".join(attribute_prompts)]
+                
+                text_tokens = clip.tokenize(combined_prompts, truncate=True).to(device)
+                
+                # 确保编码时权重在正确设备；encode_text 依赖 dtype (由 visual 决定)
+                if self.clip_model.token_embedding.weight.device != device:
+                    self.clip_model.to(device)
+                    if hasattr(self.clip_model, 'visual'):
+                        self.clip_model.visual.cpu()
+                
                 text_features = self.clip_model.encode_text(text_tokens)
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                
-                # 转换为 float (CLIP 可能是 float16)
                 text_features = text_features.float()
         else:
-            batch_size = 1
+            if isinstance(attribute_prompts, list) and len(attribute_prompts) > 0 and isinstance(attribute_prompts[0], tuple):
+                batch_size = len(attribute_prompts[0])
+            else:
+                batch_size = 1
             text_features = torch.randn(batch_size, 512, device=next(self.parameters()).device)
         
         text_embed = self.text_proj(text_features)

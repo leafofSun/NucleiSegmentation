@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--use_amp", type=bool, default=False, help="use amp")
     # PNuRL相关参数
     parser.add_argument("--use_pnurl", action='store_true', help="启用PNuRL训练（使用属性提示词增强图像特征）")
-    parser.add_argument("--pnurl_clip_path", type=str, default="", help="CLIP模型路径（用于PNuRL文本编码）")
+    parser.add_argument("--pnurl_clip_path", type=str, default="ViT-B/16", help="CLIP模型路径（用于PNuRL文本编码）")
     parser.add_argument("--pnurl_num_classes", type=str, default="3,5,4,3,3", help="PNuRL每个属性的类别数量，格式：颜色,形状,排列,大小,分布（默认：3,5,4,3,3）")
     parser.add_argument("--pnurl_loss_weight", type=float, default=1.0, help="PNuRL属性损失的权重")
     parser.add_argument("--attribute_info_path", type=str, default=None, help="属性信息文件路径（如果不在data_dir中）")
@@ -68,8 +68,19 @@ def to_device(batch_input, device):
             if key=='image' or key=='label':
                 device_input[key] = value.float().to(device)
             elif key == 'attribute_prompts':
-                # 属性提示保持为列表，不需要移到device
-                device_input[key] = value
+                # 属性提示保持为列表，但需展开 DataLoader 默认 collate 产生的 tuple
+                if isinstance(value, (list, tuple)):
+                    flattened_prompts = []
+                    for item in value:
+                        if isinstance(item, (list, tuple)):
+                            # DataLoader 对单样本会给出 ('prompt',)，多样本则 ('p1','p2',...)
+                            if len(item) > 0:
+                                flattened_prompts.append(item[0])
+                        else:
+                            flattened_prompts.append(item)
+                    device_input[key] = flattened_prompts
+                else:
+                    device_input[key] = value
             elif key == 'attribute_labels':
                 # 属性标签是tensor列表，需要移到device
                 if isinstance(value, list):

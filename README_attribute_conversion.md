@@ -114,3 +114,6 @@ ATTRIBUTE_MAPPINGS = {
 3. **图像ID格式**：转换脚本会自动移除图像ID的扩展名（如 `image_00.png` → `image_00`）
 
 
+
+
+

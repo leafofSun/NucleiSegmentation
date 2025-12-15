@@ -190,8 +190,32 @@ class TestingDataset(Dataset):
         # 3. 基于 Padded Mask 生成 Box
         if self.prompt_path is None:
             if mask_instance_padded.max() > 0:
-                # 传入 Padded Mask
-                boxes = get_boxes_from_mask(mask_instance_padded, box_num=500, max_pixel=0)
+                # === 【关键修复】测试模式下：不补齐 Box，只返回实际数量的框 ===
+                # 直接使用 regionprops 获取所有真实框，避免重复框导致 ID 不匹配
+                from skimage.measure import label, regionprops
+                
+                # 智能判断：如果是实例图，不要重新 label
+                if mask_instance_padded.max() > 1:
+                    label_img = mask_instance_padded.astype(int)
+                else:
+                    label_img = label(mask_instance_padded)
+                
+                regions = regionprops(label_img)
+                
+                # 直接获取所有真实框，不补齐，不截断
+                real_boxes = [tuple(region.bbox) for region in regions]
+                
+                # 转换为 (x0, y0, x1, y1) 格式（SAM 期望的格式）
+                boxes_coord = []
+                for box in real_boxes:
+                    y0, x0, y1, x1 = box  # regionprops 返回的是 (min_row, min_col, max_row, max_col) 即 (y0, x0, y1, x1)
+                    boxes_coord.append([x0, y0, x1, y1])
+                
+                if len(boxes_coord) == 0:
+                    # 兜底：如果没有找到任何框，返回一个默认框
+                    boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
+                else:
+                    boxes = torch.tensor(boxes_coord, dtype=torch.float)
                 
                 binary_mask_padded = (mask_instance_padded > 0).astype(np.float32)
                 point_coords, point_labels = init_point_sampling(binary_mask_padded, self.point_num)
