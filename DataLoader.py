@@ -87,6 +87,7 @@ class TestingDataset(Dataset):
         if image is None:
             raise ValueError(f"无法读取图像文件: {self.image_paths[index]}")
         
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = (image - self.pixel_mean) / self.pixel_std
 
         mask_paths = self.mask_paths_list[index]
@@ -272,6 +273,7 @@ class TrainingDataset(Dataset):
         if image is None:
             raise ValueError(f"无法读取图像文件: {self.image_paths[index]}")
         
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = (image - self.pixel_mean) / self.pixel_std
         h, w, _ = image.shape
         # 训练模式：使用随机裁剪（模仿 PromptNu）

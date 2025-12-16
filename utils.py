@@ -15,49 +15,29 @@ import os
 def get_boxes_from_mask(mask, box_num=1, std=0.1, max_pixel=5):
     """
     从 mask 中提取边界框，支持空 mask 的健壮处理
-    
-    Args:
-        mask: Mask, can be a torch.Tensor or a numpy array of binary mask or instance mask.
-        box_num: Number of bounding boxes, default is 1.
-        std: Standard deviation of the noise, default is 0.1.
-        max_pixel: Maximum noise pixel value, default is 5.
-    Returns:
-        noise_boxes: Bounding boxes after noise perturbation, returned as a torch.Tensor.
     """
     if isinstance(mask, torch.Tensor):
         mask = mask.numpy()
 
-    # === [修复] 智能判断：如果是实例图，不要重新 label ===
-    # 这样能保留原本紧贴着的独立实例
     if mask.max() > 1:
         label_img = mask.astype(int)
     else:
         label_img = label(mask)
     regions = regionprops(label_img)
 
-    # 获取所有区域的框
     boxes = [tuple(region.bbox) for region in regions]
 
-    # 1. 处理没有区域的情况 (空 Mask) - 优先处理，避免后续除以零
     if len(boxes) == 0:
-        # 如果没有找到任何细胞，返回 box_num 个默认框 (0,0,1,1)
-        # 或者返回全图框 (0, 0, h, w)
-        h, w = mask.shape
-        # 这里返回全图框作为负样本提示可能更好，或者返回微小框
         return torch.tensor([[0, 0, 1, 1]] * box_num, dtype=torch.float)
 
-    # 2. 处理区域过多的情况
     if len(boxes) >= box_num:
-        # 按面积排序取前 box_num 个
         sorted_regions = sorted(regions, key=lambda x: x.area, reverse=True)[:box_num]
         boxes = [tuple(region.bbox) for region in sorted_regions]
 
-    # 3. 处理区域不足的情况 (补齐)
     elif len(boxes) < box_num:
         num_duplicates = box_num - len(boxes)
         boxes += [boxes[i % len(boxes)] for i in range(num_duplicates)]
 
-    # 4. 添加噪声扰动
     noise_boxes = []
     for box in boxes:
         y0, x0, y1, x1 = box
@@ -80,21 +60,10 @@ def get_boxes_from_mask(mask, box_num=1, std=0.1, max_pixel=5):
 
 
 def select_random_points(pr, gt, point_num = 9):
-    """
-    Selects random points from the predicted and ground truth masks and assigns labels to them.
-    Args:
-        pred (torch.Tensor): Predicted mask tensor.
-        gt (torch.Tensor): Ground truth mask tensor.
-        point_num (int): Number of random points to select. Default is 9.
-    Returns:
-        batch_points (np.array): Array of selected points coordinates (x, y) for each batch.
-        batch_labels (np.array): Array of corresponding labels (0 for background, 1 for foreground) for each batch.
-    """
     pred, gt = pr.data.cpu().numpy(), gt.data.cpu().numpy()
     error = np.zeros_like(pred)
     error[pred != gt] = 1
 
-    # error = np.logical_xor(pred, gt)
     batch_points = []
     batch_labels = []
     for j in range(error.shape[0]):
@@ -119,7 +88,7 @@ def select_random_points(pr, gt, point_num = 9):
                 label = 0
             else:
                 label = -1
-            points.append((y, x))   #Negate the coordinates
+            points.append((y, x))
             labels.append(label)
 
         batch_points.append(points)
@@ -128,19 +97,9 @@ def select_random_points(pr, gt, point_num = 9):
 
 
 def init_point_sampling(mask, get_point=1):
-    """
-    Initialization samples points from the mask and assigns labels to them.
-    Args:
-        mask (torch.Tensor): Input mask tensor.
-        num_points (int): Number of points to sample. Default is 1.
-    Returns:
-        coords (torch.Tensor): Tensor containing the sampled points' coordinates (x, y).
-        labels (torch.Tensor): Tensor containing the corresponding labels (0 for background, 1 for foreground).
-    """
     if isinstance(mask, torch.Tensor):
         mask = mask.numpy()
         
-     # Get coordinates of black/white pixels
     fg_coords = np.argwhere(mask == 1)[:,::-1]
     bg_coords = np.argwhere(mask == 0)[:,::-1]
 
@@ -172,62 +131,30 @@ def init_point_sampling(mask, get_point=1):
     
 
 def get_transforms(img_size, ori_h, ori_w, mode='train'):
-    """
-    获取图像变换，区分训练和测试模式（模仿 PromptNu 策略）
-    
-    Args:
-        img_size: 目标图像尺寸
-        ori_h: 原始图像高度
-        ori_w: 原始图像宽度
-        mode: 'train' 使用随机裁剪（PromptNu风格），'test' 使用补零保持原分辨率
-    
-    Returns:
-        A.Compose: Albumentations 变换组合
-    """
     transforms = []
-    
     if mode == 'train':
-        # === 训练策略：模仿 PromptNu 的随机裁剪 ===
-        # 1. 如果图片比目标尺寸小，先补零到目标尺寸，防止裁剪报错
         if ori_h < img_size or ori_w < img_size:
             transforms.append(A.PadIfNeeded(
                 min_height=img_size, 
                 min_width=img_size, 
                 border_mode=cv2.BORDER_CONSTANT, 
-                fill=0,      # 对于图像的填充值 (0通常是黑色或标准化后的均值)
-                fill_mask=0  # 对于掩码的填充值 (0代表背景)
+                fill=0, 
+                fill_mask=0
             ))
-        
-        # 2. 核心修改：使用 RandomCrop 代替 Resize
-        # 这样模型看到的是 100% 原始分辨率的局部细节
         transforms.append(A.RandomCrop(height=img_size, width=img_size))
-        
     elif mode == 'test':
-        # === 测试策略：保持原分辨率 ===
-        # 1. 只进行补零 (Padding)，绝不进行缩放 (Resize)
-        # 注意：这要求我们在运行 test.py 时设置一个足够大的 image_size (如 1024)
-        # 以确保整张原图都能放进去
         transforms.append(A.PadIfNeeded(
             min_height=img_size, 
             min_width=img_size, 
             border_mode=cv2.BORDER_CONSTANT, 
-            fill=0,      # 对于图像的填充值 (0通常是黑色或标准化后的均值)
-            fill_mask=0  # 对于掩码的填充值 (0代表背景)
+            fill=0, 
+            fill_mask=0
         ))
-        
-        # 如果原图真的比 image_size 还大（极少数情况），才被迫缩放
-        # 注意：这行代码保留作为保险，但通常不会执行（因为 image_size 应该设置得足够大）
-        # transforms.append(A.Resize(img_size, img_size))  # 注释掉，保持原分辨率
-    
     transforms.append(ToTensorV2(p=1.0))
     return A.Compose(transforms, p=1.)
 
 
-# 为了兼容旧代码调用，保留 train_transforms 作为别名（默认使用训练模式）
 def train_transforms(img_size, ori_h, ori_w):
-    """
-    向后兼容的别名，默认使用训练模式（随机裁剪）
-    """
     return get_transforms(img_size, ori_h, ori_w, mode='train')
 
 
@@ -278,7 +205,10 @@ def setting_prompt_none(batched_input):
 def draw_boxes(img, boxes):
     img_copy = np.copy(img)
     for box in boxes:
-        cv2.rectangle(img_copy, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+        # === [修复] 强制转换为 int，解决 OpenCV 类型报错 ===
+        pt1 = (int(box[0]), int(box[1]))
+        pt2 = (int(box[2]), int(box[3]))
+        cv2.rectangle(img_copy, pt1, pt2, (0, 255, 0), 2)
     return img_copy
 
 
@@ -291,40 +221,35 @@ def save_masks(preds, save_path, mask_name, image_size, original_size, pad=None,
 
     mask = preds.squeeze().cpu().numpy()
     
-    # 确保 mask 的尺寸与 original_size 匹配
     if mask.shape[0] != ori_h or mask.shape[1] != ori_w:
         mask = cv2.resize(mask, (ori_w, ori_h), interpolation=cv2.INTER_NEAREST)
     
     mask = cv2.cvtColor(mask * 255, cv2.COLOR_GRAY2BGR)
 
-    if visual_prompt: #visualize the prompt
+    if visual_prompt: 
         if boxes is not None:
-            # 处理 boxes：可能是 [N, 4] 或 [4] 的形状
             boxes_np = boxes.cpu().numpy() if isinstance(boxes, torch.Tensor) else boxes
             if boxes_np.ndim == 1:
                 boxes_np = boxes_np.reshape(1, -1)
             elif boxes_np.ndim > 2:
                 boxes_np = boxes_np.reshape(-1, 4)
             
-            # 转换每个 box 的坐标：从 padded 图像坐标到原图坐标
             boxes_ori = []
             for box in boxes_np:
                 x0, y0, x1, y1 = box
                 if pad is not None:
-                    # pad 格式是 (top, left)，boxes 是在 padded 图像上的坐标
-                    # 需要减去 padding 才能回到原图坐标
+                    # 减去 padding
                     x0_ori = max(0, int(x0 - pad[1] + 0.5))
                     y0_ori = max(0, int(y0 - pad[0] + 0.5))
                     x1_ori = min(ori_w, int(x1 - pad[1] + 0.5))
                     y1_ori = min(ori_h, int(y1 - pad[0] + 0.5))
                 else:
-                    # 如果没有 padding，说明图像被缩放了，需要按比例转换
+                    # 缩放还原
                     x0_ori = int(x0 * ori_w / image_size) 
                     y0_ori = int(y0 * ori_h / image_size) 
                     x1_ori = int(x1 * ori_w / image_size) 
                     y1_ori = int(y1 * ori_h / image_size)
                 
-                # 确保坐标有效
                 if x1_ori > x0_ori and y1_ori > y0_ori:
                     boxes_ori.append((x0_ori, y0_ori, x1_ori, y1_ori))
             
@@ -333,42 +258,36 @@ def save_masks(preds, save_path, mask_name, image_size, original_size, pad=None,
 
         if points is not None:
             point_coords, point_labels = points[0], points[1]
-            # 处理 point_coords 和 point_labels 的形状
             if isinstance(point_coords, torch.Tensor):
                 point_coords = point_coords.squeeze(0).cpu().numpy()
             if isinstance(point_labels, torch.Tensor):
                 point_labels = point_labels.squeeze(0).cpu().numpy()
             
-            # 确保 point_coords 是 [N, 2] 形状
             if point_coords.ndim == 1:
                 point_coords = point_coords.reshape(1, -1)
             elif point_coords.ndim > 2:
                 point_coords = point_coords.reshape(-1, 2)
             
-            # 确保 point_labels 是 [N] 形状
             if point_labels.ndim > 1:
                 point_labels = point_labels.flatten()
             
-            # 转换每个点的坐标：从 padded 图像坐标到原图坐标
             for (x, y), label in zip(point_coords, point_labels):
                 if pad is not None:
-                    # pad 格式是 (top, left)，points 是在 padded 图像上的坐标
                     x_ori = max(0, min(ori_w - 1, int(x - pad[1] + 0.5)))
                     y_ori = max(0, min(ori_h - 1, int(y - pad[0] + 0.5)))
                 else:
-                    # 如果没有 padding，说明图像被缩放了，需要按比例转换
                     x_ori = max(0, min(ori_w - 1, int(x * ori_w / image_size)))
                     y_ori = max(0, min(ori_h - 1, int(y * ori_h / image_size)))
                 
                 color = (0, 255, 0) if label == 1 else (0, 0, 255)
-                mask[y_ori, x_ori] = color
-                cv2.drawMarker(mask, (x_ori, y_ori), color, markerType=cv2.MARKER_CROSS, markerSize=7, thickness=2)  
+                # mask[y_ori, x_ori] = color # 避免越界或类型错误，使用drawMarker代替
+                cv2.drawMarker(mask, (int(x_ori), int(y_ori)), color, markerType=cv2.MARKER_CROSS, markerSize=7, thickness=2)  
+    
     os.makedirs(save_path, exist_ok=True)
     mask_path = os.path.join(save_path, f"{mask_name}")
     cv2.imwrite(mask_path, np.uint8(mask))
 
 
-#Loss funcation
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, alpha=0.25):
         super(FocalLoss, self).__init__()
@@ -376,10 +295,6 @@ class FocalLoss(nn.Module):
         self.alpha = alpha
 
     def forward(self, pred, mask):
-        """
-        pred: [B, 1, H, W]
-        mask: [B, 1, H, W]
-        """
         assert pred.shape == mask.shape, "pred and mask should have the same shape."
         p = torch.sigmoid(pred)
         num_pos = torch.sum(mask)
@@ -401,10 +316,6 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, pred, mask):
-        """
-        pred: [B, 1, H, W]
-        mask: [B, 1, H, W]
-        """
         assert pred.shape == mask.shape, "pred and mask should have the same shape."
         p = torch.sigmoid(pred)
         intersection = torch.sum(p * mask)
@@ -415,16 +326,10 @@ class DiceLoss(nn.Module):
 
 
 class MaskIoULoss(nn.Module):
-
     def __init__(self, ):
         super(MaskIoULoss, self).__init__()
 
     def forward(self, pred_mask, ground_truth_mask, pred_iou):
-        """
-        pred_mask: [B, 1, H, W]
-        ground_truth_mask: [B, 1, H, W]
-        pred_iou: [B, 1]
-        """
         assert pred_mask.shape == ground_truth_mask.shape, "pred_mask and ground_truth_mask should have the same shape."
 
         p = torch.sigmoid(pred_mask)
@@ -436,7 +341,6 @@ class MaskIoULoss(nn.Module):
 
 
 class FocalDiceloss_IoULoss(nn.Module):
-    
     def __init__(self, weight=20.0, iou_scale=1.0):
         super(FocalDiceloss_IoULoss, self).__init__()
         self.weight = weight
@@ -446,10 +350,6 @@ class FocalDiceloss_IoULoss(nn.Module):
         self.maskiou_loss = MaskIoULoss()
 
     def forward(self, pred, mask, pred_iou):
-        """
-        pred: [B, 1, H, W]
-        mask: [B, 1, H, W]
-        """
         assert pred.shape == mask.shape, "pred and mask should have the same shape."
 
         focal_loss = self.focal_loss(pred, mask)

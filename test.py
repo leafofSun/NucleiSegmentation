@@ -40,16 +40,18 @@ def parse_args():
     # PNuRL相关参数
     parser.add_argument("--use_pnurl", action='store_true', help="启用PNuRL（使用属性提示词增强图像特征）")
     parser.add_argument("--pnurl_clip_path", type=str, default="ViT-B/16", help="CLIP模型路径（用于PNuRL文本编码）")
-    parser.add_argument("--pnurl_num_classes", type=str, default="3,5,4,3,3", help="PNuRL每个属性的类别数量，格式：颜色,形状,排列,大小,分布（默认：3,5,4,3,3）")
-    parser.add_argument("--attribute_info_path", type=str, default="data/cpm17/attribute_info_test.json", help="属性信息文件路径（如果不在data_dir中）")
+    parser.add_argument("--pnurl_num_classes", type=str, default="3,5,4,3,3", help="PNuRL每个属性的类别数量")
+    parser.add_argument("--attribute_info_path", type=str, default="data/cpm17/attribute_info_test.json", help="属性信息文件路径")
     args = parser.parse_args()
     
     # 解析PNuRL类别数量
     if args.use_pnurl:
         try:
-            args.pnurl_num_classes = [int(x.strip()) for x in args.pnurl_num_classes.split(',')]
+            if isinstance(args.pnurl_num_classes, str):
+                args.pnurl_num_classes = [int(x.strip()) for x in args.pnurl_num_classes.split(',')]
             if len(args.pnurl_num_classes) != 5:
-                raise ValueError("PNuRL类别数量必须是5个（颜色、形状、排列、大小、分布）")
+                # 默认回退
+                args.pnurl_num_classes = [3, 5, 4, 3, 3]
         except Exception as e:
             print(f"警告: 解析PNuRL类别数量失败: {e}，使用默认值 [3, 5, 4, 3, 3]")
             args.pnurl_num_classes = [3, 5, 4, 3, 3]
@@ -71,7 +73,6 @@ def to_device(batch_input, device):
                     flattened_prompts = []
                     for item in value:
                         if isinstance(item, (list, tuple)):
-                            # DataLoader 对单样本会给出 ('prompt',)，多样本则 ('p1','p2',...)
                             if len(item) > 0:
                                 flattened_prompts.append(item[0])
                         else:
@@ -80,7 +81,6 @@ def to_device(batch_input, device):
                 else:
                     device_input[key] = value
             elif key == 'attribute_labels':
-                # 属性标签是tensor列表，需要移到device
                 if isinstance(value, list):
                     device_input[key] = [v.to(device) if isinstance(v, torch.Tensor) else v for v in value]
                 else:
@@ -95,6 +95,10 @@ def to_device(batch_input, device):
 
 
 def postprocess_masks(low_res_masks, image_size, original_size):
+    """
+    后处理：将SAM输出的低分辨率mask恢复到原始图像尺寸
+    关键逻辑：先上采样到 padded size (1024)，然后 crop 掉 padding
+    """
     # 处理original_size可能是tensor或tuple的情况
     if isinstance(original_size, (list, tuple)) and len(original_size) == 2:
         if isinstance(original_size[0], torch.Tensor):
@@ -103,23 +107,32 @@ def postprocess_masks(low_res_masks, image_size, original_size):
         else:
             ori_h, ori_w = original_size
     else:
-        ori_h, ori_w = original_size
+        # Fallback
+        ori_h, ori_w = image_size, image_size
     
+    # 1. 上采样到模型输入尺寸 (e.g., 1024x1024)
     masks = F.interpolate(
         low_res_masks,
         (image_size, image_size),
         mode="bilinear",
         align_corners=False,
-        )
+    )
     
+    # 2. 执行 Un-padding (裁剪)
+    # 逻辑必须与 DataLoader 中的 padding 逻辑完全一致
     if ori_h < image_size and ori_w < image_size:
-        top = torch.div((image_size - ori_h), 2, rounding_mode='trunc')  #(image_size - ori_h) // 2
-        left = torch.div((image_size - ori_w), 2, rounding_mode='trunc') #(image_size - ori_w) // 2
+        # DataLoader logic: pad_h = max(target - h, 0), pad_top = pad_h // 2
+        top = (image_size - ori_h) // 2
+        left = (image_size - ori_w) // 2
+        
+        # 裁剪出中间有效区域
         masks = masks[..., top : ori_h + top, left : ori_w + left]
         pad = (top, left)
     else:
+        # 如果原图比 1024 还大 (罕见)，或者刚好一样，则 resize
         masks = F.interpolate(masks, (ori_h, ori_w), mode="bilinear", align_corners=False)
         pad = None 
+        
     return masks, pad
 
 
@@ -130,18 +143,16 @@ def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_em
         batched_input: 批次输入数据
         ddp_model: SAM 模型
         image_embeddings: 图像嵌入特征
-        text_embeddings: 文本嵌入（来自 PNuRL 的 learnable_context），shape: [B, feat_dim] 或 [B, 1, feat_dim]
+        text_embeddings: 文本嵌入（来自 PNuRL 的 learnable_context）
     """
     if  batched_input["point_coords"] is not None:
         points = (batched_input["point_coords"], batched_input["point_labels"])
     else:
         points = None
 
-    # 修复：处理多个框的情况
-    # 如果 boxes 的形状是 [1, N, 4]，需要 reshape 为 [N, 4] 以便 prompt_encoder 正确处理
+    # 处理 boxes
     boxes = batched_input.get("boxes", None)
-    num_boxes = 1  # 默认 batch size
-
+    num_boxes = 1
     
     if boxes is not None:
         if len(boxes.shape) == 3 and boxes.shape[0] == 1:
@@ -149,20 +160,19 @@ def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_em
             num_boxes = boxes.shape[1]
             boxes = boxes.squeeze(0)
         elif len(boxes.shape) == 2:
-            # [N, 4] 已经是正确格式
             num_boxes = boxes.shape[0]
         else:
-            # 其他情况，尝试 flatten
             boxes = boxes.reshape(-1, 4)
             num_boxes = boxes.shape[0]
+            
+    # 【核心修复】这里绝对不要加 max_boxes = 50 的限制！
+    # 让模型处理所有框，否则 AJI/Dice 会因漏检而极低。
     
-  
-    
-    # 如果有多于1个框，需要扩展 image_embeddings 以匹配 batch size
+    # 扩展 image_embeddings 以匹配 batch size (num_boxes)
     if num_boxes > 1:
-        # image_embeddings: [1, C, H, W] -> [N, C, H, W]
+        # [1, C, H, W] -> [N, C, H, W]
         image_embeddings = image_embeddings.repeat(num_boxes, 1, 1, 1)
-        # text_embeddings 也需要扩展（如果存在）
+        # 扩展 text_embeddings
         if text_embeddings is not None:
             if len(text_embeddings.shape) == 2:
                 # [1, feat_dim] -> [N, feat_dim]
@@ -174,9 +184,9 @@ def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_em
     with torch.no_grad():
         sparse_embeddings, dense_embeddings = ddp_model.prompt_encoder(
             points=points,
-            boxes=boxes,  # 使用处理后的 boxes
+            boxes=boxes,
             masks=batched_input.get("mask_inputs", None),
-            text_embeddings=text_embeddings,  # 传递文本嵌入
+            text_embeddings=text_embeddings,
         )
 
         low_res_masks, iou_predictions = ddp_model.mask_decoder(
@@ -188,6 +198,7 @@ def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_em
         )
     
     if args.multimask:
+        # 选择置信度最高的 mask
         max_values, max_indexs = torch.max(iou_predictions, dim=1)
         max_values = max_values.unsqueeze(1)
         iou_predictions = max_values
@@ -195,25 +206,19 @@ def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_em
         for i, idx in enumerate(max_indexs):
             low_res.append(low_res_masks[i:i+1, idx])
         low_res_masks = torch.stack(low_res, 0)
-    masks = F.interpolate(low_res_masks,(args.image_size, args.image_size), mode="bilinear", align_corners=False,)
+    
+    # 这里暂时不需要插值到 image_size，留给 postprocess_masks 处理
+    masks = F.interpolate(low_res_masks, (args.image_size, args.image_size), mode="bilinear", align_corners=False)
     return masks, low_res_masks, iou_predictions
 
 
-def is_not_saved(save_path, mask_name):
-    masks_path = os.path.join(save_path, f"{mask_name}")
-    if os.path.exists(masks_path):
-        return False
-    else:
-        return True
-
-
 def main(args):
-    # 如果启用PNuRL，设置相关参数
+    # PNuRL 配置
     if args.use_pnurl:
         args.pnurl_config = {
             'clip_model_path': args.pnurl_clip_path,
             'num_classes_per_attr': args.pnurl_num_classes,
-            'attr_loss_weight': 1.0,  # 测试时不需要损失权重，但需要设置
+            'attr_loss_weight': 1.0,
         }
         print(f"启用PNuRL测试")
         print(f"  - CLIP模型路径: {args.pnurl_clip_path}")
@@ -226,22 +231,9 @@ def main(args):
         print(key + ': ' + str(value))
     print('*'*100)
 
+    # 加载模型
     model = sam_model_registry[args.model_type](args).to(args.device) 
     
-    # # 调试：检查模型是否加载了checkpoint
-    # if args.sam_checkpoint and os.path.exists(args.sam_checkpoint):
-    #     print(f"\n[调试] 检查checkpoint加载:")
-    #     print(f"  Checkpoint路径: {args.sam_checkpoint}")
-    #     # 检查模型参数是否已更新（不是随机初始化）
-    #     first_param = next(iter(model.parameters()))
-    #     print(f"  模型第一个参数统计: mean={first_param.data.mean().item():.6f}, std={first_param.data.std().item():.6f}")
-    #     # 检查mask_decoder的输出层参数
-    #     if hasattr(model, 'mask_decoder'):
-    #         output_hypernetworks = model.mask_decoder.output_hypernetworks_mlps
-    #         if len(output_hypernetworks) > 0:
-    #             first_mlp_param = next(iter(output_hypernetworks[0].parameters()))
-    #             print(f"  Mask decoder输出层参数: mean={first_mlp_param.data.mean().item():.6f}, std={first_mlp_param.data.std().item():.6f}")
-
     criterion = FocalDiceloss_IoULoss()
     test_dataset = TestingDataset(
         data_path=args.data_path, 
@@ -269,29 +261,23 @@ def main(args):
         batched_input = to_device(batched_input, args.device)
         ori_labels = batched_input["ori_label"]
         original_size = batched_input["original_size"]
-        # 确保original_size是正确的格式（tuple或list）
-        if isinstance(original_size, (list, tuple)) and len(original_size) == 2:
-            if isinstance(original_size[0], torch.Tensor):
-                # 如果是tensor，转换为int
-                original_size = (int(original_size[0].item() if original_size[0].numel() == 1 else original_size[0]), 
-                                int(original_size[1].item() if original_size[1].numel() == 1 else original_size[1]))
         labels = batched_input["label"]
         img_name = batched_input['name'][0]
+        
         if args.prompt_path is None:
             prompt_dict[img_name] = {
-                        "boxes": batched_input["boxes"].squeeze(1).cpu().numpy().tolist(),
-                        "point_coords": batched_input["point_coords"].squeeze(1).cpu().numpy().tolist(),
-                        "point_labels": batched_input["point_labels"].squeeze(1).cpu().numpy().tolist()
-                        }
+                "boxes": batched_input["boxes"].squeeze(1).cpu().numpy().tolist(),
+                "point_coords": batched_input["point_coords"].squeeze(1).cpu().numpy().tolist(),
+                "point_labels": batched_input["point_labels"].squeeze(1).cpu().numpy().tolist()
+            }
 
         with torch.no_grad():
             image_embeddings = model.image_encoder(batched_input["image"])
             
-            # 如果使用PNuRL，对图像特征进行加权
+            # PNuRL: 文本特征注入
             pnurl_context = None
             if args.use_pnurl:
                 attribute_prompts = batched_input.get("attribute_prompts", None)
-                # 测试时不需要计算损失，所以不传入attribute_labels
                 if attribute_prompts is not None:
                     weighted_image_embeddings, pnurl_context, _, _ = model.pnurl(
                         image_features=image_embeddings,
@@ -299,203 +285,128 @@ def main(args):
                         attribute_labels=None,
                         return_loss=False,
                     )
-                    # 使用加权后的ViT特征
                     image_embeddings = weighted_image_embeddings
 
-        # 处理 pnurl_context 为 text_embeddings 格式
-        text_embeddings_input = None
-        if pnurl_context is not None:
-            # pnurl_context shape: [B, feat_dim] -> [B, 1, feat_dim] 以匹配 sparse_embeddings 格式
-            text_embeddings_input = pnurl_context.unsqueeze(1)
-        
-        if args.boxes_prompt:
-            save_path = os.path.join(args.work_dir, args.run_name, "boxes_prompt")
-            batched_input["point_coords"], batched_input["point_labels"] = None, None
-            masks, low_res_masks, iou_predictions = prompt_and_decoder(
-                args, batched_input, model, image_embeddings, 
-                text_embeddings=text_embeddings_input  # 传递 PNuRL 的文本提示
-            )
-            points_show = None
-
-        else:
-            save_path = os.path.join(f"{args.work_dir}", args.run_name, f"iter{args.iter_point if args.iter_point > 1 else args.point_num}_prompt")
-            batched_input["boxes"] = None
-            point_coords, point_labels = [batched_input["point_coords"]], [batched_input["point_labels"]]
-     
-            for iter_idx in range(args.iter_point):
+            # 准备 text_embeddings
+            text_embeddings_input = None
+            if pnurl_context is not None:
+                text_embeddings_input = pnurl_context.unsqueeze(1)
+            
+            if args.boxes_prompt:
+                save_path = os.path.join(args.work_dir, args.run_name, "boxes_prompt")
+                batched_input["point_coords"], batched_input["point_labels"] = None, None
                 masks, low_res_masks, iou_predictions = prompt_and_decoder(
-                    args, batched_input, model, image_embeddings,
-                    text_embeddings=text_embeddings_input  # 传递 PNuRL 的文本提示
+                    args, batched_input, model, image_embeddings, 
+                    text_embeddings=text_embeddings_input
                 )
-                if iter_idx != args.iter_point-1:
-                    batched_input = generate_point(masks, labels, low_res_masks, batched_input, args.point_num)
-                    batched_input = to_device(batched_input, args.device)
-                    point_coords.append(batched_input["point_coords"])
-                    point_labels.append(batched_input["point_labels"])
-                    batched_input["point_coords"] = torch.concat(point_coords,dim=1)
-                    batched_input["point_labels"] = torch.concat(point_labels, dim=1)
-  
-            points_show = (torch.concat(point_coords, dim=1), torch.concat(point_labels, dim=1))
+                points_show = None
+            else:
+                save_path = os.path.join(f"{args.work_dir}", args.run_name, f"iter{args.iter_point if args.iter_point > 1 else args.point_num}_prompt")
+                batched_input["boxes"] = None
+                point_coords, point_labels = [batched_input["point_coords"]], [batched_input["point_labels"]]
+                for iter_idx in range(args.iter_point):
+                    masks, low_res_masks, iou_predictions = prompt_and_decoder(
+                        args, batched_input, model, image_embeddings,
+                        text_embeddings=text_embeddings_input
+                    )
+                    if iter_idx != args.iter_point-1:
+                        batched_input = generate_point(masks, labels, low_res_masks, batched_input, args.point_num)
+                        batched_input = to_device(batched_input, args.device)
+                        point_coords.append(batched_input["point_coords"])
+                        point_labels.append(batched_input["point_labels"])
+                        batched_input["point_coords"] = torch.concat(point_coords,dim=1)
+                        batched_input["point_labels"] = torch.concat(point_labels, dim=1)
+                points_show = (torch.concat(point_coords, dim=1), torch.concat(point_labels, dim=1))
 
-        # 后处理 masks：将低分辨率 masks 调整到原始图像尺寸
+        # === [核心修复] 后处理：裁剪 Padding ===
         masks, pad = postprocess_masks(low_res_masks, args.image_size, original_size)
         
-        # ================== [修复] 构建实例图 (Instance Map) 而不是简单合并 ==================
-        # 原逻辑: masks, _ = torch.max(masks, dim=0, keepdim=True) (导致粘连)
-        # 新逻辑: 为每个 box 的预测分配唯一 ID，构建实例索引图
-        
-        # 保存原始 logits 用于 loss 计算
-        masks_for_loss = masks.clone()
-        if masks.shape[0] > 1:
-            # 对于 loss 计算，使用 max 合并（保持原有逻辑）
-            masks_for_loss, _ = torch.max(masks_for_loss, dim=0, keepdim=True)
-        
+        # === [核心修复] 构建实例分割图 (防止 mask 粘连) ===
+        # masks shape: [N, 1, H, W]
         N, _, H, W = masks.shape
         
+        # 准备 Loss 计算用的 merged mask
+        masks_for_loss = masks.clone()
         if N > 1:
-            # 构建实例图：为每个预测分配唯一 ID
+            masks_for_loss, _ = torch.max(masks_for_loss, dim=0, keepdim=True)
+        
+        if N > 1:
+            # 这里的 N 等于 box 的数量 (例如 46)
             full_instance_map = torch.zeros((H, W), dtype=torch.int32, device=masks.device)
-            
-            # 将 logits 转为概率
             probs = torch.sigmoid(masks)
             
-            # 逐个叠加实例 (Painter's Algorithm)
-            # 注意：如果有重叠，后一个会覆盖前一个
-            # 更高级的做法是比较重叠区域的置信度，但对于细胞核，这种简单做法通常够用
+            # Painter's algorithm: 依次叠加
             for idx in range(N):
-                # 获取第 idx 个实例的 mask (阈值 0.5)
-                # shape: [1, H, W]
                 single_mask = probs[idx] > 0.5
-                
-                # 赋值 ID (idx + 1)，因为 0 是背景
-                # 只在 mask 为 True 的地方赋值
                 full_instance_map[single_mask.squeeze()] = idx + 1
             
-            # 调整维度以适配后续代码 [H, W] -> [1, 1, H, W]
-            # 注意：现在 masks 里面存的是 int32 的 ID，不再是 logits
+            # 转回 float tensor [1, 1, H, W] 用于 metrics
             masks = full_instance_map.unsqueeze(0).unsqueeze(0).float()
             
-            # iou_predictions 也取最大值或者平均值，仅用于 loss 计算
             if iou_predictions is not None and iou_predictions.shape[0] > 1:
                 iou_predictions, _ = torch.max(iou_predictions, dim=0, keepdim=True)
         else:
-            # 如果只有一个预测，仍然需要转换为实例图格式（ID=1）
             probs = torch.sigmoid(masks)
-            single_mask = (probs > 0.5).squeeze()
-            full_instance_map = torch.zeros((H, W), dtype=torch.int32, device=masks.device)
-            full_instance_map[single_mask] = 1
-            masks = full_instance_map.unsqueeze(0).unsqueeze(0).float()
-        # ================== [结束修复] ==================
+            full_instance_map = (probs > 0.5).int()
+            masks = full_instance_map
         
         if args.save_pred:
-            # 处理 boxes 的形状：可能是 [B, N, 4] 或 [N, 4]
             boxes_for_vis = None
             if batched_input.get("boxes", None) is not None:
                 boxes_for_vis = batched_input["boxes"]
-                # 去掉 batch 维度（如果有）
                 if boxes_for_vis.dim() == 3:
                     boxes_for_vis = boxes_for_vis.squeeze(0)
             save_masks(masks, save_path, img_name, args.image_size, original_size, pad, boxes_for_vis, points_show)
-        # ================== [结束修复] ==================
 
-        # 确保ori_labels的形状与masks匹配：[B, 1, H, W]
-        # ori_labels从DataLoader返回时是[1, H, W]，需要添加batch和channel维度
+        # 处理 GT 标签维度
         if len(ori_labels.shape) == 3:
-            # [1, H, W] -> [1, 1, H, W]
             ori_labels = ori_labels.unsqueeze(0)
         elif len(ori_labels.shape) == 2:
-            # [H, W] -> [1, 1, H, W]
             ori_labels = ori_labels.unsqueeze(0).unsqueeze(0)
         
-        # 确保 masks 和 ori_labels 的空间尺寸匹配
+        # 确保尺寸匹配 (防止除法取整误差导致的 1px 差异)
         if masks.shape[2:] != ori_labels.shape[2:]:
-            # 将 ori_labels 调整到 masks 的尺寸
             ori_labels = F.interpolate(ori_labels, size=masks.shape[2:], mode='nearest')
         
-        # [新增] 清洗 GT 标签，将 ID 重排为 1, 2, 3...
-        # 解决 ori_labels max=11730 的问题
+        # 重排 GT ID
         from skimage.segmentation import relabel_sequential
         gt_numpy = ori_labels.squeeze().cpu().numpy().astype(int)
         gt_relabelled, _, _ = relabel_sequential(gt_numpy)
-        # 更新 ori_labels
         ori_labels = torch.tensor(gt_relabelled).unsqueeze(0).unsqueeze(0).to(args.device).float()
         
-        # ================== [开始] 标签值域检查和修复 ==================
-        # 调试：检查标签值域（只打印第一张图）
+        # 标签检查
         if i == 0:
-            print(f"\n[DEBUG] 标签值域检查: Image {img_name}")
-            print(f"  - ori_labels Min: {ori_labels.min().item():.4f}, Max: {ori_labels.max().item():.4f}")
-            print(f"  - masks (Pred) Min: {masks.min().item():.4f}, Max: {masks.max().item():.4f}")
-        
-        # 【修复】不再强制二值化，保持实例信息用于 Metrics 计算
-        # ori_labels 应该是实例图（如果 DataLoader 正确返回了 ori_label）
-        # 如果 ori_labels 是实例图（max > 1），我们需要保持它用于 AJI/PQ 计算
-        # 但 Loss 计算需要二值图，所以创建一个二值副本
-        if ori_labels.max() > 1:
-            if i == 0:
-                print(f"  >>> 检测到实例图 (Max={ori_labels.max().item():.2f})，保持实例信息用于 Metrics 计算")
-            # 创建二值副本用于 Loss 计算
-            ori_labels_binary = (ori_labels > 0).float()
-        else:
-            # 已经是二值图
-            ori_labels_binary = ori_labels
-        # ================== [结束] 标签值域检查和修复 ==================
-        
-        # 计算 Loss 用二值
+            print(f"\n[DEBUG] 标签值域: GT Max={ori_labels.max().item()}, Pred Max={masks.max().item()}")
+
+        # Loss 用二值
+        ori_labels_binary = (ori_labels > 0).float()
         loss = criterion(masks_for_loss, ori_labels_binary, iou_predictions)
         test_loss.append(loss.item())
 
-        # ================== [开始修复] 数据对齐与清洗 ==================
-        # 注意：ori_labels 已经在前面进行了重排（在形状调整之后）
-        # 直接使用已经重排过的 ori_labels
-        ori_labels_clean = ori_labels
-        
-        # 2. 确保 Pred 也是干净的实例图
-        #    masks 已经是我们自己构建的实例图，通常从 1 开始，问题不大
-        #    但为了保险，也进行 ID 重排，防止内存溢出
+        # Metrics 计算 (使用重排后的实例图)
         pred_numpy = masks.squeeze().cpu().numpy().astype(int)
         pred_relabelled, _, _ = relabel_sequential(pred_numpy)
         masks_clean = torch.tensor(pred_relabelled).unsqueeze(0).unsqueeze(0).to(args.device).float()
         
-        # ================== [修改 SegMetrics 调用] ==================
-        # 我们现在有两个版本的 GT：
-        # 1. ori_labels_clean: 实例图 (0, 1, 2...) -> 用于 AJI, PQ
-        # 2. ori_labels_binary: 二值图 (0, 1) -> 用于 Dice
-        
-        # 临时方案：直接在这里计算 Dice，绕过 SegMetrics 的潜在 Bug
-        # 手动计算 Batch Dice (Binary)
+        # 计算指标
+        # 临时手动计算 Dice 以确保准确性
         pred_bin = (masks_clean > 0).float()
-        gt_bin = (ori_labels_clean > 0).float()
+        gt_bin = (ori_labels > 0).float()
         inter = (pred_bin * gt_bin).sum()
         union = pred_bin.sum() + gt_bin.sum()
         dice_val = 2.0 * inter / (union + 1e-7)
         
-        # 调用 SegMetrics 计算 AJI/PQ (传入清洗后的实例图)
-        # 注意：metrics.py 里的 AJI/PQ 计算能处理实例图输入
-        metrics_results = SegMetrics(masks_clean, ori_labels_clean, args.metrics)
+        metrics_results = SegMetrics(masks_clean, ori_labels, args.metrics)
         
-        # 覆盖 Dice 结果
-        if isinstance(metrics_results, dict):
-            metrics_results['dice'] = dice_val.item()
-            metrics_results['mDice'] = dice_val.item()  # 双保险
-            
-            # 将结果转为列表，适配后续代码
-            metric_values = []
-            for metric in args.metrics:
-                if metric in ['mDice', 'dice']:
-                    metric_values.append(dice_val.item())
-                else:
-                    # 获取其他指标 (AJI, PQ)
-                    val = metrics_results.get(metric, 0.0)
-                    metric_values.append(val)
-            test_batch_metrics = metric_values
-        else:
-            # 如果 SegMetrics 返回的是列表，可能需要手动替换第一个元素
-            # 但根据你的代码，它应该返回字典
-            test_batch_metrics = metrics_results
+        # 整理结果
+        metric_values = []
+        for metric in args.metrics:
+            if metric in ['mDice', 'dice']:
+                metric_values.append(dice_val.item())
+            else:
+                metric_values.append(metrics_results.get(metric, 0.0))
         
-        test_batch_metrics = [float('{:.4f}'.format(metric)) for metric in test_batch_metrics]
-        # ================== [结束修复] ==================
+        test_batch_metrics = [float('{:.4f}'.format(m)) for m in metric_values]
 
         for j in range(len(args.metrics)):
             test_iter_metrics[j] += test_batch_metrics[j]
