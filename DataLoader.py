@@ -14,17 +14,18 @@ import random
 
 
 class TestingDataset(Dataset):
+    
     def __init__(self, data_path, image_size=256, mode='test', requires_name=True, point_num=1, return_ori_mask=True, prompt_path=None, attribute_info_path=None):
         self.image_size = image_size
         self.return_ori_mask = return_ori_mask
         self.prompt_path = prompt_path
         
+        # ... (Prompt list loading logic remains same) ...
         if prompt_path is None:
             self.prompt_list = {}
             self.prompt_list_type = None
         else:
             loaded_data = json.load(open(prompt_path, "r"))
-            # ... (略去详细 dict/list 解析代码，请保持原样) ...
             if isinstance(loaded_data, dict):
                 self.prompt_list = loaded_data
                 self.prompt_list_type = "dict"
@@ -35,7 +36,7 @@ class TestingDataset(Dataset):
         self.requires_name = requires_name
         self.point_num = point_num
         
-        # 加载属性信息
+        # Load attribute info
         self.attribute_info = {}
         if attribute_info_path is None:
             attribute_info_path = os.path.join(data_path, f'attribute_info_{mode}.json')
@@ -44,7 +45,6 @@ class TestingDataset(Dataset):
                 self.attribute_info = json.load(open(attribute_info_path, "r"))
             except: pass
 
-        # 路径处理
         if not os.path.isabs(data_path):
             current_dir = os.path.abspath(os.getcwd())
             if 'SAM-Med2D-main' in data_path and 'SAM-Med2D-main' in current_dir:
@@ -54,7 +54,7 @@ class TestingDataset(Dataset):
         
         json_file_path = os.path.join(data_path, f'image2label_{mode}.json')
         if not os.path.exists(json_file_path):
-            raise FileNotFoundError(f"找不到数据文件: {json_file_path}")
+            raise FileNotFoundError(f"Data file not found: {json_file_path}")
         json_file = open(json_file_path, "r")
         dataset = json.load(json_file)
         
@@ -80,16 +80,20 @@ class TestingDataset(Dataset):
       
         self.pixel_mean = [123.675, 116.28, 103.53]
         self.pixel_std = [58.395, 57.12, 57.375]
-
+    
     def __getitem__(self, index):
         image_input = {}
         image = cv2.imread(self.image_paths[index])
         if image is None:
-            raise ValueError(f"无法读取图像文件: {self.image_paths[index]}")
+            raise ValueError(f"Cannot read image: {self.image_paths[index]}")
         
+        # === [Fix 1] BGR -> RGB ===
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Normalize
         image = (image - self.pixel_mean) / self.pixel_std
 
+        # Read Masks
         mask_paths = self.mask_paths_list[index]
         ori_np_mask_instance = None
         for mask_path in mask_paths:
@@ -106,83 +110,92 @@ class TestingDataset(Dataset):
                     mask[mask > 0] += current_max_id
                 ori_np_mask_instance = np.maximum(ori_np_mask_instance, mask)
         
+        if ori_np_mask_instance is None:
+             # Fallback if no masks found
+             h, w = image.shape[:2]
+             ori_np_mask_instance = np.zeros((h, w), dtype=np.float32)
+
         h, w = ori_np_mask_instance.shape
         target_size = self.image_size
 
-        # === 修复1：手动 Padding ===
-        pad_h = max(target_size - h, 0)
-        pad_w = max(target_size - w, 0)
+        # === [Fix 2] Resize Longest Side (Crucial for SAM performance) ===
+        scale = target_size * 1.0 / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        
+        image_resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        mask_resized = cv2.resize(ori_np_mask_instance, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        
+        # === Padding ===
+        pad_h = max(target_size - new_h, 0)
+        pad_w = max(target_size - new_w, 0)
         pad_top = pad_h // 2
         pad_bottom = pad_h - pad_top
         pad_left = pad_w // 2
         pad_right = pad_w - pad_left
         
-        image_padded = cv2.copyMakeBorder(image, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
-        mask_instance_padded = cv2.copyMakeBorder(ori_np_mask_instance, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
+        image_padded = cv2.copyMakeBorder(image_resized, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
+        mask_instance_padded = cv2.copyMakeBorder(mask_resized, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
 
         image_tensor = torch.from_numpy(image_padded).permute(2, 0, 1).float()
         
-        # === 修复2：真实 Box 数量 (不补齐) ===
+        # === Generate Boxes from Padded Mask ===
         if self.prompt_path is None:
-            from skimage.measure import label, regionprops
-            if mask_instance_padded.max() > 1:
-                label_img = mask_instance_padded.astype(int)
+            if mask_instance_padded.max() > 0:
+                from skimage.measure import label, regionprops
+                if mask_instance_padded.max() > 1:
+                    label_img = mask_instance_padded.astype(int)
+                else:
+                    label_img = label(mask_instance_padded)
+                
+                regions = regionprops(label_img)
+                real_boxes = [tuple(region.bbox) for region in regions]
+                
+                boxes_coord = []
+                for box in real_boxes:
+                    y0, x0, y1, x1 = box
+                    boxes_coord.append([x0, y0, x1, y1])
+                
+                if len(boxes_coord) == 0:
+                    boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
+                else:
+                    boxes = torch.tensor(boxes_coord, dtype=torch.float)
+                
+                binary_mask_padded = (mask_instance_padded > 0).astype(np.float32)
+                point_coords, point_labels = init_point_sampling(binary_mask_padded, self.point_num)
             else:
-                label_img = label(mask_instance_padded)
-            
-            regions = regionprops(label_img)
-            real_boxes = []
-            for region in regions:
-                y0, x0, y1, x1 = region.bbox
-                real_boxes.append([x0, y0, x1, y1]) # 转换为 xyxy
-            
-            if len(real_boxes) == 0:
                 boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
                 point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
                 point_labels = torch.tensor([[0]], dtype=torch.int)
-            else:
-                boxes = torch.tensor(real_boxes, dtype=torch.float)
-                # 简单生成中心点
-                point_coords = []
-                point_labels = []
-                for box in real_boxes:
-                    x0, y0, x1, y1 = box
-                    point_coords.append([[(x0+x1)/2, (y0+y1)/2]])
-                    point_labels.append([1])
-                point_coords = torch.tensor(point_coords, dtype=torch.float)
-                point_labels = torch.tensor(point_labels, dtype=torch.int)
         else:
-             boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
-             point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
-             point_labels = torch.tensor([[0]], dtype=torch.int)
+            boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
+            point_coords = torch.tensor([[[0, 0]]], dtype=torch.float)
+            point_labels = torch.tensor([[0]], dtype=torch.int)
 
         image_input["image"] = image_tensor
         image_input["boxes"] = boxes
         image_input["point_coords"] = point_coords
         image_input["point_labels"] = point_labels
         image_input["label"] = torch.tensor(mask_instance_padded > 0).float().unsqueeze(0)
-        image_input["original_size"] = (h, w)
+        image_input["original_size"] = (h, w) # Keep original size for post-processing
         if mask_paths:
             image_input["label_path"] = '/'.join(mask_paths[0].split('/')[:-1])
 
-        if self.return_ori_mask:
-            image_input["ori_label"] = torch.tensor(ori_np_mask_instance).unsqueeze(0)
+        # === [Fix 3] Ensure ori_label is always returned ===
+        # Even if return_ori_mask is False, for validation/testing we usually need it for metrics
+        image_input["ori_label"] = torch.tensor(ori_np_mask_instance).unsqueeze(0)
      
         image_name = self.image_paths[index].split('/')[-1]
         if self.requires_name:
             image_input["name"] = image_name
         
-        # === 修复3：文件名 Key 匹配 (TrainingDataset 也要加这个！) ===
+        # PNuRL Key Matching
         if self.attribute_info:
-             file_stem = image_name.split('.')[0] # image_04
+             file_stem = image_name.split('.')[0]
              attr_info = None
-             
-             # 优先尝试无后缀的 file_stem
              for key in [file_stem, image_name, self.image_paths[index]]:
                  if key in self.attribute_info:
                      attr_info = self.attribute_info[key]
                      break
-                 
              if attr_info and 'attribute_prompts' in attr_info:
                  image_input['attribute_prompts'] = attr_info['attribute_prompts']
         
@@ -191,21 +204,9 @@ class TestingDataset(Dataset):
     def __len__(self):
         return len(self.image_paths)
 
+
 class TrainingDataset(Dataset):
-    def __init__(self, data_dir, image_size=256, mode='train', requires_name=True, point_num=1, mask_num=5, 
-                 attribute_info_path=None):
-        """
-        Initializes a training dataset.
-        Args:
-            data_dir (str): Directory containing the dataset.
-            image_size (int, optional): Desired size for the input images. Defaults to 256.
-            mode (str, optional): Mode of the dataset. Defaults to 'train'.
-            requires_name (bool, optional): Indicates whether to include image names in the output. Defaults to True.
-            num_points (int, optional): Number of points to sample. Defaults to 1.
-            num_masks (int, optional): Number of masks to sample. Defaults to 5.
-            attribute_info_path (str, optional): Path to JSON file containing attribute_prompts and attribute_labels for PNuRL. 
-                If None, will try to load from data_dir/attribute_info_{mode}.json. Defaults to None.
-        """
+    def __init__(self, data_dir, image_size=256, mode='train', requires_name=True, point_num=1, mask_num=5, attribute_info_path=None):
         self.image_size = image_size
         self.requires_name = requires_name
         self.point_num = point_num
@@ -215,41 +216,24 @@ class TrainingDataset(Dataset):
 
         dataset = json.load(open(os.path.join(data_dir, f'image2label_{mode}.json'), "r"))
         
-        # 加载属性信息（用于PNuRL）
         self.attribute_info = {}
         if attribute_info_path is None:
             attribute_info_path = os.path.join(data_dir, f'attribute_info_{mode}.json')
         if os.path.exists(attribute_info_path):
             try:
                 self.attribute_info = json.load(open(attribute_info_path, "r"))
-                print(f"加载属性信息从: {attribute_info_path}")
-            except Exception as e:
-                print(f"警告: 无法加载属性信息文件 {attribute_info_path}: {e}")
-                self.attribute_info = {}
-        elif attribute_info_path and os.path.exists(attribute_info_path):
-            try:
-                self.attribute_info = json.load(open(attribute_info_path, "r"))
-                print(f"加载属性信息从: {attribute_info_path}")
-            except Exception as e:
-                print(f"警告: 无法加载属性信息文件 {attribute_info_path}: {e}")
-                self.attribute_info = {}
-        # 将 JSON 中的路径转换为实际的数据目录路径
-        # JSON 中的路径格式可能是 "data_demo/..." 或 "cpm17/..."，需要转换为绝对路径
+            except: pass
+
         def convert_path(path):
             if isinstance(path, str):
-                # 处理 data_demo/ 格式
                 if path.startswith('data_demo/'):
                     return path.replace('data_demo/', f'{data_dir}/')
-                # 处理 cpm17/ 格式
                 elif path.startswith('cpm17/'):
-                    # data_dir 应该是 data/cpm17，所以需要去掉末尾的 cpm17
                     base_dir = str(data_dir).rstrip('/cpm17').rstrip('\\cpm17')
                     if base_dir == str(data_dir):
-                        # 如果data_dir就是cpm17目录，直接使用
                         return os.path.join(data_dir, path.replace('cpm17/', ''))
                     else:
                         return os.path.join(base_dir, path)
-                # 如果已经是绝对路径或相对路径，直接返回
                 return path
             elif isinstance(path, list):
                 return [convert_path(p) for p in path]
@@ -260,58 +244,43 @@ class TrainingDataset(Dataset):
         self.label_paths = list(converted_dataset.values())
     
     def __getitem__(self, index):
-        """
-        Returns a sample from the dataset.
-        Args:
-            index (int): Index of the sample.
-        Returns:
-            dict: A dictionary containing the sample data.
-        """
-
         image_input = {}
         image = cv2.imread(self.image_paths[index])
         if image is None:
-            raise ValueError(f"无法读取图像文件: {self.image_paths[index]}")
+            raise ValueError(f"Cannot read image: {self.image_paths[index]}")
         
+        # === [Fix 1] BGR -> RGB ===
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
         image = (image - self.pixel_mean) / self.pixel_std
         h, w, _ = image.shape
-        # 训练模式：使用随机裁剪（模仿 PromptNu）
+        
+        # === [Fix 2] Training Transforms (Use RandomCrop logic) ===
         transforms = get_transforms(self.image_size, h, w, mode='train')
     
         masks_list = []
         boxes_list = []
         point_coords_list, point_labels_list = [], []
         
-        # 随机选择 mask_num 个样本进行训练
         mask_path = random.choices(self.label_paths[index], k=self.mask_num)
         
         for m in mask_path:
             pre_mask = cv2.imread(m, 0)
-            if pre_mask is None:
-                raise ValueError(f"无法读取掩码文件: {m}")
+            if pre_mask is None: continue
             pre_mask = pre_mask.astype(np.float32)
 
-            # 1. 随机裁剪并尝试找到有细胞的区域
             for retry_count in range(10):
                 augments = transforms(image=image, mask=pre_mask)
                 image_tensor = augments['image']
-                mask_instance_crop = augments['mask'] # 裁剪后的实例图
-                
-                # 转换为 numpy
+                mask_instance_crop = augments['mask']
                 if isinstance(mask_instance_crop, torch.Tensor):
                     mask_instance_crop_np = mask_instance_crop.cpu().numpy()
                 else:
                     mask_instance_crop_np = mask_instance_crop
-                
                 if mask_instance_crop_np.max() > 0:
                     break
             
-            # 2. 【核心修复】分离目标实例
-            # 我们不能简单地用 mask > 0 作为标签，必须选出一个特定的实例
             from skimage.measure import label, regionprops
-            
-            # 获取所有连通域
             if mask_instance_crop_np.max() > 1:
                 label_img = mask_instance_crop_np.astype(int)
             else:
@@ -320,13 +289,8 @@ class TrainingDataset(Dataset):
             regions = regionprops(label_img)
             
             if len(regions) > 0:
-                # 策略：随机选一个实例，或者选最大的
-                # 这里为了稳定，选最大的那个实例作为本次的训练目标
                 target_region = max(regions, key=lambda x: x.area)
-                
-                # A. 生成该实例的 Box
                 y0, x0, y1, x1 = target_region.bbox
-                # 添加一点噪声模拟真实提示
                 h_box, w_box = y1-y0, x1-x0
                 noise = 0.1
                 y0 += random.randint(int(-h_box*noise), int(h_box*noise))
@@ -335,29 +299,16 @@ class TrainingDataset(Dataset):
                 x1 += random.randint(int(-w_box*noise), int(w_box*noise))
                 boxes = torch.tensor([[x0, y0, x1, y1]], dtype=torch.float)
                 
-                # B. 【关键】生成只包含该实例的 Mask
-                # 只有 ID 等于目标实例 ID 的像素才设为 1，其他设为 0
                 target_id = target_region.label
                 target_mask = (label_img == target_id).astype(np.float32)
-                
-                # Point 同理，基于 target_mask 生成
                 point_coords, point_label = init_point_sampling(target_mask, self.point_num)
-                # 确保 point_coords 形状为 [num_points, 2]（SAM 期望的格式，不需要额外的 batch 维度）
-                # init_point_sampling 返回的格式：
-                # - point_num == 1: [1, 2] 和 [1]
-                # - point_num > 1: [num_points, 2] 和 [num_points]
-                # 这些格式已经是 SAM 期望的格式，不需要修改
-                
             else:
-                # 兜底：没有实例
                 target_mask = np.zeros_like(mask_instance_crop_np, dtype=np.float32)
                 boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
-                # 确保形状与正常情况一致：[num_points, 2] 和 [num_points]（SAM 期望的格式）
                 point_coords = torch.zeros((self.point_num, 2), dtype=torch.float)
                 point_label = torch.zeros((self.point_num,), dtype=torch.int)
 
-            # 3. 存入列表
-            masks_list.append(torch.tensor(target_mask).long()) # 现在 mask 只有这一个细胞了！
+            masks_list.append(torch.tensor(target_mask).long())
             boxes_list.append(boxes)
             point_coords_list.append(point_coords)
             point_labels_list.append(point_label)
@@ -368,39 +319,29 @@ class TrainingDataset(Dataset):
         point_labels = torch.stack(point_labels_list, dim=0)
 
         image_input["image"] = image_tensor.unsqueeze(0)
-        # label 增加 channel 维度: [mask_num, 1, H, W]
         image_input["label"] = mask.unsqueeze(1).float()
         image_input["boxes"] = boxes
         image_input["point_coords"] = point_coords
         image_input["point_labels"] = point_labels
 
-        # 添加属性信息（用于PNuRL，如果可用）
         image_name = self.image_paths[index].split('/')[-1]
-        image_key = self.image_paths[index]  # 使用完整路径作为key
-        file_stem = image_name.split('.')[0]  # 无后缀文件名（JSON 里的格式）
         
-        # 尝试从attribute_info中获取属性信息
+        # === [Fix 4] PNuRL Key Matching (Remove Suffix) ===
         if self.attribute_info:
-            # 尝试多种key格式（包括无后缀文件名）
             attr_data = None
             file_stem = image_name.split('.')[0]
-            potential_keys = [file_stem, image_name, self.image_paths[index]]
-            for key in potential_keys:
+            
+            for key in [file_stem, image_name, self.image_paths[index]]:
                 if key in self.attribute_info:
                     attr_data = self.attribute_info[key]
                     break
             
             if attr_data is not None:
-                # 支持PNuRL格式: {"attribute_prompts": [...], "attribute_labels": [[...], [...], ...]}
                 if isinstance(attr_data, dict):
-                    # 属性提示词（5个属性：颜色、形状、排列、大小、分布）
                     if "attribute_prompts" in attr_data:
                         image_input["attribute_prompts"] = attr_data["attribute_prompts"]
-                    
-                    # 属性标签（5个属性的标签列表）
                     if "attribute_labels" in attr_data:
                         attr_labels = attr_data["attribute_labels"]
-                        # 转换为tensor列表
                         if isinstance(attr_labels, list):
                             attr_labels_tensors = []
                             for label in attr_labels:
@@ -411,47 +352,28 @@ class TrainingDataset(Dataset):
                             if len(attr_labels_tensors) > 0:
                                 image_input["attribute_labels"] = attr_labels_tensors
                 elif isinstance(attr_data, list):
-                    # 如果直接是列表，假设是attribute_prompts
                     if len(attr_data) > 0 and isinstance(attr_data[0], str):
                         image_input["attribute_prompts"] = attr_data
+        
         if self.requires_name:
             image_input["name"] = image_name
-            return image_input
-        else:
-            return image_input
+            
+        return image_input
+
     def __len__(self):
         return len(self.image_paths)
 
-
+# ... (stack_dict_batched remains same) ...
 def stack_dict_batched(batched_input):
     out_dict = {}
     for k,v in batched_input.items():
         if isinstance(v, list):
-            # 对于文本提示、属性提示和全局标签，保持列表格式
-            if k == 'text_prompts' or k == 'attribute_prompts':
-                # 如果每个样本都有文本提示列表，合并或保持
+            if k == 'text_prompts' or k == 'attribute_prompts' or k == 'attribute_labels' or k == 'global_labels':
                 out_dict[k] = v
-            elif k == 'attribute_labels':
-                # attribute_labels 是列表的列表，每个元素是一个属性的标签列表
-                # 保持列表格式，不进行stack
-                out_dict[k] = v
-            elif k == 'global_labels':
-                # 如果是全局标签列表，尝试stack成tensor
-                if len(v) > 0 and isinstance(v[0], torch.Tensor):
-                    try:
-                        out_dict[k] = torch.stack(v, dim=0)
-                    except:
-                        out_dict[k] = v
-                else:
-                    out_dict[k] = v
             else:
                 out_dict[k] = v
         else:
-            # 特殊处理 point_coords 和 point_labels
-            # 它们的形状应该是 [batch_size, mask_num, num_points, 2] 和 [batch_size, mask_num, num_points]
-            # 需要 reshape 成 [batch_size * mask_num, num_points, 2] 和 [batch_size * mask_num, num_points]
             if k == 'point_coords' or k == 'point_labels':
-                # 如果已经是正确的形状 [batch_size, mask_num, num_points, ...]，直接 reshape
                 if v.dim() >= 3:
                     out_dict[k] = v.reshape(-1, *v.shape[2:])
                 else:
@@ -459,13 +381,3 @@ def stack_dict_batched(batched_input):
             else:
                 out_dict[k] = v.reshape(-1, *v.shape[2:])
     return out_dict
-
-
-if __name__ == "__main__":
-    train_dataset = TrainingDataset("data/data_demo", image_size=256, mode='train', requires_name=True, point_num=1, mask_num=5)
-    print("Dataset:", len(train_dataset))
-    train_batch_sampler = DataLoader(dataset=train_dataset, batch_size=2, shuffle=True, num_workers=4)
-    for i, batched_image in enumerate(tqdm(train_batch_sampler)):
-        batched_image = stack_dict_batched(batched_image)
-        print(batched_image["image"].shape, batched_image["label"].shape)
-

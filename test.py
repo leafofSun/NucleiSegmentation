@@ -96,10 +96,9 @@ def to_device(batch_input, device):
 
 def postprocess_masks(low_res_masks, image_size, original_size):
     """
-    后处理：将SAM输出的低分辨率mask恢复到原始图像尺寸
-    关键逻辑：先上采样到 padded size (1024)，然后 crop 掉 padding
+    后处理：Padding -> 1024 -> Crop Padding -> Resize Back to Original
     """
-    # 处理original_size可能是tensor或tuple的情况
+    # ... (获取 ori_h, ori_w 代码不变) ...
     if isinstance(original_size, (list, tuple)) and len(original_size) == 2:
         if isinstance(original_size[0], torch.Tensor):
             ori_h = original_size[0].item() if original_size[0].numel() == 1 else int(original_size[0])
@@ -107,10 +106,9 @@ def postprocess_masks(low_res_masks, image_size, original_size):
         else:
             ori_h, ori_w = original_size
     else:
-        # Fallback
         ori_h, ori_w = image_size, image_size
-    
-    # 1. 上采样到模型输入尺寸 (e.g., 1024x1024)
+
+    # 1. 上采样到 1024 (模型输出)
     masks = F.interpolate(
         low_res_masks,
         (image_size, image_size),
@@ -118,23 +116,24 @@ def postprocess_masks(low_res_masks, image_size, original_size):
         align_corners=False,
     )
     
-    # 2. 执行 Un-padding (裁剪)
-    # 逻辑必须与 DataLoader 中的 padding 逻辑完全一致
-    if ori_h < image_size and ori_w < image_size:
-        # DataLoader logic: pad_h = max(target - h, 0), pad_top = pad_h // 2
-        top = (image_size - ori_h) // 2
-        left = (image_size - ori_w) // 2
-        
-        # 裁剪出中间有效区域
-        masks = masks[..., top : ori_h + top, left : ori_w + left]
-        pad = (top, left)
-    else:
-        # 如果原图比 1024 还大 (罕见)，或者刚好一样，则 resize
-        masks = F.interpolate(masks, (ori_h, ori_w), mode="bilinear", align_corners=False)
-        pad = None 
-        
+    # 2. 计算缩放后的尺寸 (与 DataLoader 逻辑对应)
+    scale = image_size * 1.0 / max(ori_h, ori_w)
+    new_h, new_w = int(ori_h * scale), int(ori_w * scale)
+    
+    # 3. 计算 Padding (与 DataLoader 逻辑对应)
+    pad_h = max(image_size - new_h, 0)
+    pad_w = max(image_size - new_w, 0)
+    pad_top = pad_h // 2
+    pad_left = pad_w // 2
+    
+    # 4. 裁剪 Padding (Crop)
+    masks = masks[..., pad_top : pad_top + new_h, pad_left : pad_left + new_w]
+    
+    # 5. 反向缩放回原始尺寸 (Resize Back)
+    masks = F.interpolate(masks, (ori_h, ori_w), mode="bilinear", align_corners=False)
+    
+    pad = (pad_top, pad_left)
     return masks, pad
-
 
 def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_embeddings=None):
     """
