@@ -447,7 +447,10 @@ class TrainingDataset(Dataset):
             attr_data = None
             file_stem = image_name.split('.')[0]
             potential_keys = [file_stem, image_name, self.image_paths[index]]
-            
+            for key in potential_keys:
+                if key in self.attribute_info:
+                    attr_data = self.attribute_info[key]
+                    break
             
             if attr_data is not None:
                 # 支持PNuRL格式: {"attribute_prompts": [...], "attribute_labels": [[...], [...], ...]}
