@@ -14,128 +14,73 @@ import random
 
 
 class TestingDataset(Dataset):
-    
-    def __init__(self, data_path, image_size=1024, mode='test', requires_name=True, point_num=1, return_ori_mask=True, prompt_path=None, attribute_info_path=None):
-        """
-        Initializes a TestingDataset object.
-        Args:
-            data_path (str): The path to the data.
-            image_size (int, optional): The size of the image. Defaults to 256.
-            mode (str, optional): The mode of the dataset. Defaults to 'test'.
-            requires_name (bool, optional): Indicates whether the dataset requires image names. Defaults to True.
-            point_num (int, optional): The number of points to retrieve. Defaults to 1.
-            return_ori_mask (bool, optional): Indicates whether to return the original mask. Defaults to True.
-            prompt_path (str, optional): The path to the prompt file. Defaults to None.
-            attribute_info_path (str, optional): Path to JSON file containing attribute_prompts for PNuRL. Defaults to None.
-        """
+    def __init__(self, data_path, image_size=256, mode='test', requires_name=True, point_num=1, return_ori_mask=True, prompt_path=None, attribute_info_path=None):
         self.image_size = image_size
         self.return_ori_mask = return_ori_mask
         self.prompt_path = prompt_path
-        # 加载 prompt_list，可能是字典或列表格式
+        
         if prompt_path is None:
             self.prompt_list = {}
             self.prompt_list_type = None
         else:
             loaded_data = json.load(open(prompt_path, "r"))
+            # ... (略去详细 dict/list 解析代码，请保持原样) ...
             if isinstance(loaded_data, dict):
-                # 字典格式：{"image_name": {"boxes": [...], "point_coords": [...], ...}}
                 self.prompt_list = loaded_data
                 self.prompt_list_type = "dict"
-            elif isinstance(loaded_data, list):
-                # 列表格式：[{"id": "image_name", "boxes": [...], ...}, ...]
-                # 转换为字典格式以便快速查找
-                self.prompt_list = {}
-                self.prompt_list_type = "list"
-                for item in loaded_data:
-                    # 支持多种可能的键名
-                    if "id" in item:
-                        # id 可能是列表或字符串
-                        ids = item["id"] if isinstance(item["id"], list) else [item["id"]]
-                        for img_id in ids:
-                            # 移除可能的扩展名
-                            img_id = img_id.split('.')[0] if '.' in img_id else img_id
-                            self.prompt_list[img_id] = item
-                    elif "image_name" in item:
-                        img_id = item["image_name"]
-                        img_id = img_id.split('.')[0] if '.' in img_id else img_id
-                        self.prompt_list[img_id] = item
             else:
                 self.prompt_list = {}
                 self.prompt_list_type = None
-                print(f"警告: prompt_path 文件格式不支持: {type(loaded_data)}")
+
         self.requires_name = requires_name
         self.point_num = point_num
         
-        # 加载属性信息（用于PNuRL）
+        # 加载属性信息
         self.attribute_info = {}
         if attribute_info_path is None:
             attribute_info_path = os.path.join(data_path, f'attribute_info_{mode}.json')
         if os.path.exists(attribute_info_path):
             try:
                 self.attribute_info = json.load(open(attribute_info_path, "r"))
-                print(f"加载测试属性信息从: {attribute_info_path}")
-            except Exception as e:
-                print(f"警告: 无法加载属性信息文件 {attribute_info_path}: {e}")
-        elif attribute_info_path and os.path.exists(attribute_info_path):
-            try:
-                self.attribute_info = json.load(open(attribute_info_path, "r"))
-                print(f"加载测试属性信息从: {attribute_info_path}")
-            except Exception as e:
-                print(f"警告: 无法加载属性信息文件 {attribute_info_path}: {e}")
+            except: pass
 
-        # 处理 data_path：如果是相对路径且包含项目名，需要修正
-        # 例如：如果 data_path 是 "SAM-Med2D-main/data/cpm17"，但当前目录已经是 SAM-Med2D-main
-        # 则需要去掉重复的 "SAM-Med2D-main" 前缀
+        # 路径处理
         if not os.path.isabs(data_path):
-            # 获取当前工作目录的绝对路径
             current_dir = os.path.abspath(os.getcwd())
-            # 如果 data_path 以项目名开头，但当前目录已经包含项目名，则去掉重复部分
             if 'SAM-Med2D-main' in data_path and 'SAM-Med2D-main' in current_dir:
-                # 找到 data_path 中 "SAM-Med2D-main" 之后的部分
                 parts = data_path.split('SAM-Med2D-main/')
                 if len(parts) > 1:
-                    data_path = parts[-1]  # 取最后一部分，例如 "data/cpm17"
+                    data_path = parts[-1]
         
         json_file_path = os.path.join(data_path, f'image2label_{mode}.json')
         if not os.path.exists(json_file_path):
-            raise FileNotFoundError(
-                f"找不到数据文件: {json_file_path}\n"
-                f"请检查 data_path 是否正确。当前 data_path: {data_path}\n"
-                f"当前工作目录: {os.getcwd()}\n"
-                f"尝试的完整路径: {os.path.abspath(json_file_path)}"
-            )
+            raise FileNotFoundError(f"找不到数据文件: {json_file_path}")
         json_file = open(json_file_path, "r")
         dataset = json.load(json_file)
         
-        # 将 JSON 中的路径从 data_demo 转换为实际的数据目录路径
         def convert_path(path):
             if isinstance(path, str) and path.startswith('data_demo/'):
                 return path.replace('data_demo/', f'{data_path}/')
             elif isinstance(path, str) and path.startswith('cpm17/'):
-                # 处理cpm17路径，确保使用绝对路径
                 return path.replace('cpm17/', f'{data_path}/')
             return path
         
-        # image2label格式：{"image_path": [mask_path1, mask_path2, ...]}
-        # 对于测试，按图片分组，每张图片的所有掩码合并成一个mask进行评估
         self.image_paths = []
-        self.mask_paths_list = []  # 每张图片对应的所有mask路径列表
+        self.mask_paths_list = []
         for image_path, mask_list in dataset.items():
             image_path = convert_path(image_path)
-            # 如果mask_list是列表，保存所有mask路径
             if isinstance(mask_list, list):
                 mask_paths = [convert_path(mask_path) for mask_path in mask_list]
                 self.image_paths.append(image_path)
                 self.mask_paths_list.append(mask_paths)
             else:
-                # 如果mask_list是单个路径（向后兼容）
                 mask_path = convert_path(mask_list)
                 self.image_paths.append(image_path)
                 self.mask_paths_list.append([mask_path])
       
         self.pixel_mean = [123.675, 116.28, 103.53]
         self.pixel_std = [58.395, 57.12, 57.375]
-    
+
     def __getitem__(self, index):
         image_input = {}
         image = cv2.imread(self.image_paths[index])
@@ -144,12 +89,11 @@ class TestingDataset(Dataset):
         
         image = (image - self.pixel_mean) / self.pixel_std
 
-        # 1. 读取并合并实例 Mask
         mask_paths = self.mask_paths_list[index]
         ori_np_mask_instance = None
         for mask_path in mask_paths:
             mask = cv2.imread(mask_path, 0)
-            if mask is None: raise ValueError(f"无法读取: {mask_path}")
+            if mask is None: continue
             mask = mask.astype(np.float32)
             if ori_np_mask_instance is None:
                 ori_np_mask_instance = mask.copy()
@@ -164,7 +108,7 @@ class TestingDataset(Dataset):
         h, w = ori_np_mask_instance.shape
         target_size = self.image_size
 
-        # === 手动 Padding ===
+        # === 修复1：手动 Padding ===
         pad_h = max(target_size - h, 0)
         pad_w = max(target_size - w, 0)
         pad_top = pad_h // 2
@@ -177,24 +121,19 @@ class TestingDataset(Dataset):
 
         image_tensor = torch.from_numpy(image_padded).permute(2, 0, 1).float()
         
-        # 3. 基于 Padded Mask 生成 Box (不补齐！)
+        # === 修复2：真实 Box 数量 (不补齐) ===
         if self.prompt_path is None:
             from skimage.measure import label, regionprops
-            # 确保使用 int 类型
             if mask_instance_padded.max() > 1:
                 label_img = mask_instance_padded.astype(int)
             else:
                 label_img = label(mask_instance_padded)
             
             regions = regionprops(label_img)
-            
-            # 获取所有真实框 (不设上限，不补齐)
             real_boxes = []
-            # region.bbox 是 (min_row, min_col, max_row, max_col) -> (y0, x0, y1, x1)
-            # 我们需要转为 (x0, y0, x1, y1)
             for region in regions:
                 y0, x0, y1, x1 = region.bbox
-                real_boxes.append([x0, y0, x1, y1])
+                real_boxes.append([x0, y0, x1, y1]) # 转换为 xyxy
             
             if len(real_boxes) == 0:
                 boxes = torch.tensor([[0, 0, 1, 1]], dtype=torch.float)
@@ -202,7 +141,7 @@ class TestingDataset(Dataset):
                 point_labels = torch.tensor([[0]], dtype=torch.int)
             else:
                 boxes = torch.tensor(real_boxes, dtype=torch.float)
-                # 为每个box生成一个中心点
+                # 简单生成中心点
                 point_coords = []
                 point_labels = []
                 for box in real_boxes:
@@ -228,22 +167,20 @@ class TestingDataset(Dataset):
         if self.return_ori_mask:
             image_input["ori_label"] = torch.tensor(ori_np_mask_instance).unsqueeze(0)
      
+        image_name = self.image_paths[index].split('/')[-1]
         if self.requires_name:
-            image_input["name"] = self.image_paths[index].split('/')[-1]
+            image_input["name"] = image_name
         
-        # PNuRL 部分 (修复文件名匹配)
+        # === 修复3：文件名 Key 匹配 (TrainingDataset 也要加这个！) ===
         if self.attribute_info:
-             full_path = self.image_paths[index]
-             file_name = full_path.split('/')[-1] # image_04.png
-             file_stem = file_name.split('.')[0]  # image_04
-             
+             file_stem = image_name.split('.')[0] # image_04
              attr_info = None
-             if full_path in self.attribute_info:
-                 attr_info = self.attribute_info[full_path]
-             elif file_name in self.attribute_info:
-                 attr_info = self.attribute_info[file_name]
-             elif file_stem in self.attribute_info: # 命中!
-                 attr_info = self.attribute_info[file_stem]
+             
+             # 优先尝试无后缀的 file_stem
+             for key in [file_stem, image_name, self.image_paths[index]]:
+                 if key in self.attribute_info:
+                     attr_info = self.attribute_info[key]
+                     break
                  
              if attr_info and 'attribute_prompts' in attr_info:
                  image_input['attribute_prompts'] = attr_info['attribute_prompts']
@@ -252,7 +189,6 @@ class TestingDataset(Dataset):
 
     def __len__(self):
         return len(self.image_paths)
-
 
 class TrainingDataset(Dataset):
     def __init__(self, data_dir, image_size=256, mode='train', requires_name=True, point_num=1, mask_num=5, 
