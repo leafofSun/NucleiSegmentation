@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument("--metrics", nargs='+', default=['mDice', 'mAJI', 'mPQ', 'mDQ', 'mSQ'], help="metrics")
     parser.add_argument("--model_type", type=str, default="vit_b", help="sam model_type")
     parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d/sam-med2d_b.pth", help="sam checkpoint")
-    parser.add_argument("--boxes_prompt", type=bool, default=True, help="use boxes prompt")
+    parser.add_argument("--boxes_prompt", type=bool, default=False, help="use boxes prompt")
     parser.add_argument("--point_num", type=int, default=1, help="point num")
     parser.add_argument("--iter_point", type=int, default=1, help="iter num") 
     parser.add_argument("--multimask", type=bool, default=True, help="ouput multimask")

@@ -249,30 +249,47 @@ class TrainingDataset(Dataset):
         if image is None:
             raise ValueError(f"Cannot read image: {self.image_paths[index]}")
         
-        # === [Fix 1] BGR -> RGB ===
+        # 1. BGR -> RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
         image = (image - self.pixel_mean) / self.pixel_std
-        h, w, _ = image.shape
         
-        # === [Fix 2] Training Transforms (Use RandomCrop logic) ===
-        transforms = get_transforms(self.image_size, h, w, mode='train')
-    
+        # === [核心修改] 先 Resize 到 1024 (与测试一致) ===
+        h, w = image.shape[:2]
+        target_size = self.image_size # 训练时传入 1024
+        
+        # 计算缩放比例 (Resize Longest Side)
+        scale = target_size * 1.0 / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        
+        # 放大图像
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # 2. 准备 Masks
         masks_list = []
         boxes_list = []
         point_coords_list, point_labels_list = [], []
         
         mask_path = random.choices(self.label_paths[index], k=self.mask_num)
         
+        # 更新后的尺寸用于 transforms
+        # 注意：这里我们不需要 Padding，因为后面会 RandomCrop
+        # 但 RandomCrop 的输入尺寸必须大于 crop_size
+        transforms = get_transforms(self.image_size, new_h, new_w, mode='train') 
+        
         for m in mask_path:
             pre_mask = cv2.imread(m, 0)
             if pre_mask is None: continue
             pre_mask = pre_mask.astype(np.float32)
+            
+            # === [核心修改] Mask 也要跟着 Resize ===
+            pre_mask = cv2.resize(pre_mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
+            # 3. 随机裁剪 (现在是在放大的图上裁，细胞核变大了！)
             for retry_count in range(10):
                 augments = transforms(image=image, mask=pre_mask)
                 image_tensor = augments['image']
                 mask_instance_crop = augments['mask']
+                # ... (后续获取 mask_instance_crop_np 代码不变) ...
                 if isinstance(mask_instance_crop, torch.Tensor):
                     mask_instance_crop_np = mask_instance_crop.cpu().numpy()
                 else:
@@ -280,6 +297,7 @@ class TrainingDataset(Dataset):
                 if mask_instance_crop_np.max() > 0:
                     break
             
+            # ... (后续生成 Box/Point 的逻辑完全不变) ...
             from skimage.measure import label, regionprops
             if mask_instance_crop_np.max() > 1:
                 label_img = mask_instance_crop_np.astype(int)
@@ -313,6 +331,7 @@ class TrainingDataset(Dataset):
             point_coords_list.append(point_coords)
             point_labels_list.append(point_label)
 
+        # ... (后续 stack 和 PNuRL Key 匹配代码不变) ...
         mask = torch.stack(masks_list, dim=0)
         boxes = torch.stack(boxes_list, dim=0)
         point_coords = torch.stack(point_coords_list, dim=0)
@@ -326,16 +345,14 @@ class TrainingDataset(Dataset):
 
         image_name = self.image_paths[index].split('/')[-1]
         
-        # === [Fix 4] PNuRL Key Matching (Remove Suffix) ===
         if self.attribute_info:
             attr_data = None
             file_stem = image_name.split('.')[0]
-            
             for key in [file_stem, image_name, self.image_paths[index]]:
                 if key in self.attribute_info:
                     attr_data = self.attribute_info[key]
                     break
-            
+            # ... (赋值 attribute_prompts 代码不变) ...
             if attr_data is not None:
                 if isinstance(attr_data, dict):
                     if "attribute_prompts" in attr_data:

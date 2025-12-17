@@ -362,7 +362,7 @@ def main(args):
         print(f"*******恢复训练从: {args.resume}")
         with open(args.resume, "rb") as f:
             checkpoint = torch.load(f, map_location=args.device, weights_only=False)
-            model.load_state_dict(checkpoint['model'])
+            model.load_state_dict(checkpoint['model'],strict=False)
             optimizer.load_state_dict(checkpoint['optimizer'])
             
             # 从保存的epoch继续训练
