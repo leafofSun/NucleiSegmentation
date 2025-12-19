@@ -1,207 +1,147 @@
-#!/usr/bin/env python3
-"""
-Convert MoNuSeg dataset (Tissue Images + Annotations) to SA-1B style dataset.
-
-Output layout (default):
-  output_dir/
-    images/
-    masks/
-    image2label_train.json   # image -> [mask,...]
-    label2image_test.json    # mask -> image
-
-Usage:
-  python scripts/convert_monuseg_to_sa1b.py --input-root data/MoNuSeg --output-dir data/monuseg_sa1b
-
-This script:
- - Reads .tif images from MoNuSegTrainingData/Tissue Images and corresponding .xml in Annotations
- - Rasterizes each Region (polygon) from XML into a binary PNG mask
- - Saves images as PNG and masks as 8-bit binary PNGs
- - Produces JSON mappings compatible with the repo examples
-"""
-import argparse
 import os
+import cv2
 import json
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from PIL import Image, ImageDraw
+import glob
 import numpy as np
+import xml.etree.ElementTree as ET
+from tqdm import tqdm
 
+# ================= 配置区域 =================
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Convert MoNuSeg to SA-1B style dataset")
-    p.add_argument("--input-root", type=str, default="data/MoNuSeg",
-                   help="Path to the MoNuSeg folder (contains MoNuSegTrainingData and MoNuSegTestData)")
-    p.add_argument("--output-dir", type=str, default="data/monuseg_sa1b",
-                   help="Directory to write SA-1B style dataset")
-    p.add_argument("--processing-limit", type=int, default=0,
-                   help="If >0, limit number of images processed (for quick tests)")
-    p.add_argument("--force", action='store_true',
-                   help="If set, force re-generation of images and masks (overwrite existing files)")
-    return p.parse_args()
+# 1. 你的原始数据路径 (根据你的描述设置)
+# 自动定位到项目根目录，再拼出 data/MoNuSeg 的绝对路径，避免重复前缀
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+RAW_ROOT = os.path.join(PROJECT_ROOT, "data", "MoNuSeg")
+TRAIN_IMG_DIR = os.path.join(RAW_ROOT, "Train", "images")       # 训练集图片
+TRAIN_XML_DIR = os.path.join(RAW_ROOT, "Train", "Annotations") # 训练集标注
+TEST_DIR = os.path.join(RAW_ROOT, "Test")                      # 测试集 (混在一起)
 
+# 2. 输出路径 (处理好的数据将保存在这里，建议用新名字以免混淆)
+OUTPUT_ROOT = "data/MoNuSeg_Processed"
 
-def xml_regions_to_polygons(xml_path):
-    """Parse Regions from an Aperio-style XML and return list of polygons (list of (x,y) tuples)."""
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    polys = []
-    # Regions are under //Region and Vertices/Vertex with X and Y
-    for region in root.findall('.//Region'):
-        verts = []
-        verts_el = region.find('Vertices')
-        if verts_el is None:
-            continue
-        for v in verts_el.findall('Vertex'):
-            x = v.get('X')
-            y = v.get('Y')
-            try:
-                xi = float(x)
-                yi = float(y)
-            except Exception:
-                continue
-            verts.append((xi, yi))
-        if len(verts) >= 3:
-            polys.append(verts)
-    return polys
+# 3. 通用属性描述 (PNuRL 需要)
+COMMON_ATTRS = {
+    "prompt": "Microscopy image of H&E stained tissue. The image contains deep purple, rounded or ellipsoidal cell nuclei that are densely distributed against a pink background.",
+    "color": "deep purple",
+    "shape": "rounded",
+    "density": "dense"
+}
 
+# ===========================================
 
-def rasterize_polygon(poly, size):
-    """Rasterize a polygon (float coords) to a binary mask of given (width,height)."""
-    W, H = size
-    # PIL expects sequence of tuples in pixel coordinates; round to int
-    pts = [(int(round(x)), int(round(y))) for (x, y) in poly]
-    mask = Image.new('L', (W, H), 0)
-    ImageDraw.Draw(mask).polygon(pts, outline=1, fill=1)
-    arr = np.array(mask, dtype=np.uint8) * 255
-    return Image.fromarray(arr)
+def parse_xml_to_mask(xml_path, shape):
+    """解析 MoNuSeg XML 生成实例掩码"""
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        print(f"Error parsing XML {xml_path}: {e}")
+        return np.zeros(shape[:2], dtype=np.int32)
 
+    # 创建空 Mask
+    mask = np.zeros(shape[:2], dtype=np.int32)
+    
+    # 遍历每个 Region (每个细胞核)
+    # MoNuSeg XML 结构: Annotations -> Annotation -> Regions -> Region -> Vertices
+    count = 0
+    for i, region in enumerate(root.findall(".//Region"), start=1):
+        vertices = []
+        for vertex in region.findall(".//Vertex"):
+            x = float(vertex.get("X"))
+            y = float(vertex.get("Y"))
+            vertices.append([x, y])
+        
+        if len(vertices) > 2: # 至少3个点才能围成多边形
+            pts = np.array(vertices, np.int32)
+            # 填充多边形，使用 i 作为实例 ID (Instance ID)
+            cv2.fillPoly(mask, [pts], i)
+            count += 1
+            
+    return mask
 
-def convert_folder(training_images_dir, annotations_dir, out_images_dir, out_masks_dir, image2label, limit=0, force=False):
-    training_images_dir = Path(training_images_dir)
-    annotations_dir = Path(annotations_dir)
-    out_images_dir = Path(out_images_dir)
-    out_masks_dir = Path(out_masks_dir)
-    out_images_dir.mkdir(parents=True, exist_ok=True)
-    out_masks_dir.mkdir(parents=True, exist_ok=True)
+def process_subset(image_source_dir, xml_source_dir, mode):
+    """
+    image_source_dir: 图片所在的文件夹
+    xml_source_dir:   XML所在的文件夹 (如果是Test，这两个是同一个路径)
+    mode:             'train' 或 'test'
+    """
+    print(f"\nProcessing {mode} set...")
+    print(f"  - Images from: {image_source_dir}")
+    print(f"  - XMLs from:   {xml_source_dir}")
 
-    imgs = sorted([p for p in training_images_dir.iterdir() if p.suffix.lower() in ['.tif', '.tiff', '.png', '.jpg', '.jpeg']])
-    if limit and limit > 0:
-        imgs = imgs[:limit]
-    for img_p in imgs:
-        base = img_p.stem
-        xml_p = annotations_dir / (base + '.xml')
-        if not xml_p.exists():
-            # try other common suffixes
-            xml_alt = annotations_dir / (base + '.xml')
-            if not xml_alt.exists():
-                print(f"Warning: annotation for {img_p.name} not found, skip")
-                continue
-            xml_p = xml_alt
+    # 创建输出目录
+    out_img_dir = os.path.join(OUTPUT_ROOT, mode, 'Images')
+    out_lbl_dir = os.path.join(OUTPUT_ROOT, mode, 'Labels')
+    os.makedirs(out_img_dir, exist_ok=True)
+    os.makedirs(out_lbl_dir, exist_ok=True)
 
-        # load image to know size and save as PNG (unless present and not forcing)
-        out_img_rel = os.path.join('images', base + '.png').replace('\\', '/')
-        out_img_path = out_images_dir / (base + '.png')
-        with Image.open(img_p) as im:
-            im = im.convert('RGB')
-            W, H = im.size
-            if not out_img_path.exists() or force:
-                im.save(out_img_path)
-
-        polys = xml_regions_to_polygons(xml_p)
-        mask_paths = []
-        for i, poly in enumerate(polys):
-            mask_name = f"{base}_mask_{i:04d}.png"
-            out_mask_path = out_masks_dir / mask_name
-            # create mask if missing or forcing
-            if not out_mask_path.exists() or force:
-                mask_img = rasterize_polygon(poly, (W, H))
-                mask_img.save(out_mask_path)
-            mask_paths.append(os.path.join('masks', mask_name).replace('\\', '/'))
-
-        image2label[out_img_rel] = mask_paths
-
-
-def main():
-    args = parse_args()
-    input_root = Path(args.input_root)
-    out_root = Path(args.output_dir)
-    out_images_dir = out_root / 'images'
-    out_masks_dir = out_root / 'masks'
+    # 寻找所有图片 (.tif)
+    img_files = glob.glob(os.path.join(image_source_dir, "*.tif"))
+    
+    if len(img_files) == 0:
+        print("  ! No .tif images found! Check path.")
+        return
 
     image2label = {}
-    label2image = {}
+    attribute_info = {}
 
-    # Process training data
-    train_images_dir = input_root / 'MoNuSegTrainingData' / 'Tissue Images'
-    train_ann_dir = input_root / 'MoNuSegTrainingData' / 'Annotations'
-    if train_images_dir.exists() and train_ann_dir.exists():
-        print('Converting training images...')
-        convert_folder(train_images_dir, train_ann_dir, out_images_dir, out_masks_dir, image2label, limit=args.processing_limit, force=args.force)
+    for img_path in tqdm(img_files):
+        filename = os.path.basename(img_path)
+        name_no_ext = os.path.splitext(filename)[0]
+        
+        # 1. 寻找对应的 XML
+        # 逻辑：在 xml_source_dir 下找 同名.xml
+        xml_path = os.path.join(xml_source_dir, name_no_ext + ".xml")
+        
+        if not os.path.exists(xml_path):
+            print(f"  ! Warning: XML not found for {filename}, skipping.")
+            continue
+
+        # 2. 读取图片 (TIF -> RGB)
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"  ! Error reading image {img_path}")
+            continue
+
+        # 3. 生成 Mask
+        mask = parse_xml_to_mask(xml_path, img.shape)
+
+        # 4. 保存为标准格式 (.png)
+        save_name = name_no_ext + ".png"
+        
+        # 保存图片
+        cv2.imwrite(os.path.join(out_img_dir, save_name), img)
+        
+        # 保存 Mask (必须是 uint16 以支持>255个细胞)
+        cv2.imwrite(os.path.join(out_lbl_dir, save_name), mask.astype(np.uint16))
+
+        # 5. 记录元数据
+        image2label[save_name] = save_name
+        attribute_info[save_name] = COMMON_ATTRS.copy()
+
+    # 保存 JSON
+    with open(os.path.join(OUTPUT_ROOT, f"image2label_{mode}.json"), 'w') as f:
+        json.dump(image2label, f, indent=4)
+    
+    with open(os.path.join(OUTPUT_ROOT, f"attribute_info_{mode}.json"), 'w') as f:
+        json.dump(attribute_info, f, indent=4)
+        
+    print(f"  ✅ {mode} set done. Saved to {OUTPUT_ROOT}/{mode}")
+
+if __name__ == "__main__":
+    # 1. 处理 Train 集
+    # 你的结构: data/MoNuSeg/Train/images 和 data/MoNuSeg/Train/Annotations
+    if os.path.exists(TRAIN_IMG_DIR) and os.path.exists(TRAIN_XML_DIR):
+        process_subset(TRAIN_IMG_DIR, TRAIN_XML_DIR, 'train')
     else:
-        print('Training data not found in expected location:', train_images_dir)
+        print(f"❌ Train paths not found:\n {TRAIN_IMG_DIR}\n {TRAIN_XML_DIR}")
 
-    # Process test data (if present) - will append mappings too
-    test_images_dir = input_root / 'MoNuSegTestData' / 'Tissue Images'
-    test_ann_dir = input_root / 'MoNuSegTestData' / 'Annotations'
-    if test_images_dir.exists() and test_ann_dir.exists():
-        print('Converting test images...')
-        convert_folder(test_images_dir, test_ann_dir, out_images_dir, out_masks_dir, image2label, limit=args.processing_limit, force=args.force)
-
-    # Build reverse mapping mask -> image
-    for img, masks in image2label.items():
-        for m in masks:
-            label2image[m] = img
-
-    out_root.mkdir(parents=True, exist_ok=True)
-    train_json_path = out_root / 'image2label_train.json'
-    test_json_path = out_root / 'label2image_test.json'
-
-    # If JSONs exist, merge instead of overwriting: union masks per image
-    if train_json_path.exists():
-        try:
-            with open(train_json_path, 'r', encoding='utf-8') as f:
-                existing = json.load(f)
-        except Exception:
-            existing = {}
+    # 2. 处理 Test 集
+    # 你的结构: data/MoNuSeg/Test (里面既有tif也有xml)
+    if os.path.exists(TEST_DIR):
+        # 此时图片和xml在同一个文件夹，所以传两次同一个路径
+        process_subset(TEST_DIR, TEST_DIR, 'test')
     else:
-        existing = {}
-
-    # merge existing and new image2label: union lists
-    merged_image2label = dict(existing)
-    for img, masks in image2label.items():
-        if img in merged_image2label:
-            # union preserve order: existing first, then new unique
-            exist_masks = merged_image2label[img]
-            combined = list(exist_masks)
-            for m in masks:
-                if m not in combined:
-                    combined.append(m)
-            merged_image2label[img] = combined
-        else:
-            merged_image2label[img] = masks
-
-    # build label2image from merged mapping (and keep any existing label2image mapping for masks not in merged)
-    if test_json_path.exists():
-        try:
-            with open(test_json_path, 'r', encoding='utf-8') as f:
-                existing_label2image = json.load(f)
-        except Exception:
-            existing_label2image = {}
-    else:
-        existing_label2image = {}
-
-    merged_label2image = dict(existing_label2image)
-    for img, masks in merged_image2label.items():
-        for m in masks:
-            merged_label2image[m] = img
-
-    with open(train_json_path, 'w', encoding='utf-8') as f:
-        json.dump(merged_image2label, f, indent=4, ensure_ascii=False)
-    with open(test_json_path, 'w', encoding='utf-8') as f:
-        json.dump(merged_label2image, f, indent=4, ensure_ascii=False)
-
-    print('Done. Wrote:', train_json_path, test_json_path)
-
-
-if __name__ == '__main__':
-    main()
+        print(f"❌ Test path not found: {TEST_DIR}")
+        
+    print("\nProcessing Complete! New dataset is at:", OUTPUT_ROOT)

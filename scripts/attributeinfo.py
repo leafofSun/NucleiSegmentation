@@ -6,7 +6,7 @@ from skimage.measure import label, regionprops
 from tqdm import tqdm
 
 # === 配置路径 ===
-DATA_ROOT = "data/cpm17"
+DATA_ROOT = "data/MoNuSeg"
 TEST_JSON_PATH = os.path.join(DATA_ROOT, "image2label_test.json")
 OUTPUT_JSON_PATH = os.path.join(DATA_ROOT, "attribute_info_test.json")
 
@@ -108,8 +108,8 @@ def main():
             mask_path = mask_list
             
         # 修正路径 (适配 data/cpm17)
-        if mask_path.startswith('cpm17/'):
-            full_mask_path = os.path.join(DATA_ROOT, mask_path.replace('cpm17/', ''))
+        if mask_path.startswith('MoNuSeg/'):
+            full_mask_path = os.path.join(DATA_ROOT, mask_path.replace('MoNuSeg/', ''))
         else:
             full_mask_path = mask_path
             

@@ -94,46 +94,58 @@ def to_device(batch_input, device):
     return device_input
 
 
-def postprocess_masks(low_res_masks, image_size, original_size):
-    """
-    后处理：Padding -> 1024 -> Crop Padding -> Resize Back to Original
-    """
-    # ... (获取 ori_h, ori_w 代码不变) ...
-    if isinstance(original_size, (list, tuple)) and len(original_size) == 2:
-        if isinstance(original_size[0], torch.Tensor):
-            ori_h = original_size[0].item() if original_size[0].numel() == 1 else int(original_size[0])
-            ori_w = original_size[1].item() if original_size[1].numel() == 1 else int(original_size[1])
-        else:
-            ori_h, ori_w = original_size
-    else:
-        ori_h, ori_w = image_size, image_size
 
-    # 1. 上采样到 1024 (模型输出)
-    masks = F.interpolate(
-        low_res_masks,
-        (image_size, image_size),
-        mode="bilinear",
-        align_corners=False,
-    )
+
+
+def postprocess_masks(masks, input_size, original_size):
+    # --- [Fix 1] Handle int input_size ---
+    if isinstance(input_size, int):
+        input_size = (input_size, input_size)
+
+    # --- [Fix 2] Chunked Processing for Memory Efficiency ---
+    output_masks = []
+    chunk_size = 20  # Process 20 masks at a time
     
-    # 2. 计算缩放后的尺寸 (与 DataLoader 逻辑对应)
-    scale = image_size * 1.0 / max(ori_h, ori_w)
+    ori_h, ori_w = original_size
+    target_h, target_w = input_size
+    
+    # Calculate padding used in DataLoader (Center Padding)
+    long_side = max(ori_h, ori_w)
+    scale = target_h / long_side
     new_h, new_w = int(ori_h * scale), int(ori_w * scale)
     
-    # 3. 计算 Padding (与 DataLoader 逻辑对应)
-    pad_h = max(image_size - new_h, 0)
-    pad_w = max(image_size - new_w, 0)
+    pad_h = target_h - new_h
+    pad_w = target_w - new_w
     pad_top = pad_h // 2
     pad_left = pad_w // 2
-    
-    # 4. 裁剪 Padding (Crop)
-    masks = masks[..., pad_top : pad_top + new_h, pad_left : pad_left + new_w]
-    
-    # 5. 反向缩放回原始尺寸 (Resize Back)
-    masks = F.interpolate(masks, (ori_h, ori_w), mode="bilinear", align_corners=False)
-    
-    pad = (pad_top, pad_left)
-    return masks, pad
+
+    # Loop over the masks
+    for i in range(0, masks.shape[1], chunk_size):
+        chunk = masks[:, i:i+chunk_size, :, :]
+        
+        # 1. Upscale to Model Input Size (e.g., 1024x1024)
+        chunk = F.interpolate(
+            chunk,
+            (target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        
+        # 2. Unpad (Center Crop) to match the valid image area
+        chunk = chunk[..., pad_top : pad_top + new_h, pad_left : pad_left + new_w]
+        
+        # 3. Resize to Original Image Size
+        chunk = F.interpolate(
+            chunk,
+            (ori_h, ori_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        
+        output_masks.append(chunk)
+        
+    masks = torch.cat(output_masks, dim=1)
+    return masks, None # Return None for padding as we handled it internally
 
 def prompt_and_decoder(args, batched_input, ddp_model, image_embeddings, text_embeddings=None):
     """
@@ -294,10 +306,56 @@ def main(args):
             if args.boxes_prompt:
                 save_path = os.path.join(args.work_dir, args.run_name, "boxes_prompt")
                 batched_input["point_coords"], batched_input["point_labels"] = None, None
-                masks, low_res_masks, iou_predictions = prompt_and_decoder(
-                    args, batched_input, model, image_embeddings, 
-                    text_embeddings=text_embeddings_input
-                )
+                
+                # --- MoNuSeg 显存优化：Prompt Batching ---
+                original_boxes = batched_input["boxes"]  
+                
+                # 你的 Log 显示 batch 维度被 squeeze 了，原本是 [1, N, 4]，这里变成了 [N, 4] 或者代码处理过
+                # 为了保险，我们先看 original_boxes 形状，确保能取到 N
+                if len(original_boxes.shape) == 3:
+                    total_boxes = original_boxes.shape[1]
+                    boxes_source = original_boxes[0] # [N, 4]
+                else:
+                    total_boxes = original_boxes.shape[0]
+                    boxes_source = original_boxes
+
+                chunk_size = 32 
+                
+                batch_masks_list = []
+                batch_iou_list = []
+                batch_low_res_list = [] # 新增：收集 low_res
+                
+                for start_idx in range(0, total_boxes, chunk_size):
+                    end_idx = min(start_idx + chunk_size, total_boxes)
+                    
+                    # 切片
+                    chunk_boxes = boxes_source[start_idx:end_idx, :]
+                    # 还原回 [1, Chunk, 4] 以符合 model 输入要求
+                    chunk_boxes = chunk_boxes.unsqueeze(0)
+                    
+                    mini_batch = batched_input.copy()
+                    mini_batch["boxes"] = chunk_boxes
+                    
+                    sub_masks, sub_low_res, sub_iou = prompt_and_decoder(
+                        args, mini_batch, model, image_embeddings, 
+                        text_embeddings=text_embeddings_input
+                    )
+                    
+                    batch_masks_list.append(sub_masks)
+                    batch_iou_list.append(sub_iou)
+                    batch_low_res_list.append(sub_low_res) # 收集
+                
+                # 拼接 (dim=0 根据你刚才的 log 是正确的)
+                masks = torch.cat(batch_masks_list, dim=0)
+                iou_predictions = torch.cat(batch_iou_list, dim=0)
+                low_res_masks = torch.cat(batch_low_res_list, dim=0) # 拼接，不再是 None
+                
+                # 此时 masks 形状应该是 [576, 1, 1024, 1024]
+                # 但 SAM-Med2D 后续代码可能期待 [1, 576, 1, 1024, 1024] 或者 [1, 576, 1024, 1024]
+                # 如果后续报错 dimension mismatch，可能需要 masks = masks.unsqueeze(0)
+                # 鉴于之前的报错是 cat 报错，说明之前是 [N, ...]。
+                # 我们先保持这样。
+                
                 points_show = None
             else:
                 save_path = os.path.join(f"{args.work_dir}", args.run_name, f"iter{args.iter_point if args.iter_point > 1 else args.point_num}_prompt")
@@ -376,7 +434,8 @@ def main(args):
         # 标签检查
         if i == 0:
             print(f"\n[DEBUG] 标签值域: GT Max={ori_labels.max().item()}, Pred Max={masks.max().item()}")
-
+        
+        unique_vals = torch.unique(ori_labels)
         # Loss 用二值
         ori_labels_binary = (ori_labels > 0).float()
         loss = criterion(masks_for_loss, ori_labels_binary, iou_predictions)

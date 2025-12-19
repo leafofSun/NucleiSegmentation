@@ -36,15 +36,18 @@ def parse_args():
     parser.add_argument("--iter_point", type=int, default=8, help="point iterations")
     parser.add_argument('--lr_scheduler', type=str, default="CosineAnnealingLR", help='lr scheduler')
     parser.add_argument("--point_list", type=list, default=[1, 3, 5, 9], help="point_list")
+    parser.add_argument("--save_interval", type=int, default=10, help="save model interval (epochs)")
     parser.add_argument("--multimask", type=bool, default=True, help="ouput multimask")
     parser.add_argument("--encoder_adapter", type=bool, default=True, help="use adapter")
     parser.add_argument("--use_amp", type=bool, default=False, help="use amp")
+    parser.add_argument("--boxes_prompt", type=bool, default=False, help="use boxes prompt")
     # PNuRL相关参数
     parser.add_argument("--use_pnurl", action='store_true', help="启用PNuRL训练（使用属性提示词增强图像特征）")
     parser.add_argument("--pnurl_clip_path", type=str, default="ViT-B/16", help="CLIP模型路径（用于PNuRL文本编码）")
     parser.add_argument("--pnurl_num_classes", type=str, default="3,5,4,3,3", help="PNuRL每个属性的类别数量，格式：颜色,形状,排列,大小,分布（默认：3,5,4,3,3）")
     parser.add_argument("--pnurl_loss_weight", type=float, default=1.0, help="PNuRL属性损失的权重")
     parser.add_argument("--attribute_info_path", type=str, default=None, help="属性信息文件路径（如果不在data_dir中）")
+    
     args = parser.parse_args()
     
     # 解析PNuRL类别数量
@@ -409,7 +412,9 @@ def main(args):
     best_loss = 1e10
     best_epoch = 0
     l = len(train_loader)
-    save_interval = 50  # 每50个epoch保存一次最好的结果
+    
+    # [修改] 不再使用硬编码，改用参数
+    # save_interval = 50 
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -434,8 +439,8 @@ def main(args):
             best_epoch = epoch + 1
             print(f"✓ 新的最佳loss: {best_loss:.4f} (epoch {best_epoch})")
 
-        # 每50个epoch保存一次最好的结果
-        if (epoch + 1) % save_interval == 0:
+        # [修改] 每 args.save_interval 个epoch保存一次最好的结果
+        if (epoch + 1) % args.save_interval == 0:
             save_path = os.path.join(args.work_dir, "models", args.run_name, f"best_epoch{best_epoch}_loss{best_loss:.4f}_sam.pth")
             state = {
                 'model': model.float().state_dict(), 
@@ -480,5 +485,3 @@ def main(args):
 if __name__ == '__main__':
     args = parse_args()
     main(args)
-
-
