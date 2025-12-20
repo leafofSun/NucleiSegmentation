@@ -160,19 +160,12 @@ cython_debug/
 #.idea/
 
 # Project specific - Data files (too large for GitHub)
-data/cpm17/images/
-data/cpm17/masks/
-data/cpm17/train/Images/
-data/cpm17/train/Labels/
-data/cpm17/train/Overlay/
-data/cpm17/test/Images/
-data/cpm17/test/Labels/
-data/cpm17/test/Overlay/
-data/data_demo/images/
-data/data_demo/masks/
+# Ignore entire data directory
+data/
 
 # Model checkpoints and weights
-workdir/models/
+# Ignore entire workdir directory
+workdir/
 *.pth
 *.pt
 *.ckpt
