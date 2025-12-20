@@ -8,15 +8,34 @@ import json
 import random
 
 # ===========================================================================================
-# [Tools] Simplified stack_dict_batched
+# [Tools] Correct stack_dict_batched
 # ===========================================================================================
-def stack_dict_batched(batched_input):
+def stack_dict_batched(batch):
+    """
+    Args:
+        batch: list of dicts. 
+               例如: [{'image': T1, 'label': L1}, {'image': T2, 'label': L2}]
+    Returns:
+        out_dict: dict of tensors (batched).
+               例如: {'image': stack([T1, T2]), 'label': stack([L1, L2])}
+    """
     out_dict = {}
-    for k, v in batched_input.items():
-        if isinstance(v, list):
-            out_dict[k] = v
+    # 遍历第一个样本的所有键
+    for k in batch[0].keys():
+        # 收集该 Batch 中所有样本的该键对应的值
+        values = [sample[k] for sample in batch]
+        
+        # 如果是 Tensor，尝试堆叠
+        if isinstance(values[0], torch.Tensor):
+            try:
+                out_dict[k] = torch.stack(values, dim=0)
+            except RuntimeError:
+                # 万一遇到维度不一致无法堆叠的情况（比如变长 Box），则保留 list
+                out_dict[k] = values
         else:
-            out_dict[k] = v
+            # 如果不是 Tensor（比如文件名是字符串），保留 list
+            out_dict[k] = values
+            
     return out_dict
 
 class TrainingDataset(Dataset):
@@ -110,32 +129,45 @@ class TrainingDataset(Dataset):
         label = cv2.resize(label, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
 
         # Initialize Tensors
-        boxes = torch.tensor([[0, 0, 1, 1]]).float() 
         point_coords = torch.zeros(1, 2).float()
         point_labels = torch.zeros(1).int()
+        
+        # 默认值 (无目标情况)
+        boxes = torch.tensor([[0, 0, 1, 1]]).float() 
 
-        # Generate Box Prompt (Training: Random 1 box)
+        # =================================================================================
+        # [核心修复] Generate Box Prompt & Label
+        # 逻辑：必须先选定一个 ID，然后针对这同一个 ID 生成 Box 和 Mask
+        # =================================================================================
         obj_ids = np.unique(label)
         obj_ids = obj_ids[obj_ids > 0]
         
         if len(obj_ids) > 0:
+            # 1. 只随机选一次 ID！
             target_id = np.random.choice(obj_ids)
+            
+            # 2. 根据这个 ID 生成 Box
             y_indices, x_indices = np.where(label == target_id)
             x_min, x_max = np.min(x_indices), np.max(x_indices)
             y_min, y_max = np.min(y_indices), np.max(y_indices)
             
             H, W = label.shape
+            # 添加随机扰动 (Jitter) 模拟不完美的提示
             x_min = max(0, x_min - np.random.randint(0, 5))
             x_max = min(W, x_max + np.random.randint(0, 5))
             y_min = max(0, y_min - np.random.randint(0, 5))
             y_max = min(H, y_max + np.random.randint(0, 5))
             
             boxes = torch.tensor([[x_min, y_min, x_max, y_max]]).float()
-        if len(obj_ids) > 1:
-            target_id = np.random.choice(obj_ids)
+            
+            # 3. 根据同一个 ID 生成 Label (Single Instance Binary Mask)
+            # 这一点至关重要：告诉模型“只分割框住的这个细胞”
             label = (label == target_id).astype(np.float32)
         else:
+            # 如果没有细胞，Label 全黑
             label = np.zeros_like(label).astype(np.float32)
+            
+        # =================================================================================
         
         image = (image - self.pixel_mean) / self.pixel_std
         image = torch.tensor(image).permute(2, 0, 1) 
@@ -237,7 +269,7 @@ class TestingDataset(Dataset):
         label = cv2.resize(label, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
         
         # =======================================================
-        # [修复] 测试集必须生成【所有】细胞的 Box，供 test.py 遍历
+        # [测试集逻辑] 生成所有细胞的 Box，供评估使用
         # =======================================================
         boxes_list = []
         obj_ids = np.unique(label)
@@ -251,24 +283,21 @@ class TestingDataset(Dataset):
             x_min, x_max = np.min(x_indices), np.max(x_indices)
             y_min, y_max = np.min(y_indices), np.max(y_indices)
             
-            # [x1, y1, x2, y2]
             boxes_list.append([x_min, y_min, x_max, y_max])
             
         if len(boxes_list) == 0:
-            # 容错：如果没有细胞，给一个 Dummy Box
             boxes_tensor = torch.tensor([[0, 0, 1, 1]]).float()
         else:
             boxes_tensor = torch.tensor(boxes_list).float()
 
-        # Dummy Points (Testing 时主要用 Box)
         point_coords = torch.zeros(1, 2).float()
         point_labels = torch.zeros(1).int()
         # =======================================================
 
         image = (image - self.pixel_mean) / self.pixel_std
         image = torch.tensor(image).permute(2, 0, 1)
-        # label 保留 Instance ID (不二值化) 给 test.py 用，或者在外面处理
-        # test.py 通常需要 tensor 格式
+        
+        # 测试集保留原始 Label (Instance ID)，用于计算 mPQ 等指标
         label_tensor = torch.tensor(label).unsqueeze(0).float()
 
         attribute_prompts = []
@@ -283,8 +312,8 @@ class TestingDataset(Dataset):
         sample = {
             "image": image,
             "label": label_tensor,
-            "ori_label": label_tensor, # 关键 Key
-            "boxes": boxes_tensor,     # 关键 Key
+            "ori_label": label_tensor, # 关键 Key，供 test.py 使用
+            "boxes": boxes_tensor,     # 关键 Key，供 test.py 使用
             "point_coords": point_coords,
             "point_labels": point_labels,
             "original_size": original_size,

@@ -413,8 +413,6 @@ def main(args):
     best_epoch = 0
     l = len(train_loader)
     
-    # [修改] 不再使用硬编码，改用参数
-    # save_interval = 50 
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
