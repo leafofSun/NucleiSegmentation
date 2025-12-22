@@ -11,8 +11,8 @@ from tqdm import tqdm
 # 引入模块
 from segment_anything import sam_model_registry
 # 仍然复用 prompt_generator 里的模型结构和 loss
-from prompt_generator import AutoBoxGenerator, build_target, auto_box_loss
-
+# 改为引入 v2 版本的函数
+from prompt_generator import AutoBoxGenerator, build_target_v2, auto_box_loss_v2
 # =================================================================================
 # 1. 定义专属的 Dense Dataset (一次性返回所有框)
 # =================================================================================
@@ -167,15 +167,18 @@ def main():
             pred_heatmap, pred_wh = box_generator(image_embedding)
             
             # 构建目标 (这次传入的是全量的框！)
-            target_heatmap, target_wh, target_mask = build_target(
+            target_heatmap, target_wh, target_mask = build_target_v2( # 改为 v2
                 gt_boxes_list, 
                 feature_shape=(64, 64), 
                 original_image_size=args.image_size,
                 device=device
             )
-            
-            loss_hm, loss_wh = auto_box_loss(pred_heatmap, pred_wh, target_heatmap, target_wh, target_mask)
-            loss = loss_hm + 0.1 * loss_wh
+
+        # 使用 v2 计算 Loss
+            loss_hm, loss_wh = auto_box_loss_v2(pred_heatmap, pred_wh, target_heatmap, target_wh, target_mask) # 改为 v2
+
+        # 重要：加大 WH Loss 权重，改为 1.0
+            loss = loss_hm + 1.0 * loss_wh
             
             optimizer.zero_grad()
             loss.backward()
