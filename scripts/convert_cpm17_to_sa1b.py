@@ -1,262 +1,194 @@
-#!/usr/bin/env python3
-"""
-将CPM17数据集转换为SAM-Med2D模型可以接受的格式，并划分为训练集和验证集。
-
-输出格式：
-  output_dir/
-    images/          # 图像文件（PNG格式）
-    masks/           # 掩码文件（PNG格式，每个实例一个mask）
-    image2label_train.json   # 训练集映射：image -> [mask1, mask2, ...]
-    image2label_val.json     # 验证集映射：image -> [mask1, mask2, ...]
-
-使用方法:
-  python scripts/convert_cpm17_to_sa1b.py --input-dir data/cpm17/train --output-dir data/cpm17 --train-ratio 0.8
-"""
-
-import argparse
 import os
 import json
-import numpy as np
-from pathlib import Path
-from PIL import Image
 import cv2
-import scipy.io
-import random
+import numpy as np
+import glob
+import shutil
 from tqdm import tqdm
+from pycocotools import mask as mask_utils
+try:
+    from scipy.io import loadmat
+except ImportError:
+    print("⚠️ 警告: 需要安装 scipy 来读取 .mat 文件: pip install scipy")
+    loadmat = None
 
+# ==============================================================================
+# 工具函数
+# ==============================================================================
+def binary_mask_to_rle(binary_mask):
+    mask_fortran = np.asfortranarray(binary_mask.astype(np.uint8))
+    rle = mask_utils.encode(mask_fortran)
+    rle['counts'] = rle['counts'].decode('utf-8')
+    return rle
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="将CPM17数据集转换为SAM-Med2D格式并划分train/val")
-    parser.add_argument("--input-dir", type=str, default="data/cpm17/train",
-                       help="CPM17训练数据目录（包含Images和Labels文件夹）")
-    parser.add_argument("--output-dir", type=str, default="data/cpm17",
-                       help="输出目录")
-    parser.add_argument("--train-ratio", type=float, default=0.8,
-                       help="训练集比例（默认0.8，即80%训练，20%验证）")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="随机种子，用于可重复的数据划分")
-    parser.add_argument("--force", action='store_true',
-                       help="强制重新生成所有文件（覆盖已存在的文件）")
-    return parser.parse_args()
-
-
-def load_mat_mask(mat_path):
+def find_images_and_masks_cpm17(root_dir):
     """
-    从.mat文件中加载实例分割mask。
+    针对 CPM17 数据格式：
+    1. 找到所有原图 (Images/image_xx.png)
+    2. 找到所有标签 (Labels/image_xx.mat)
+    3. 进行配对
+    """
+    image_map = {}  # {'image_00': 'path/to/image_00.png'}
+    mask_map = {}   # {'image_00': 'path/to/image_00.mat'}
     
-    Args:
-        mat_path: .mat文件路径
-        
-    Returns:
-        inst_map: numpy数组，包含实例ID的mask
+    # 查找 Images 目录下的图片
+    images_dir = os.path.join(root_dir, 'Images')
+    if os.path.exists(images_dir):
+        for fname in os.listdir(images_dir):
+            if (fname.startswith('image_') or fname.startswith('Image_')) and \
+               (fname.endswith('.png') or fname.endswith('.tif')):
+                stem = os.path.splitext(fname)[0]
+                image_map[stem] = os.path.join(images_dir, fname)
+    
+    # 查找 Labels 目录下的 .mat 文件
+    labels_dir = os.path.join(root_dir, 'Labels')
+    if os.path.exists(labels_dir):
+        for fname in os.listdir(labels_dir):
+            if fname.endswith('.mat'):
+                stem = os.path.splitext(fname)[0]
+                mask_map[stem] = os.path.join(labels_dir, fname)
+    
+    print(f"   -> 找到 {len(image_map)} 张原图")
+    print(f"   -> 找到 {len(mask_map)} 个标签文件")
+    
+    return image_map, mask_map
+
+def load_mat_instances(mat_path):
     """
+    从 .mat 文件中加载实例分割图，并提取所有实例
+    返回: list of binary masks (每个实例一个)
+    """
+    if loadmat is None:
+        raise ImportError("需要安装 scipy: pip install scipy")
+    
     try:
-        mat_data = scipy.io.loadmat(mat_path)
-        if 'inst_map' in mat_data:
-            inst_map = mat_data['inst_map']
-            # 确保是numpy数组
-            if isinstance(inst_map, np.ndarray):
-                return inst_map.astype(np.uint16)
-        # 尝试其他可能的键名
-        for key in ['instance_map', 'label', 'mask']:
-            if key in mat_data:
-                inst_map = mat_data[key]
-                if isinstance(inst_map, np.ndarray):
-                    return inst_map.astype(np.uint16)
-        raise ValueError(f"无法在{mat_path}中找到实例mask数据")
+        data = loadmat(mat_path)
+        inst_map = data.get('inst_map', None)
+        
+        if inst_map is None:
+            # 尝试查找其他可能的键
+            keys = [k for k in data.keys() if not k.startswith('__')]
+            if keys:
+                inst_map = data[keys[0]]
+            else:
+                return []
+        
+        # 提取所有唯一的实例 ID（排除背景 0）
+        unique_ids = np.unique(inst_map)
+        unique_ids = unique_ids[unique_ids > 0]
+        
+        instances = []
+        for inst_id in unique_ids:
+            binary_mask = (inst_map == inst_id).astype(np.uint8)
+            instances.append(binary_mask)
+        
+        return instances
     except Exception as e:
-        raise ValueError(f"加载.mat文件失败 {mat_path}: {str(e)}")
+        print(f"⚠️ 读取 {mat_path} 时出错: {e}")
+        return []
 
-
-def extract_instances_from_mask(inst_map):
-    """
-    从实例分割mask中提取每个实例的二进制mask。
+def convert_cpm17_recursive(src_root, dst_root):
+    print(f"🚀 开始转换 CPM17 -> {dst_root}")
     
-    Args:
-        inst_map: 包含实例ID的mask数组
-        
-    Returns:
-        masks: 列表，每个元素是一个二进制mask（numpy数组，0和1）
-    """
-    masks = []
-    unique_ids = np.unique(inst_map)
-    # 排除背景（ID=0）
-    unique_ids = unique_ids[unique_ids > 0]
+    if loadmat is None:
+        print("❌ 错误: 需要安装 scipy 来读取 .mat 文件")
+        print("   请运行: pip install scipy")
+        return
     
-    for inst_id in unique_ids:
-        # 创建二进制mask：当前实例为1，其他为0
-        binary_mask = (inst_map == inst_id).astype(np.uint8)
-        masks.append(binary_mask)
-    
-    return masks
-
-
-def convert_cpm17_dataset(input_dir, output_dir, train_ratio=0.8, seed=42, force=False):
-    """
-    转换CPM17数据集并划分为训练集和验证集。
-    
-    Args:
-        input_dir: 输入目录（包含Images和Labels文件夹）
-        output_dir: 输出目录
-        train_ratio: 训练集比例
-        seed: 随机种子
-        force: 是否强制重新生成
-    """
-    input_dir = Path(input_dir)
-    output_dir = Path(output_dir)
-    
-    images_dir = input_dir / 'Images'
-    labels_dir = input_dir / 'Labels'
-    out_images_dir = output_dir / 'images'
-    out_masks_dir = output_dir / 'masks'
-    
-    # 创建输出目录
-    out_images_dir.mkdir(parents=True, exist_ok=True)
-    out_masks_dir.mkdir(parents=True, exist_ok=True)
-    
-    if not images_dir.exists():
-        raise ValueError(f"图像目录不存在: {images_dir}")
-    if not labels_dir.exists():
-        raise ValueError(f"标签目录不存在: {labels_dir}")
-    
-    # 获取所有图像文件
-    image_files = sorted([f for f in images_dir.iterdir() 
-                         if f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.tif', '.tiff']])
-    
-    if len(image_files) == 0:
-        raise ValueError(f"在{images_dir}中未找到图像文件")
-    
-    print(f"找到 {len(image_files)} 个图像文件")
-    
-    # 构建图像到标签的映射
-    image_to_masks = {}
-    all_image_names = []
-    
-    print("正在转换图像和掩码...")
-    for img_path in tqdm(image_files):
-        base_name = img_path.stem
-        all_image_names.append(base_name)
-        
-        # 对应的.mat文件
-        mat_path = labels_dir / f"{base_name}.mat"
-        
-        if not mat_path.exists():
-            print(f"警告: 未找到对应的标签文件 {mat_path}，跳过图像 {img_path.name}")
+    # 分别处理 train 和 test
+    for split in ['train', 'test']:
+        split_src = os.path.join(src_root, split)
+        if not os.path.exists(split_src):
+            print(f"⚠️ 跳过 {split}: 路径不存在")
             continue
+            
+        # 目标路径
+        split_dst = os.path.join(dst_root, split)
+        os.makedirs(split_dst, exist_ok=True)
         
-        # 读取图像以获取尺寸
-        try:
-            img = cv2.imread(str(img_path))
-            if img is None:
-                print(f"警告: 无法读取图像 {img_path}，跳过")
+        print(f"\n📁 处理 {split} 数据集...")
+        # === 核心：查找图片和标签 ===
+        img_dict, mask_dict = find_images_and_masks_cpm17(split_src)
+        
+        success_count = 0
+        skip_count = 0
+        
+        # 开始转换
+        for stem, img_path in tqdm(img_dict.items(), desc=f"转换 {split}"):
+            # 检查是否有对应的 .mat 标签文件
+            if stem not in mask_dict:
+                skip_count += 1
                 continue
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            mat_path = mask_dict[stem]
+            
+            # 读取原图
+            img = cv2.imread(img_path)
+            if img is None:
+                print(f"⚠️ 无法读取图片: {img_path}")
+                continue
             h, w = img.shape[:2]
-        except Exception as e:
-            print(f"警告: 读取图像失败 {img_path}: {str(e)}，跳过")
-            continue
-        
-        # 保存图像为PNG（如果不存在或强制重新生成）
-        out_img_path = out_images_dir / f"{base_name}.png"
-        if not out_img_path.exists() or force:
-            Image.fromarray(img).save(out_img_path)
-        
-        # 读取.mat文件并提取实例
-        try:
-            inst_map = load_mat_mask(mat_path)
-            # 确保mask尺寸与图像一致
-            if inst_map.shape != (h, w):
-                print(f"警告: mask尺寸 {inst_map.shape} 与图像尺寸 {(h, w)} 不匹配，调整mask尺寸")
-                inst_map = cv2.resize(inst_map, (w, h), interpolation=cv2.INTER_NEAREST)
             
-            # 提取每个实例的二进制mask
-            instance_masks = extract_instances_from_mask(inst_map)
-        except Exception as e:
-            print(f"警告: 处理标签文件失败 {mat_path}: {str(e)}，跳过")
-            continue
-        
-        if len(instance_masks) == 0:
-            print(f"警告: 图像 {base_name} 没有找到任何实例，跳过")
-            continue
-        
-        # 保存每个实例的mask
-        mask_paths = []
-        for i, mask in enumerate(instance_masks):
-            mask_name = f"{base_name}_mask_{i:04d}.png"
-            out_mask_path = out_masks_dir / mask_name
+            # 从 .mat 文件中加载所有实例
+            instances = load_mat_instances(mat_path)
+            if len(instances) == 0:
+                skip_count += 1
+                continue
             
-            # 保存mask（如果不存在或强制重新生成）
-            if not out_mask_path.exists() or force:
-                # 保存为二进制PNG（0和255）
-                mask_img = (mask * 255).astype(np.uint8)
-                Image.fromarray(mask_img).save(out_mask_path)
+            annotations = []
             
-            # 使用相对路径（相对于data目录）
-            # 格式：cpm17/masks/xxx.png 或 data/cpm17/masks/xxx.png
-            mask_rel_path = f"cpm17/masks/{mask_name}"
-            mask_paths.append(mask_rel_path)
+            # 处理每个实例
+            for inst_idx, binary_mask in enumerate(instances):
+                # 确保掩码尺寸与图片一致
+                if binary_mask.shape[0] != h or binary_mask.shape[1] != w:
+                    # 调整掩码尺寸
+                    binary_mask = cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                    binary_mask = (binary_mask > 0).astype(np.uint8)
+                
+                # 提取坐标
+                y_inds, x_inds = np.where(binary_mask > 0)
+                if len(y_inds) < 3:  # 至少需要3个像素点
+                    continue
+                
+                x1, x2 = int(np.min(x_inds)), int(np.max(x_inds))
+                y1, y2 = int(np.min(y_inds)), int(np.max(y_inds))
+                
+                # 计算面积和 RLE
+                rle = binary_mask_to_rle(binary_mask)
+                area = int(mask_utils.area(rle))
+                
+                # 写入标注
+                annotations.append({
+                    "bbox": [x1, y1, x2-x1, y2-y1],
+                    "segmentation": rle,
+                    "area": area,
+                    "iscrowd": 0,
+                    "category_id": 1
+                })
+            
+            if len(annotations) > 0:
+                # 1. 复制图片到目标文件夹
+                filename = os.path.basename(img_path)
+                shutil.copy2(img_path, os.path.join(split_dst, filename))
+                
+                # 2. 保存 JSON
+                json_dict = {
+                    "image": {"file_name": filename, "height": h, "width": w, "id": stem},
+                    "annotations": annotations
+                }
+                with open(os.path.join(split_dst, stem + ".json"), 'w') as f:
+                    json.dump(json_dict, f, indent=2)
+                
+                success_count += 1
         
-        # 图像相对路径
-        img_rel_path = f"cpm17/images/{base_name}.png"
-        image_to_masks[img_rel_path] = mask_paths
+        print(f"✅ {split} 转换完成: 成功生成 {success_count} 个样本, 跳过 {skip_count} 个样本")
+
+if __name__ == "__main__":
+    SRC_DIR = "data/cpm17"
+    DST_DIR = "data/cpm17_SA1B"
     
-    print(f"成功转换 {len(image_to_masks)} 个图像")
-    
-    # 划分训练集和验证集
-    print(f"正在划分数据集（训练集比例: {train_ratio}）...")
-    image_keys = list(image_to_masks.keys())
-    
-    if len(image_keys) < 2:
-        print("警告: 图像数量太少，无法划分数据集，全部用作训练集")
-        train_keys = image_keys
-        val_keys = []
-    else:
-        # 使用随机种子确保可重复性
-        random.seed(seed)
-        np.random.seed(seed)
+    # 清空旧数据
+    if os.path.exists(DST_DIR):
+        shutil.rmtree(DST_DIR)
         
-        # 随机打乱
-        shuffled_keys = image_keys.copy()
-        random.shuffle(shuffled_keys)
-        
-        # 计算划分点
-        split_idx = int(len(shuffled_keys) * train_ratio)
-        train_keys = shuffled_keys[:split_idx]
-        val_keys = shuffled_keys[split_idx:]
-    
-    # 构建训练集和验证集的映射
-    train_image2label = {k: image_to_masks[k] for k in train_keys}
-    test_image2label = {k: image_to_masks[k] for k in val_keys}
-    
-    # 保存JSON文件
-    train_json_path = output_dir / 'image2label_train.json'
-    val_json_path = output_dir / 'image2label_test.json'
-    
-    with open(train_json_path, 'w', encoding='utf-8') as f:
-        json.dump(train_image2label, f, indent=4, ensure_ascii=False)
-    
-    with open(val_json_path, 'w', encoding='utf-8') as f:
-        json.dump(val_image2label, f, indent=4, ensure_ascii=False)
-    
-    print(f"\n转换完成！")
-    print(f"训练集: {len(train_image2label)} 个图像")
-    print(f"验证集: {len(test_image2label)} 个图像")
-    print(f"输出目录: {output_dir}")
-    print(f"训练集JSON: {train_json_path}")
-    print(f"验证集JSON: {test_json_path}")
-
-
-def main():
-    args = parse_args()
-    convert_cpm17_dataset(
-        input_dir=args.input_dir,
-        output_dir=args.output_dir,
-        train_ratio=args.train_ratio,
-        seed=args.seed,
-        force=args.force
-    )
-
-
-if __name__ == '__main__':
-    main()
-
+    convert_cpm17_recursive(SRC_DIR, DST_DIR)

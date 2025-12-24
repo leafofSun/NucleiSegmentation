@@ -1,147 +1,151 @@
 import os
-import cv2
-import json
 import glob
-import numpy as np
+import shutil
+import json
 import xml.etree.ElementTree as ET
+import cv2
+import numpy as np
 from tqdm import tqdm
+# 必须引入 pycocotools 来生成 RLE Mask
+from pycocotools import mask as mask_utils
 
-# ================= 配置区域 =================
-
-# 1. 你的原始数据路径 (根据你的描述设置)
-# 自动定位到项目根目录，再拼出 data/MoNuSeg 的绝对路径，避免重复前缀
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-RAW_ROOT = os.path.join(PROJECT_ROOT, "data", "MoNuSeg")
-TRAIN_IMG_DIR = os.path.join(RAW_ROOT, "Train", "images")       # 训练集图片
-TRAIN_XML_DIR = os.path.join(RAW_ROOT, "Train", "Annotations") # 训练集标注
-TEST_DIR = os.path.join(RAW_ROOT, "Test")                      # 测试集 (混在一起)
-
-# 2. 输出路径 (处理好的数据将保存在这里，建议用新名字以免混淆)
-OUTPUT_ROOT = "data/MoNuSeg_Processed"
-
-# 3. 通用属性描述 (PNuRL 需要)
-COMMON_ATTRS = {
-    "prompt": "Microscopy image of H&E stained tissue. The image contains deep purple, rounded or ellipsoidal cell nuclei that are densely distributed against a pink background.",
-    "color": "deep purple",
-    "shape": "rounded",
-    "density": "dense"
-}
-
-# ===========================================
-
-def parse_xml_to_mask(xml_path, shape):
-    """解析 MoNuSeg XML 生成实例掩码"""
+def parse_xml_to_annotations(xml_path, img_height, img_width):
+    """
+    解析 MoNuSeg XML -> 多边形 -> Binary Mask -> RLE
+    """
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
-    except Exception as e:
-        print(f"Error parsing XML {xml_path}: {e}")
-        return np.zeros(shape[:2], dtype=np.int32)
-
-    # 创建空 Mask
-    mask = np.zeros(shape[:2], dtype=np.int32)
-    
-    # 遍历每个 Region (每个细胞核)
-    # MoNuSeg XML 结构: Annotations -> Annotation -> Regions -> Region -> Vertices
-    count = 0
-    for i, region in enumerate(root.findall(".//Region"), start=1):
-        vertices = []
-        for vertex in region.findall(".//Vertex"):
-            x = float(vertex.get("X"))
-            y = float(vertex.get("Y"))
-            vertices.append([x, y])
         
-        if len(vertices) > 2: # 至少3个点才能围成多边形
-            pts = np.array(vertices, np.int32)
-            # 填充多边形，使用 i 作为实例 ID (Instance ID)
-            cv2.fillPoly(mask, [pts], i)
-            count += 1
+        annotations = []
+        
+        # 查找所有 Region (每个 Region 代表一个细胞)
+        regions = root.findall('.//Region')
+        
+        for region in regions:
+            vertices = region.findall('.//Vertex')
+            coords = []
+            for v in vertices:
+                x = float(v.get('X'))
+                y = float(v.get('Y'))
+                coords.append([x, y])
             
-    return mask
+            if len(coords) < 3: continue # 忽略不成形的点
+                
+            # 1. 生成多边形 Mask
+            # 创建一个全黑的底图
+            mask = np.zeros((img_height, img_width), dtype=np.uint8)
+            poly_points = np.array(coords, dtype=np.int32)
+            # 填充多边形区域为 1
+            cv2.fillPoly(mask, [poly_points], 1)
+            
+            # 2. 计算 Bounding Box
+            x_min = np.min(poly_points[:, 0])
+            x_max = np.max(poly_points[:, 0])
+            y_min = np.min(poly_points[:, 1])
+            y_max = np.max(poly_points[:, 1])
+            w = x_max - x_min
+            h = y_max - y_min
+            
+            # 过滤极小框
+            if w < 2 or h < 2: continue
+            
+            # 3. 编码为 RLE (Run-Length Encoding)
+            # RLE 需要列优先 (Fortran-style)
+            mask_fortran = np.asfortranarray(mask)
+            rle = mask_utils.encode(mask_fortran)
+            # 将 bytes 解码为 string 以存入 JSON
+            rle['counts'] = rle['counts'].decode('utf-8')
+            
+            annotations.append({
+                "bbox": [int(x_min), int(y_min), int(w), int(h)],
+                "area": int(mask_utils.area(rle)),
+                "segmentation": rle,  # 这里的 mask 是精确的形状
+                "iscrowd": 0,
+                "category_id": 1
+            })
+            
+        return annotations
+    except Exception as e:
+        print(f"❌ Error parsing XML {xml_path}: {e}")
+        return []
 
-def process_subset(image_source_dir, xml_source_dir, mode):
-    """
-    image_source_dir: 图片所在的文件夹
-    xml_source_dir:   XML所在的文件夹 (如果是Test，这两个是同一个路径)
-    mode:             'train' 或 'test'
-    """
-    print(f"\nProcessing {mode} set...")
-    print(f"  - Images from: {image_source_dir}")
-    print(f"  - XMLs from:   {xml_source_dir}")
-
-    # 创建输出目录
-    out_img_dir = os.path.join(OUTPUT_ROOT, mode, 'Images')
-    out_lbl_dir = os.path.join(OUTPUT_ROOT, mode, 'Labels')
-    os.makedirs(out_img_dir, exist_ok=True)
-    os.makedirs(out_lbl_dir, exist_ok=True)
-
-    # 寻找所有图片 (.tif)
-    img_files = glob.glob(os.path.join(image_source_dir, "*.tif"))
+def process_monuseg_pair(img_path, xml_path, out_dir):
+    filename = os.path.basename(img_path)
+    file_id = os.path.splitext(filename)[0]
     
-    if len(img_files) == 0:
-        print("  ! No .tif images found! Check path.")
+    # 1. 读取图片
+    img = cv2.imread(img_path)
+    if img is None:
+        print(f"⚠️ Error reading image: {img_path}")
         return
-
-    image2label = {}
-    attribute_info = {}
-
-    for img_path in tqdm(img_files):
-        filename = os.path.basename(img_path)
-        name_no_ext = os.path.splitext(filename)[0]
-        
-        # 1. 寻找对应的 XML
-        # 逻辑：在 xml_source_dir 下找 同名.xml
-        xml_path = os.path.join(xml_source_dir, name_no_ext + ".xml")
-        
-        if not os.path.exists(xml_path):
-            print(f"  ! Warning: XML not found for {filename}, skipping.")
-            continue
-
-        # 2. 读取图片 (TIF -> RGB)
-        img = cv2.imread(img_path)
-        if img is None:
-            print(f"  ! Error reading image {img_path}")
-            continue
-
-        # 3. 生成 Mask
-        mask = parse_xml_to_mask(xml_path, img.shape)
-
-        # 4. 保存为标准格式 (.png)
-        save_name = name_no_ext + ".png"
-        
-        # 保存图片
-        cv2.imwrite(os.path.join(out_img_dir, save_name), img)
-        
-        # 保存 Mask (必须是 uint16 以支持>255个细胞)
-        cv2.imwrite(os.path.join(out_lbl_dir, save_name), mask.astype(np.uint16))
-
-        # 5. 记录元数据
-        image2label[save_name] = save_name
-        attribute_info[save_name] = COMMON_ATTRS.copy()
-
-    # 保存 JSON
-    with open(os.path.join(OUTPUT_ROOT, f"image2label_{mode}.json"), 'w') as f:
-        json.dump(image2label, f, indent=4)
+    h, w = img.shape[:2]
     
-    with open(os.path.join(OUTPUT_ROOT, f"attribute_info_{mode}.json"), 'w') as f:
-        json.dump(attribute_info, f, indent=4)
-        
-    print(f"  ✅ {mode} set done. Saved to {OUTPUT_ROOT}/{mode}")
+    # 2. 解析标注 (包含 RLE Mask)
+    annotations = parse_xml_to_annotations(xml_path, h, w)
+    
+    if len(annotations) == 0:
+        print(f"⚠️ No valid annotations for {filename}")
+    
+    # 3. 构建 JSON
+    json_data = {
+        "image": {
+            "file_name": filename,
+            "height": h,
+            "width": w,
+            "id": file_id
+        },
+        "annotations": annotations
+    }
+    
+    # 4. 保存
+    shutil.copy2(img_path, os.path.join(out_dir, filename))
+    with open(os.path.join(out_dir, file_id + '.json'), 'w') as f:
+        json.dump(json_data, f)
 
-if __name__ == "__main__":
-    # 1. 处理 Train 集
-    # 你的结构: data/MoNuSeg/Train/images 和 data/MoNuSeg/Train/Annotations
-    if os.path.exists(TRAIN_IMG_DIR) and os.path.exists(TRAIN_XML_DIR):
-        process_subset(TRAIN_IMG_DIR, TRAIN_XML_DIR, 'train')
-    else:
-        print(f"❌ Train paths not found:\n {TRAIN_IMG_DIR}\n {TRAIN_XML_DIR}")
-
-    # 2. 处理 Test 集
-    # 你的结构: data/MoNuSeg/Test (里面既有tif也有xml)
-    if os.path.exists(TEST_DIR):
-        # 此时图片和xml在同一个文件夹，所以传两次同一个路径
-        process_subset(TEST_DIR, TEST_DIR, 'test')
-    else:
-        print(f"❌ Test path not found: {TEST_DIR}")
+def convert_monuseg(src_root, dst_root):
+    # 准备目录
+    train_out = os.path.join(dst_root, 'train')
+    test_out = os.path.join(dst_root, 'test')
+    os.makedirs(train_out, exist_ok=True)
+    os.makedirs(test_out, exist_ok=True)
+    
+    print(f"🚀 开始转换 MoNuSeg (带RLE掩码) 到: {dst_root}")
+    
+    # --- 1. 处理 Train Set ---
+    print("\nProcessing Train Set...")
+    train_img_dir = os.path.join(src_root, 'Train', 'Tissue Images')
+    train_xml_dir = os.path.join(src_root, 'Train', 'Annotations')
+    
+    train_images = glob.glob(os.path.join(train_img_dir, '*.tif'))
+    for img_path in tqdm(train_images):
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+        xml_path = os.path.join(train_xml_dir, stem + '.xml')
         
-    print("\nProcessing Complete! New dataset is at:", OUTPUT_ROOT)
+        if os.path.exists(xml_path):
+            process_monuseg_pair(img_path, xml_path, train_out)
+        else:
+            print(f"⚠️ Missing XML: {stem}")
+
+    # --- 2. 处理 Test Set ---
+    print("\nProcessing Test Set...")
+    test_dir = os.path.join(src_root, 'Test')
+    test_images = glob.glob(os.path.join(test_dir, '*.tif'))
+    
+    for img_path in tqdm(test_images):
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+        xml_path = os.path.join(test_dir, stem + '.xml')
+        
+        if os.path.exists(xml_path):
+            process_monuseg_pair(img_path, xml_path, test_out)
+        else:
+            print(f"⚠️ Missing XML: {stem}")
+            
+    print(f"\n✅ MoNuSeg 转换完成！")
+
+if __name__ == '__main__':
+    # 你的路径
+    SRC_ROOT = 'data/MoNuSeg'
+    DST_ROOT = 'data/MoNuSeg_SA1B_RLE'
+    
+    convert_monuseg(SRC_ROOT, DST_ROOT)

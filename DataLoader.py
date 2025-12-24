@@ -6,38 +6,33 @@ import numpy as np
 from torch.utils.data import DataLoader
 import json
 import random
+import glob
+
+# 尝试导入 pycocotools
+try:
+    from pycocotools import mask as mask_utils
+except ImportError:
+    mask_utils = None
 
 # ===========================================================================================
 # [Tools] Correct stack_dict_batched
 # ===========================================================================================
 def stack_dict_batched(batch):
-    """
-    Args:
-        batch: list of dicts. 
-               例如: [{'image': T1, 'label': L1}, {'image': T2, 'label': L2}]
-    Returns:
-        out_dict: dict of tensors (batched).
-               例如: {'image': stack([T1, T2]), 'label': stack([L1, L2])}
-    """
     out_dict = {}
-    # 遍历第一个样本的所有键
     for k in batch[0].keys():
-        # 收集该 Batch 中所有样本的该键对应的值
         values = [sample[k] for sample in batch]
-        
-        # 如果是 Tensor，尝试堆叠
         if isinstance(values[0], torch.Tensor):
             try:
                 out_dict[k] = torch.stack(values, dim=0)
             except RuntimeError:
-                # 万一遇到维度不一致无法堆叠的情况（比如变长 Box），则保留 list
                 out_dict[k] = values
         else:
-            # 如果不是 Tensor（比如文件名是字符串），保留 list
             out_dict[k] = values
-            
     return out_dict
 
+# ===========================================================================================
+# Training Dataset (双模式支持)
+# ===========================================================================================
 class TrainingDataset(Dataset):
     def __init__(self, data_path, image_size=256, mode='train', requires_name=True, point_num=1, mask_num=5, attribute_info_path=None):
         self.image_size = image_size
@@ -46,285 +41,278 @@ class TrainingDataset(Dataset):
         self.mask_num = mask_num
         self.pixel_mean = [123.675, 116.28, 103.53]
         self.pixel_std = [58.395, 57.12, 57.375]
-        
-        json_path = os.path.join(data_path, f'image2label_{mode}.json')
-        if not os.path.exists(json_path):
-            raise FileNotFoundError(f"JSON not found: {json_path}")
-            
-        with open(json_path, 'r') as f:
-            dataset = json.load(f)
+        self.data_path = data_path
         
         self.attribute_info = {}
         if attribute_info_path and os.path.exists(attribute_info_path):
             with open(attribute_info_path, 'r') as f:
                 self.attribute_info = json.load(f)
 
-        # --- Path Resolution Logic ---
-        base_dir = os.path.basename(os.path.normpath(data_path))
+        # 1. 优先检查旧版 image2label
+        json_map_path = os.path.join(data_path, f'image2label_{mode}.json')
         
-        def convert_path(path):
-            if isinstance(path, str):
-                if path.startswith('data_demo/'):
-                    path = path.replace('data_demo/', f'{data_path}/')
-                elif path.startswith('cpm17/'):
-                    if base_dir == str(data_path):
-                        path = os.path.join(data_path, path.replace('cpm17/', ''))
-                    else:
-                        path = os.path.join(data_path, path)
-                return path
-            return path
-
-        def resolve_image_path(path: str) -> str:
-            base = os.path.basename(path)
-            candidates = [
-                path,
-                os.path.join(data_path, path),
-                os.path.join(data_path, 'train', 'Images', base),
-                os.path.join(data_path, 'Images', base),
-            ]
-            for cand in candidates:
-                if isinstance(cand, str) and os.path.exists(cand):
-                    return cand
-            return path
-
-        def resolve_mask_path(path: str) -> str:
-            base = os.path.basename(path)
-            candidates = [
-                path,
-                os.path.join(data_path, path),
-                os.path.join(data_path, 'train', 'Labels', base),
-                os.path.join(data_path, 'Labels', base),
-            ]
-            for cand in candidates:
-                if isinstance(cand, str) and os.path.exists(cand):
-                    return cand
-            return path
-        
-        converted_dataset = {convert_path(k): convert_path(v) for k, v in dataset.items()}
-        self.image_paths = [resolve_image_path(k) for k in converted_dataset.keys()]
-        self.label_paths = []
-        for v in converted_dataset.values():
-            if isinstance(v, list):
-                self.label_paths.append([resolve_mask_path(p) for p in v])
+        if os.path.exists(json_map_path):
+            self.dataset_type = 'legacy'
+            print(f"✅ [Training] Found map file: {os.path.basename(json_map_path)}")
+            with open(json_map_path, 'r') as f:
+                dataset = json.load(f)
+            self.image_paths, self.label_paths = self._parse_legacy_paths(dataset, data_path)
+        else:
+            # 2. 否则进入 SA-1B 模式
+            search_path = os.path.join(data_path, mode) if os.path.exists(os.path.join(data_path, mode)) else data_path
+            self.json_files = sorted(glob.glob(os.path.join(search_path, '**', '*.json'), recursive=True))
+            self.json_files = [f for f in self.json_files if "image2label" not in os.path.basename(f)]
+            
+            if len(self.json_files) > 0:
+                self.dataset_type = 'sa1b'
+                print(f"✅ [Training] Found {len(self.json_files)} SA-1B JSONs in {search_path}")
             else:
-                self.label_paths.append(resolve_mask_path(v))
-        print(f"Training Dataset loaded: {len(self.image_paths)} images.")
+                raise FileNotFoundError(f"❌ No training data found in {data_path}")
+
+    def _parse_legacy_paths(self, dataset, data_path):
+        img_paths, lbl_paths = [], []
+        for k, v in dataset.items():
+            img_p = os.path.join(data_path, k) if not os.path.exists(k) else k
+            if isinstance(v, list): lbl_p = [os.path.join(data_path, i) if not os.path.exists(i) else i for i in v]
+            else: lbl_p = os.path.join(data_path, v) if not os.path.exists(v) else v
+            img_paths.append(img_p)
+            lbl_paths.append(lbl_p)
+        return img_paths, lbl_paths
+
+    def __len__(self):
+        return len(self.image_paths) if self.dataset_type == 'legacy' else len(self.json_files)
 
     def __getitem__(self, index):
+        if self.dataset_type == 'legacy':
+            return self._getitem_legacy(index)
+        else:
+            return self._getitem_sa1b(index)
+
+    def _getitem_legacy(self, index):
         image_path = self.image_paths[index]
         image = cv2.imread(image_path)
-        if image is None:
-            return self.__getitem__(random.randint(0, len(self.image_paths) - 1))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
         label_path = self.label_paths[index]
-        if isinstance(label_path, list):
-            label_path = label_path[0]
+        if isinstance(label_path, list): label_path = label_path[0]
         label = cv2.imread(label_path, -1)
-        if label is None:
-             return self.__getitem__(random.randint(0, len(self.image_paths) - 1))
-
+        
         original_size = image.shape[:2]
         image = cv2.resize(image, (self.image_size, self.image_size))
         label = cv2.resize(label, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
-
-        # Initialize Tensors
-        point_coords = torch.zeros(1, 2).float()
-        point_labels = torch.zeros(1).int()
         
-        # 默认值 (无目标情况)
-        boxes = torch.tensor([[0, 0, 1, 1]]).float() 
-
-        # =================================================================================
-        # [核心修复] Generate Box Prompt & Label
-        # 逻辑：必须先选定一个 ID，然后针对这同一个 ID 生成 Box 和 Mask
-        # =================================================================================
         obj_ids = np.unique(label)
         obj_ids = obj_ids[obj_ids > 0]
-        
+        boxes = torch.tensor([[0, 0, 1, 1]]).float()
         if len(obj_ids) > 0:
-            # 1. 只随机选一次 ID！
             target_id = np.random.choice(obj_ids)
-            
-            # 2. 根据这个 ID 生成 Box
-            y_indices, x_indices = np.where(label == target_id)
-            x_min, x_max = np.min(x_indices), np.max(x_indices)
-            y_min, y_max = np.min(y_indices), np.max(y_indices)
-            
-            H, W = label.shape
-            # 添加随机扰动 (Jitter) 模拟不完美的提示
-            x_min = max(0, x_min - np.random.randint(0, 5))
-            x_max = min(W, x_max + np.random.randint(0, 5))
-            y_min = max(0, y_min - np.random.randint(0, 5))
-            y_max = min(H, y_max + np.random.randint(0, 5))
-            
-            boxes = torch.tensor([[x_min, y_min, x_max, y_max]]).float()
-            
-            # 3. 根据同一个 ID 生成 Label (Single Instance Binary Mask)
-            # 这一点至关重要：告诉模型“只分割框住的这个细胞”
+            ys, xs = np.where(label == target_id)
+            x1, x2, y1, y2 = np.min(xs), np.max(xs), np.min(ys), np.max(ys)
+            boxes = torch.tensor([[x1, y1, x2, y2]]).float()
             label = (label == target_id).astype(np.float32)
         else:
-            # 如果没有细胞，Label 全黑
             label = np.zeros_like(label).astype(np.float32)
             
-        # =================================================================================
-        
-        image = (image - self.pixel_mean) / self.pixel_std
-        image = torch.tensor(image).permute(2, 0, 1) 
-        label = torch.tensor(label).unsqueeze(0) 
+        return self._pack(image, label, boxes, original_size, image_path)
 
-        attribute_prompts = []
-        if self.attribute_info:
-            filename = os.path.basename(image_path)
-            info = self.attribute_info.get(filename)
-            if info and "prompt" in info:
-                attribute_prompts.append(info["prompt"])
-        if not attribute_prompts:
-            attribute_prompts.append("Medical image")
-
-        sample = {
-            "image": image,
-            "label": label,
-            "point_coords": point_coords,
-            "point_labels": point_labels,
-            "boxes": boxes,
-            "original_size": original_size,
-            "image_path": image_path,
-            "attribute_prompts": attribute_prompts,
-        }
+    def _getitem_sa1b(self, index):
+        json_path = self.json_files[index]
+        base_path = os.path.splitext(json_path)[0]
+        img_path = None
+        for ext in ['.jpg', '.jpeg', '.png', '.tif']:
+            if os.path.exists(base_path + ext): img_path = base_path + ext; break
         
-        if self.requires_name:
-            sample["name"] = os.path.basename(image_path)
+        if not img_path: return self.__getitem__(random.randint(0, len(self)-1))
+        
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        ori_h, ori_w = image.shape[:2]
+        image = cv2.resize(image, (self.image_size, self.image_size))
+        
+        with open(json_path, 'r') as f: data = json.load(f)
+        anns = data.get('annotations', [])
+        
+        label = np.zeros((self.image_size, self.image_size), dtype=np.float32)
+        boxes = torch.tensor([[0, 0, 1, 1]]).float()
+        
+        if len(anns) > 0:
+            ann = random.choice(anns)
+            if 'bbox' in ann:
+                x, y, w, h = ann['bbox']
+                sx, sy = self.image_size/ori_w, self.image_size/ori_h
+                boxes = torch.tensor([[x*sx, y*sy, (x+w)*sx, (y+h)*sy]]).float()
             
+            if 'segmentation' in ann and mask_utils:
+                try:
+                    mask = mask_utils.decode(ann['segmentation'])
+                    label = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST).astype(np.float32)
+                except:
+                    # Fallback to box mask
+                    x1, y1, x2, y2 = boxes[0].int().tolist()
+                    label[y1:y2, x1:x2] = 1.0
+            elif 'bbox' in ann:
+                # No mask available, create rectangle mask from box
+                x1, y1, x2, y2 = boxes[0].int().tolist()
+                label[y1:y2, x1:x2] = 1.0
+
+        return self._pack(image, label, boxes, (ori_h, ori_w), img_path)
+
+    def _pack(self, image, label, boxes, ori_size, path):
+        image = (image - self.pixel_mean) / self.pixel_std
+        image = torch.tensor(image).permute(2, 0, 1).float()
+        if not isinstance(label, torch.Tensor): label = torch.tensor(label).float().unsqueeze(0)
+        
+        sample = {
+            "image": image, "label": label, "boxes": boxes, 
+            "point_coords": torch.zeros(1,2), "point_labels": torch.zeros(1),
+            "original_size": ori_size, "image_path": path,
+            "attribute_prompts": ["Medical image"]
+        }
+        if self.requires_name: sample["name"] = os.path.basename(path)
         return sample
 
-    def __len__(self):
-        return len(self.image_paths)
 
+# ===========================================================================================
+# Testing Dataset (关键修正版)
+# ===========================================================================================
 class TestingDataset(Dataset):
     def __init__(self, data_path, image_size=256, mode='test', requires_name=True, point_num=1, return_ori_mask=True, prompt_path=None, attribute_info_path=None):
         self.image_size = image_size
         self.requires_name = requires_name
-        self.point_num = point_num
-        self.return_ori_mask = return_ori_mask
-        self.prompt_path = prompt_path
-        
         self.pixel_mean = [123.675, 116.28, 103.53]
         self.pixel_std = [58.395, 57.12, 57.375]
         
+        # 1. 尝试寻找 Legacy JSON
         json_path = os.path.join(data_path, f'image2label_{mode}.json')
-        if not os.path.exists(json_path):
-             raise FileNotFoundError(f"JSON not found: {json_path}")
-             
-        with open(json_path, 'r') as f:
-            dataset = json.load(f)
-
-        self.attribute_info = {}
-        if attribute_info_path and os.path.exists(attribute_info_path):
-            with open(attribute_info_path, 'r') as f:
-                self.attribute_info = json.load(f)
-
-        def resolve_image_path(path: str) -> str:
-            base = os.path.basename(path)
-            candidates = [
-                path,
-                os.path.join(data_path, path),
-                os.path.join(data_path, 'test', 'Images', base),
-                os.path.join(data_path, 'Images', base),
-            ]
-            for cand in candidates:
-                if isinstance(cand, str) and os.path.exists(cand):
-                    return cand
-            return path
+        
+        if os.path.exists(json_path):
+            self.dataset_type = 'legacy'
+            print(f"✅ [Testing] Found legacy map: {json_path}")
+            with open(json_path, 'r') as f: dataset = json.load(f)
+            self.image_paths = [os.path.join(data_path, k) if not os.path.exists(k) else k for k in dataset.keys()]
+            self.label_paths = [os.path.join(data_path, v) if not os.path.exists(v) else v for v in dataset.values()]
+        else:
+            # 2. 尝试 SA-1B 模式
+            search_path = os.path.join(data_path, mode)
+            if not os.path.exists(search_path): 
+                search_path = data_path
             
-        def resolve_mask_path(path: str) -> str:
-            base = os.path.basename(path)
-            candidates = [
-                path,
-                os.path.join(data_path, path),
-                os.path.join(data_path, 'test', 'Labels', base),
-                os.path.join(data_path, 'Labels', base),
-            ]
-            for cand in candidates:
-                if isinstance(cand, str) and os.path.exists(cand):
-                    return cand
-            return path
-        
-        self.image_paths = [resolve_image_path(k) for k in dataset.keys()]
-        self.label_paths = [resolve_mask_path(v) for v in dataset.values()]
-    
+            self.json_files = sorted(glob.glob(os.path.join(search_path, '**', '*.json'), recursive=True))
+            self.json_files = [f for f in self.json_files if "image2label" not in f]
+            
+            if len(self.json_files) > 0:
+                self.dataset_type = 'sa1b'
+                print(f"✅ [Testing] Found {len(self.json_files)} SA-1B JSONs in {search_path}")
+            else:
+                self.dataset_type = 'legacy_folder'
+                img_dir = os.path.join(data_path, 'Images')
+                if not os.path.exists(img_dir): img_dir = data_path
+                self.image_paths = sorted(glob.glob(os.path.join(img_dir, '*.png')) + glob.glob(os.path.join(img_dir, '*.tif')))
+                self.label_paths = [] # 暂无Label
+
+    def __len__(self):
+        if self.dataset_type == 'sa1b': return len(self.json_files)
+        return len(self.image_paths)
+
     def __getitem__(self, index):
-        image_path = self.image_paths[index]
-        image = cv2.imread(image_path)
-        if image is None:
-             raise ValueError(f"Cannot read image: {image_path}")
+        if self.dataset_type == 'sa1b':
+            return self._getitem_sa1b(index)
+        else:
+            return self._getitem_legacy(index)
+
+    # --- [修复核心] 强制解耦 Box 读取和 Mask 读取 ---
+    def _getitem_sa1b(self, index):
+        json_path = self.json_files[index]
+        base_path = os.path.splitext(json_path)[0]
         
+        img_path = None
+        for ext in ['.jpg', '.jpeg', '.png', '.tif']:
+            if os.path.exists(base_path + ext): img_path = base_path + ext; break
+        
+        if not img_path: return self.__getitem__(random.randint(0, len(self) - 1))
+        
+        image = cv2.imread(img_path)
         original_size = image.shape[:2]
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_resized = cv2.resize(image, (self.image_size, self.image_size))
         
-        label_path = self.label_paths[index]
-        label = cv2.imread(label_path, -1)
-        
-        image = cv2.resize(image, (self.image_size, self.image_size))
-        label = cv2.resize(label, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
-        
-        # =======================================================
-        # [测试集逻辑] 生成所有细胞的 Box，供评估使用
-        # =======================================================
-        boxes_list = []
-        obj_ids = np.unique(label)
-        
-        for obj_id in obj_ids:
-            if obj_id == 0: continue # 跳过背景
-            
-            y_indices, x_indices = np.where(label == obj_id)
-            if len(y_indices) == 0: continue
+        try:
+            with open(json_path, 'r') as f: data = json.load(f)
+        except:
+            return self.__getitem__(random.randint(0, len(self) - 1))
 
-            x_min, x_max = np.min(x_indices), np.max(x_indices)
-            y_min, y_max = np.min(y_indices), np.max(y_indices)
-            
-            boxes_list.append([x_min, y_min, x_max, y_max])
-            
+        anns = data.get('annotations', [])
+        gt_mask = np.zeros(original_size, dtype=np.int32)
+        boxes_list = []
+        
+        for idx, ann in enumerate(anns):
+            # 1. 无论有没有 Mask，只要有 Box 就先读出来！(用于画绿框)
+            if 'bbox' in ann:
+                x, y, w, h = ann['bbox']
+                boxes_list.append([x, y, x+w, y+h])
+
+            # 2. 如果有 Mask，再尝试解码 Mask (用于算 Dice)
+            if 'segmentation' in ann and mask_utils:
+                try:
+                    mask = mask_utils.decode(ann['segmentation'])
+                    gt_mask[mask > 0] = (idx + 1)
+                except:
+                    pass
+        
+        # Resize GT Mask
+        label_resized = cv2.resize(gt_mask.astype(np.float32), (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+        
+        # 处理 Box Tensor (缩放到 1024x1024)
         if len(boxes_list) == 0:
-            boxes_tensor = torch.tensor([[0, 0, 1, 1]]).float()
+            boxes_tensor = torch.tensor([[0,0,1,1]]).float()
         else:
             boxes_tensor = torch.tensor(boxes_list).float()
+            sx, sy = self.image_size/original_size[1], self.image_size/original_size[0]
+            boxes_tensor[:, 0::2] *= sx
+            boxes_tensor[:, 1::2] *= sy
 
-        point_coords = torch.zeros(1, 2).float()
-        point_labels = torch.zeros(1).int()
-        # =======================================================
+        return self._pack(image_resized, label_resized, boxes_tensor, original_size, img_path)
 
-        image = (image - self.pixel_mean) / self.pixel_std
-        image = torch.tensor(image).permute(2, 0, 1)
+    def _getitem_legacy(self, index):
+        img_path = self.image_paths[index]
+        lbl_path = self.label_paths[index] if index < len(self.label_paths) else None
         
-        # 测试集保留原始 Label (Instance ID)，用于计算 mPQ 等指标
+        image = cv2.imread(img_path)
+        original_size = image.shape[:2]
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_resized = cv2.resize(image, (self.image_size, self.image_size))
+        
+        if lbl_path and os.path.exists(lbl_path):
+            label = cv2.imread(lbl_path, -1)
+            label_resized = cv2.resize(label, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+        else:
+            label_resized = np.zeros((self.image_size, self.image_size))
+            
+        boxes_list = []
+        if np.max(label_resized) > 0:
+            ids = np.unique(label_resized)
+            for i in ids:
+                if i==0: continue
+                ys, xs = np.where(label_resized == i)
+                boxes_list.append([np.min(xs), np.min(ys), np.max(xs), np.max(ys)])
+        
+        boxes_tensor = torch.tensor(boxes_list).float() if boxes_list else torch.tensor([[0,0,1,1]]).float()
+        return self._pack(image_resized, label_resized, boxes_tensor, original_size, img_path)
+
+    def _pack(self, image, label, boxes, ori_size, path):
+        image = (image - self.pixel_mean) / self.pixel_std
+        image = torch.tensor(image).permute(2, 0, 1).float()
         label_tensor = torch.tensor(label).unsqueeze(0).float()
-
-        attribute_prompts = []
-        if self.attribute_info:
-            filename = os.path.basename(image_path)
-            info = self.attribute_info.get(filename)
-            if info and "prompt" in info:
-                attribute_prompts.append(info["prompt"])
-        if not attribute_prompts:
-            attribute_prompts.append("Medical image")
-
+        
         sample = {
             "image": image,
             "label": label_tensor,
-            "ori_label": label_tensor, # 关键 Key，供 test.py 使用
-            "boxes": boxes_tensor,     # 关键 Key，供 test.py 使用
-            "point_coords": point_coords,
-            "point_labels": point_labels,
-            "original_size": original_size,
-            "image_path": image_path,
-            "attribute_prompts": attribute_prompts
+            "ori_label": label_tensor,
+            "boxes": boxes, 
+            "point_coords": torch.zeros(1,2),
+            "point_labels": torch.zeros(1),
+            "original_size": ori_size,
+            "image_path": path,
+            "attribute_prompts": ["Medical image"]
         }
-        
-        if self.requires_name:
-            sample["name"] = os.path.basename(image_path)
-            
+        if self.requires_name: sample["name"] = os.path.basename(path)
         return sample
-
-    def __len__(self):
-        return len(self.image_paths)
