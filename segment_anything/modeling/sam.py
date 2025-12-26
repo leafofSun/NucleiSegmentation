@@ -233,8 +233,8 @@ except ImportError:
 # =============================================================================
 class TextSam(Sam):
     """
-    支持文本引导的 SAM 变体。
-    继承自原版 Sam，增加了 CLIP 文本编码器和 Prompt 生成器。
+    支持双向语义引导（Bi-directional Semantic Prompting）的 SAM 变体。
+    它会自动生成 "Nuclei" (正向) 和 "Background" (负向) 的提示点，混合输入给 SAM。
     """
     def __init__(
         self, 
@@ -243,87 +243,69 @@ class TextSam(Sam):
         mask_decoder,
         pixel_mean=[123.675, 116.28, 103.53],
         pixel_std=[58.395, 57.12, 57.375],
-        # 新增配置
-        clip_model_name="ViT-B/16", # 使用最通用的 CLIP 模型
-        text_dim=512,               # CLIP ViT-B/16 输出维度是 512
-        embed_dim=256               # SAM 内部特征维度是 256
+        clip_model_name="ViT-B/16", # 新增参数
+        text_dim=512,               # 新增参数
+        embed_dim=256               # 新增参数
     ):
-        # 1. 初始化父类 (SAM 原生组件)
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
         
-        # 2. 初始化 CLIP (冻结状态)
-        # 我们只用它提取语义特征，不训练它，节省显存
+        # 1. 初始化 CLIP (冻结参数，只用于提取文本特征)
         print(f"Loading CLIP model: {clip_model_name}...")
-        self.clip_model, self.preprocess = clip.load(clip_model_name, device="cpu") 
-        # 放到 CPU 加载是为了防止瞬间爆显存，forward 时会自动转到 GPU
-        
+        self.clip_model, self.preprocess_clip = clip.load(clip_model_name, device="cpu")
         for param in self.clip_model.parameters():
-            param.requires_grad = False  # ❄️ 冻结参数
+            param.requires_grad = False
             
-        # 3. 初始化 提示生成器 (你的新心脏！可训练)
-        # 它负责把 SAM 的图和 CLIP 的文结合起来
+        # 2. 初始化 提示生成器 (我们刚刚修改过的双通道生成器)
         self.prompt_generator = TextGuidedPointGenerator(
-            embed_dim=embed_dim, # 256
-            text_dim=text_dim    # 512
+            embed_dim=embed_dim,
+            text_dim=text_dim
         )
 
     def forward(self, batched_input, multimask_output=False):
-        """
-        重写的前向传播：
-        输入 (图 + 文) -> 生成器 -> 坐标 -> SAM -> Mask
-        """
-        # --- A. 图像编码 (SAM 原生) ---
-        # input_images: [B, 3, 1024, 1024]
+        # --- A. 图像编码 ---
+        # 预处理图片并计算 Image Embeddings
         processed_images = [self.preprocess_input(x["image"]) for x in batched_input]
         input_images = torch.stack(processed_images).to(self.device)
-        
-        # image_embeddings: [B, 256, 64, 64]
-        # 这是 SAM 提取的高层视觉特征
-        image_embeddings = self.image_encoder(input_images)
+        image_embeddings = self.image_encoder(input_images) # [B, 256, 64, 64]
 
-        # --- B. 文本编码 (CLIP) ---
-        # 提取 batch 里的文本列表，例如 ["kidney cell", "liver cell"]
-        text_lists = [x.get("text_prompts", ["cell"]) for x in batched_input]
+        # --- B. 构造双向文本 (Bi-directional Text Construction) ---
+        # 强制构造 [Nuclei, Background] 语义对
+        # 这里的 "Nuclei" 对应 Channel 0 (正样本), "Background" 对应 Channel 1 (负样本)
+        B = len(batched_input)
+        bi_prompts = ["Nuclei", "Background"] 
         
-        # 将列表转为字符串 (简单拼接)
-        joined_texts = [", ".join(t) if isinstance(t, list) else t for t in text_lists]
-        
-        with torch.no_grad(): # CLIP 不参与梯度计算
-            # 1. Tokenize (文本转数字)
-            text_tokens = clip.tokenize(joined_texts, truncate=True).to(self.device)
-            # 2. Encode (数字转向量) -> [B, 512]
-            text_features = self.clip_model.encode_text(text_tokens)
-            # 3. Normalize (归一化是 CLIP 的标准操作)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            text_features = text_features.float() # 确保精度匹配
+        # 使用 CLIP 编码文本
+        text_tokens = clip.tokenize(bi_prompts).to(self.device) # [2, 77]
+        with torch.no_grad():
+            text_features_proto = self.clip_model.encode_text(text_tokens) # [2, 512]
+            text_features_proto = text_features_proto / text_features_proto.norm(dim=-1, keepdim=True)
+            text_features_proto = text_features_proto.float()
+            # 扩展到 Batch 维度: [B, 2, 512]
+            text_features = text_features_proto.unsqueeze(0).repeat(B, 1, 1)
 
-        # --- C. 提示生成 (End-to-End Core) ---
-        # 这里发生了关键的“对齐”和“融合”
-        # heatmap_logits: [B, 1, 64, 64]
+        # --- C. 提示生成 (Generator Forward) ---
+        # 生成双通道热力图: [B, 2, 64, 64]
         heatmap_logits = self.prompt_generator(image_embeddings, text_features)
         
-        # 软坐标提取 (Soft-Argmax) -> 结果是 Feature Map 尺度 (0~64)
-        # coords_in_feature: [B, 1, 2] -> (x, y)
-        coords_in_feature = self.prompt_generator.get_coordinates_differentiable(heatmap_logits)
+        # 提取点: 每个通道提取最强点 (Top-1)
+        # points_in_feat: [B, 2, 2] (坐标)
+        # point_labels:   [B, 2]    (1 for Nuclei, 0 for Background)
+        points_in_feat, point_labels = self.prompt_generator.get_points_from_heatmap(heatmap_logits, topk=1)
         
-        # --- D. 坐标映射 (Feature Map -> Image) ---
-        # SAM 的 Prompt Encoder 需要原图尺度的坐标 (0~1024)
-        # 比例 = 1024 / 64 = 16
+        # --- D. 坐标映射 (Feature Map -> Image Size) ---
+        # 从 64x64 映射回 1024x1024 (Scale factor usually 16)
         scale_factor = input_images.shape[-1] / image_embeddings.shape[-1]
-        point_coords = coords_in_feature * scale_factor
-        
-        # 构造 Labels: 1 表示前景点 (Positive Prompt)
-        point_labels = torch.ones(point_coords.shape[0], 1, device=self.device)
+        point_coords = points_in_feat * scale_factor
 
-        # --- E. SAM 解码 (原生逻辑) ---
-        # 将生成的点送入 SAM
+        # --- E. SAM 解码 ---
+        # 将提取到的正负点混合喂给 Prompt Encoder
+        # SAM 会自动处理 Label=0 的点作为"排除区域"
         sparse_embeddings, dense_embeddings = self.prompt_encoder(
             points=(point_coords, point_labels),
             boxes=None,
             masks=None,
         )
         
-        # 生成 Mask
         low_res_masks, iou_predictions = self.mask_decoder(
             image_embeddings=image_embeddings,
             image_pe=self.prompt_encoder.get_dense_pe(),
@@ -335,7 +317,7 @@ class TextSam(Sam):
         # --- F. 结果封装 ---
         outputs = []
         for i in range(len(batched_input)):
-            # 后处理：调整 mask 尺寸回原始尺寸
+            # 后处理 Mask 到原始尺寸
             mask_post = self.postprocess_masks(
                 low_res_masks[i],
                 input_size=input_images.shape[-2:],
@@ -343,20 +325,18 @@ class TextSam(Sam):
             )
             
             out_dict = {
-                "masks": mask_post,                 # 最终分割结果
+                "masks": mask_post,
                 "iou_predictions": iou_predictions[i],
-                "low_res_masks": low_res_masks[i],  #用于计算 Dice Loss
-                "heatmap_logits": heatmap_logits[i] # ✅ 重点：返回热力图用于辅助 Loss
+                "low_res_masks": low_res_masks[i],
+                "heatmap_logits": heatmap_logits[i] # 关键：返回用于 Loss 计算
             }
             outputs.append(out_dict)
             
         return outputs
 
-    # 复用父类的预处理函数
     def preprocess_input(self, x: torch.Tensor) -> torch.Tensor:
-        # Normalize colors
+        # 辅助函数：对输入图像进行归一化和 Padding
         x = (x - self.pixel_mean) / self.pixel_std
-        # Pad
         h, w = x.shape[-2:]
         padh = self.image_encoder.img_size - h
         padw = self.image_encoder.img_size - w
