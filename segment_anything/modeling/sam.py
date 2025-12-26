@@ -1,27 +1,17 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import torch
 from torch import nn
 from torch.nn import functional as F
-
 from typing import Any, Dict, List, Tuple, Optional
-
 from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
 from .pnurl import PNuRL
-
-# =============================================================================
-# [新增] 引入依赖库
-# =============================================================================
 import sys
 import os
 
-# 1. 尝试导入 CLIP
 try:
     import clip
 except ImportError:
@@ -29,9 +19,8 @@ except ImportError:
     try:
         import clip
     except ImportError:
-        print("⚠️ Warning: CLIP not found. Text encoder will fail.")
+        print("⚠️ Warning: CLIP not found.")
 
-# 2. 尝试导入 Prompt Generator
 try:
     from prompt_generator import TextGuidedPointGenerator
 except ImportError:
@@ -40,7 +29,6 @@ except ImportError:
         from prompt_generator import TextGuidedPointGenerator
     except ImportError:
         print("⚠️ Warning: prompt_generator.py not found.")
-
 
 class Sam(nn.Module):
     mask_threshold: float = 0.0
@@ -145,6 +133,7 @@ class Sam(nn.Module):
         return masks
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        # [Fix] 这里的归一化是必要的，但必须确保输入是 0-255 的 Tensor
         x = (x - self.pixel_mean) / self.pixel_std
         h, w = x.shape[-2:]
         padh = self.image_encoder.img_size - h
@@ -153,16 +142,7 @@ class Sam(nn.Module):
         return x
 
 
-# =============================================================================
-# [新增] TextSam 类 (End-to-End Multi-modal SAM)
-# =============================================================================
-# =============================================================================
-# [新增] TextSam 类 (End-to-End Multi-modal SAM)
-# =============================================================================
 class TextSam(Sam):
-    """
-    支持双向语义引导（Bi-directional Semantic Prompting）的 SAM 变体。
-    """
     def __init__(
         self, 
         image_encoder, 
@@ -176,8 +156,6 @@ class TextSam(Sam):
     ):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
         
-        # 1. 初始化 CLIP (加载并缓存特征，节省显存)
-        # ... (保持原样) ...
         print(f"Loading CLIP model: {clip_model_name}...")
         clip_model, _ = clip.load(clip_model_name, device="cpu")
         bi_prompts = ["Nuclei", "Background"]
@@ -189,50 +167,48 @@ class TextSam(Sam):
         self.register_buffer("text_features_static", text_features.unsqueeze(0)) 
         del clip_model 
 
-        # 2. 初始化 Prompt Generator
         self.prompt_generator = TextGuidedPointGenerator(
             embed_dim=embed_dim,
             text_dim=text_dim
         )
         
-        # 3. ❄️ 精细化冻结策略 (The Fine-grained Freeze Strategy) ❄️
-        
-        # A. 首先，冻结 SAM 的所有参数 (保护 ViT 骨干)
+        # 冻结策略
         for param in self.image_encoder.parameters(): param.requires_grad = False
         for param in self.prompt_encoder.parameters(): param.requires_grad = False
-        
-        # B. 解冻 Mask Decoder (必须训练，否则无法理解新的 Prompt)
         for param in self.mask_decoder.parameters(): param.requires_grad = True
         
-        # C. 【关键】解冻 Adapter！让随机初始化的层可以被训练
-        # 我们遍历 image_encoder，只解冻名字里带 "Adapter" 的层
+        # 解冻 Adapter
         adapter_count = 0
         for name, param in self.image_encoder.named_parameters():
             if "Adapter" in name:
                 param.requires_grad = True
                 adapter_count += 1
-        
-        print(f"✅ TextSam Strategy: ViT Backbone Frozen | {adapter_count} Adapter Layers Unfrozen for Training.")
+        print(f"✅ TextSam Initialized: {adapter_count} Adapter Layers Unfrozen.")
 
     def forward(self, batched_input, multimask_output=False):
         # 1. 图像编码
+        # 注意：这里的 input_images 是 padding 后的（例如 1024x1024）
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         image_embeddings = self.image_encoder(input_images) 
 
-        # 2. 准备文本特征
+        # 2. 文本特征
         B = len(batched_input)
         text_features = self.text_features_static.expand(B, -1, -1) 
 
-        # 3. 生成热力图
+        # 3. 热力图
         heatmap_logits = self.prompt_generator(image_embeddings, text_features)
         
-        # 4. 提取点
+        # 4. 提取点 (Feature Map Scale)
         points_in_feat, point_labels = self.prompt_generator.get_points_from_heatmap(heatmap_logits, topk=1)
         
-        # 5. 坐标映射 (Feature Map -> Image Size)
-        # [Fix] 修复坐标不匹配问题
-        feat_size = image_embeddings.shape[-1] # 64
-        input_size = input_images.shape[-1]    # 256 (or 1024)
+        # 5. 坐标映射 (Feature Map -> Image Scale)
+        # [CRITICAL FIX]
+        # 特征图大小: 64
+        feat_size = image_embeddings.shape[-1] 
+        # 输入图大小: 1024 (ImageEncoderViT 的默认输入尺寸)
+        input_size = self.image_encoder.img_size 
+        
+        # 计算缩放倍率 (1024 / 64 = 16)
         scale_factor = input_size / feat_size
         
         # 映射坐标并居中
@@ -256,8 +232,7 @@ class TextSam(Sam):
         # 7. 结果封装
         outputs = []
         for i in range(len(batched_input)):
-            # 后处理 Mask 到原始尺寸
-            # 注意：这里我们要用 batched_input 里的原始尺寸，而不是 padding 后的 input_images 尺寸
+            # 后处理: 还原到原始图片的实际大小 (例如 256x256)
             mask_post = self.postprocess_masks(
                 low_res_masks[i],
                 input_size=batched_input[i]["image"].shape[-2:], 

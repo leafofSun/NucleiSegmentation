@@ -1,29 +1,23 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from typing import Optional, Tuple, Type
-
 from .common import LayerNorm2d, MLPBlock
 
-# Optional CLIP import
 try:
     import clip as _clip
 except Exception:
     _clip = None
 
 class Adapter_Layer(nn.Module):
-    def __init__(self, embed_dim, mlp_ratio=0.25, norm_layer = nn.LayerNorm, skip_connect=True):
+    def __init__(self, embed_dim, mlp_ratio=0.25, norm_layer=nn.LayerNorm, skip_connect=True):
         super().__init__()
-        self.skip_connect = skip_connect
+        # [关键] 移除 skip_connect 和 norm，Adapter 只输出增量
         hidden_dim = int(embed_dim * mlp_ratio)
-        self.norm = norm_layer(embed_dim)
+        
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.channel = nn.Sequential(
                 nn.Linear(embed_dim, hidden_dim, bias=False),
@@ -36,7 +30,7 @@ class Adapter_Layer(nn.Module):
                 nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1, bias=False),
                 nn.ReLU(),
                 nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=4, stride=2, padding=1, bias=False),
-                # [关键修改 1] 移除了这里的 nn.ReLU()！确保 Adapter 分支是线性的，可以输出负值
+                # [关键] 移除末端 ReLU，保持线性，允许输出负值
         )
         
         # 基础权重初始化 (Kaiming Init)
@@ -44,47 +38,35 @@ class Adapter_Layer(nn.Module):
             if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
 
-        # [关键修改 2] 零初始化 (Zero Initialization)
-        # 这一点至关重要！
-        # 将 Spatial 分支最后一层卷积的权重设为 0 -> 初始 Spatial Adapter 输出为 0
+        # [关键] 零初始化 - 确保初始状态为 Identity Mapping
+        # Spatial 分支最后一层权重为 0 -> x_spatial = 0
         nn.init.zeros_(self.spatial[2].weight)
-        # 将 Channel 分支最后一层线性的权重设为 0 -> 初始 Channel Adapter 输出为 0 (Sigmoid前)
-        # 注意：这里我们初始化 Linear 层权重为 0，这会让 Sigmoid 输入接近 0，输出接近 0.5。
-        # 对于 Channel Attention (x * sigmoid)，初始 scaling 是 0.5。
-        # 为了更彻底的 Identity Mapping，我们可以让 Channel 分支不起作用，或者接受 0.5 的 scaling。
-        # 但最关键的是 Spatial 分支必须为 0，因为它直接加在特征上。
-        nn.init.zeros_(self.channel[2].weight) 
-        # 为了让 Channel Attention 初始也接近 Identity，我们可以让最后一个 Linear 偏置为负大数，或者简单地让它初始化为 0 也没问题，
-        # 因为 Spatial 分支是主要干扰源 (加法噪音)。
+        # Channel 分支：虽然 Sigmoid(0)=0.5，但通过负偏置可以让输出接近 1
+        # 或者接受 0.5 的 scaling（影响较小，因为 spatial 输出为 0）
+        nn.init.zeros_(self.channel[2].weight)
+        # [可选] 让 channel 分支的最后一个 Linear 输出接近 0，使得 Sigmoid 输入为负大数，输出接近 0
+        # 但为了简化，我们接受 0.5 的 scaling，因为关键的是 spatial 分支必须为 0
                 
     def forward(self, x):
-        # x shape: (B, H, W, C)
-        # Permute to (B, C, H, W) for Conv layers
+        # x: (B, H, W, C) -> (B, C, H, W)
         x = x.permute(0,3,1,2)
         B, C, H_orig, W_orig = x.size()
         
         # Channel Attention
-        # 这里的 view 操作要小心，确保维度匹配
-        x_avg = self.avg_pool(x).view(B, C)
-        x_channel_attn = self.channel(x_avg).view(B, C, 1, 1)
-        x_channel = x_channel_attn * x
+        x_channel = self.channel(self.avg_pool(x).view(B, C)).view(B, C, 1, 1) * x
         
         # Spatial Adapter
         x_spatial = self.spatial(x_channel)
         
-        # 尺寸对齐 (防止 Conv/ConvT 带来的尺寸微小变化)
         if x_spatial.shape[2] != H_orig or x_spatial.shape[3] != W_orig:
             x_spatial = F.interpolate(x_spatial, size=(H_orig, W_orig), mode='bilinear', align_corners=False)
         
-        # Residual Connection
-        if self.skip_connect:
-            x = x + x_spatial
-        else:
-            x = x_spatial
-            
-        # Permute back to (B, H, W, C)
-        x = x.permute(0,2,3,1)
-        return self.norm(x)
+        # [关键修改] 直接返回增量 x_spatial (B, C, H, W)
+        # 不要加回 x，也不要做 Norm，让 Block 去处理加法
+        
+        # (B, C, H, W) -> (B, H, W, C)
+        x_spatial = x_spatial.permute(0,2,3,1)
+        return x_spatial 
     
 
 class ImageEncoderViT(nn.Module):
@@ -106,10 +88,10 @@ class ImageEncoderViT(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         global_attn_indexes: Tuple[int, ...] = (),
-        adapter_train = False
-        , use_clip: bool = False
-        , clip_model_name: str = "ViT-B/16"
-        , clip_pretrained: bool = True
+        adapter_train = False,
+        use_clip: bool = False,
+        clip_model_name: str = "ViT-B/16",
+        clip_pretrained: bool = True
     ) -> None:
         super().__init__()
         self.use_clip = use_clip
@@ -127,7 +109,6 @@ class ImageEncoderViT(nn.Module):
         if self.use_clip:
             if _clip is None:
                 raise ImportError("clip not installed")
-            # Load CLIP to CPU initially to save GPU memory if needed, or move later
             self.clip, _ = _clip.load(self.clip_model_name, device="cpu", jit=False)
 
         self.pos_embed: Optional[nn.Parameter] = None
@@ -161,7 +142,6 @@ class ImageEncoderViT(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # CLIP path
         if self.use_clip:
             visual = self.clip.visual
             x_conv = visual.conv1(x)
@@ -194,11 +174,9 @@ class ImageEncoderViT(nn.Module):
             x = self.neck(x_patches.permute(0, 3, 1, 2))
             return x
 
-        # Standard SAM ViT path
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             B, H, W, C = x.shape
-            # Handle pos_embed resizing if input size is different
             pos_embed = self.pos_embed
             if pos_embed.shape[1] != H or pos_embed.shape[2] != W:
                 pos_embed = pos_embed.permute(0, 3, 1, 2)
@@ -223,6 +201,7 @@ class Block(nn.Module):
         self.mlp = MLPBlock(embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer)
         self.window_size = window_size
         if self.adapter:
+            # [关键] Adapter 不需要 Norm Layer，它只是一个加法分支
             self.Adapter = Adapter_Layer(dim)
 
     def forward(self, x):
@@ -236,10 +215,11 @@ class Block(nn.Module):
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
         x = shortcut + x
         
-        # Adapter Logic
+        # [关键] Parallel Adapter Structure
         if self.adapter:
             x_norm = self.norm2(x)
-            # Add adapter output to the MLP output
+            # x_new = x + MLP(Norm(x)) + Adapter(Norm(x))
+            # Adapter 必须初始化为 0，这样初始状态下 x_new = x + MLP(Norm(x))，完全等同于原始 ViT
             x = x + self.mlp(x_norm) + self.Adapter(x_norm)
         else:
             x = x + self.mlp(self.norm2(x))
