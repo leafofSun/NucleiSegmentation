@@ -10,6 +10,7 @@ import numpy as np
 import datetime
 import logging
 from collections import defaultdict
+import cv2  # [新增] 用于Resize
 
 # === Imports ===
 from DataLoader import TrainingDataset, stack_dict_batched
@@ -82,6 +83,8 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                     pred_mask = out['masks'][0, :, :]
                 
                 gt_mask = labels[i].float()
+                
+                # [Training Fix] 训练时已经处理了尺寸不匹配问题
                 if pred_mask.shape != gt_mask.shape[-2:]:
                     gt_mask = F.interpolate(gt_mask.unsqueeze(0), size=pred_mask.shape[-2:], mode='nearest').squeeze(0)
 
@@ -140,7 +143,7 @@ def validate_one_epoch(args, model, val_loader, epoch):
     
     for batch, batched_input in enumerate(pbar):
         images = batched_input['image'].to(args.device)
-        labels = batched_input['label'].detach().cpu().numpy() # GT
+        labels = batched_input['label'].detach().cpu().numpy() # GT [B, 1, 256, 256]
         
         sam_input = []
         for i in range(len(images)):
@@ -161,11 +164,19 @@ def validate_one_epoch(args, model, val_loader, epoch):
                 logit = out['masks'][0, :, :]
             
             prob = torch.sigmoid(logit).cpu().numpy()
-            pred_mask = (prob > 0.5).astype(np.uint8)
-            pred_list.append(pred_mask)
+            pred_mask = (prob > 0.5).astype(np.uint8) # 可能为原始尺寸 (e.g., 1000x1000)
             
+            # 处理 GT
             gt = labels[i]
-            if gt.ndim == 3: gt = gt[0]
+            if gt.ndim == 3: gt = gt[0] # [256, 256]
+            
+            # === [Validation Fix] 强制对齐尺寸 ===
+            # 因为 GT 已经被 DataLoader 缩放到 256x256 了，所以预测值也要缩放
+            if pred_mask.shape != gt.shape:
+                pred_mask = cv2.resize(pred_mask, (gt.shape[1], gt.shape[0]), interpolation=cv2.INTER_NEAREST)
+            # ===================================
+
+            pred_list.append(pred_mask)
             gt_list.append(gt)
 
         pred_batch = np.array(pred_list) 
@@ -176,6 +187,8 @@ def validate_one_epoch(args, model, val_loader, epoch):
             for k, v in batch_res.items():
                 val_metrics[k].append(v)
         except Exception as e:
+            # 打印错误，不再默默忽略
+            print(f"[Metric Error] Batch {batch}: {e}")
             pass 
             
     avg_results = {k: np.mean(v) for k, v in val_metrics.items() if len(v) > 0}

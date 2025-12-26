@@ -15,6 +15,32 @@ from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
 from .pnurl import PNuRL
 
+# =============================================================================
+# [新增] 引入依赖库
+# =============================================================================
+import sys
+import os
+
+# 1. 尝试导入 CLIP
+try:
+    import clip
+except ImportError:
+    sys.path.append(os.path.join(os.path.dirname(__file__), "../../../CLIP")) 
+    try:
+        import clip
+    except ImportError:
+        print("⚠️ Warning: CLIP not found. Text encoder will fail.")
+
+# 2. 尝试导入 Prompt Generator
+try:
+    from prompt_generator import TextGuidedPointGenerator
+except ImportError:
+    sys.path.append(os.path.join(os.path.dirname(__file__), "../../.."))
+    try:
+        from prompt_generator import TextGuidedPointGenerator
+    except ImportError:
+        print("⚠️ Warning: prompt_generator.py not found.")
+
 
 class Sam(nn.Module):
     mask_threshold: float = 0.0
@@ -32,18 +58,6 @@ class Sam(nn.Module):
         use_coop_prompt: bool = False,
         coop_config: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        SAM predicts object masks from an image and input prompts.
-
-        Arguments:
-          image_encoder (ImageEncoderViT): The backbone used to encode the
-            image into image embeddings that allow for efficient mask prediction.
-          prompt_encoder (PromptEncoder): Encodes various types of input prompts.
-          mask_decoder (MaskDecoder): Predicts masks from the image embeddings
-            and encoded prompts.
-          pixel_mean (list(float)): Mean values for normalizing pixels in the input image.
-          pixel_std (list(float)): Std values for normalizing pixels in the input image.
-        """
         super().__init__()
         self.image_encoder = image_encoder
         self.prompt_encoder = prompt_encoder
@@ -53,9 +67,7 @@ class Sam(nn.Module):
         self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
         
-        # 初始化 PNuRL 模块
         if self.use_pnurl and pnurl_config is not None:
-            # PNuRL 期望的 feat_dim 通常为 256 (与 prompt_encoder.embed_dim 一致)
             self.pnurl = PNuRL(
                 feat_dim=prompt_encoder.embed_dim,
                 embed_dim=prompt_encoder.embed_dim,
@@ -63,7 +75,6 @@ class Sam(nn.Module):
                 num_classes_per_attr=pnurl_config.get('num_classes_per_attr', [3, 5, 4, 3, 3]),
                 attr_loss_weight=pnurl_config.get('attr_loss_weight', 1.0)
             )
-            # 初始化 prompt_encoder 的 text_projection（用于 PNuRL 的 learnable_context）
             if self.prompt_encoder.text_projection is None:
                 self.prompt_encoder.text_projection = nn.Linear(prompt_encoder.embed_dim, prompt_encoder.embed_dim)
         else:
@@ -79,45 +90,6 @@ class Sam(nn.Module):
         batched_input: List[Dict[str, Any]],
         multimask_output: bool,
     ) -> List[Dict[str, torch.Tensor]]:
-        """
-        Predicts masks end-to-end from provided images and prompts.
-        If prompts are not known in advance, using SamPredictor is
-        recommended over calling the model directly.
-
-        Arguments:
-          batched_input (list(dict)): A list over input images, each a
-            dictionary with the following keys. A prompt key can be
-            excluded if it is not present.
-              'image': The image as a torch tensor in 3xHxW format,
-                already transformed for input to the model.
-              'original_size': (tuple(int, int)) The original size of
-                the image before transformation, as (H, W).
-              'point_coords': (torch.Tensor) Batched point prompts for
-                this image, with shape BxNx2. Already transformed to the
-                input frame of the model.
-              'point_labels': (torch.Tensor) Batched labels for point prompts,
-                with shape BxN.
-              'boxes': (torch.Tensor) Batched box inputs, with shape Bx4.
-                Already transformed to the input frame of the model.
-              'mask_inputs': (torch.Tensor) Batched mask inputs to the model,
-                in the form Bx1xHxW.
-          multimask_output (bool): Whether the model should predict multiple
-            disambiguating masks, or return a single mask.
-
-        Returns:
-          (list(dict)): A list over input images, where each element is
-            as dictionary with the following keys.
-              'masks': (torch.Tensor) Batched binary mask predictions,
-                with shape BxCxHxW, where B is the number of input prompts,
-                C is determined by multimask_output, and (H, W) is the
-                original size of the image.
-              'iou_predictions': (torch.Tensor) The model's predictions
-                of mask quality, in shape BxC.
-              'low_res_logits': (torch.Tensor) Low resolution logits with
-                shape BxCxHxW, where H=W=256. Can be passed as mask input
-                to subsequent iterations of prediction.
-        """
-
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         image_embeddings = self.image_encoder(input_images)
 
@@ -160,21 +132,6 @@ class Sam(nn.Module):
         input_size: Tuple[int, ...],
         original_size: Tuple[int, ...],
     ) -> torch.Tensor:
-        """
-        Remove padding and upscale masks to the original image size.
-
-        Arguments:
-          masks (torch.Tensor): Batched masks from the mask_decoder,
-            in BxCxHxW format.
-          input_size (tuple(int, int)): The size of the image input to the
-            model, in (H, W) format. Used to remove padding.
-          original_size (tuple(int, int)): The original size of the image
-            before resizing for input to the model, in (H, W) format.
-
-        Returns:
-          (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
-            is given by original_size.
-        """
         if masks.dim() == 3:
           masks = masks.unsqueeze(0)
         masks = F.interpolate(
@@ -188,147 +145,129 @@ class Sam(nn.Module):
         return masks
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize pixel values and pad to a square input."""
-        # Normalize colors
         x = (x - self.pixel_mean) / self.pixel_std
-        # Pad
         h, w = x.shape[-2:]
         padh = self.image_encoder.img_size - h
         padw = self.image_encoder.img_size - w
         x = F.pad(x, (0, padw, 0, padh))
         return x
 
-# =============================================================================
-# [新增] 引入依赖库
-# =============================================================================
-import torch.nn as nn
-import sys
-import os
-
-# 1. 尝试导入 CLIP
-try:
-    import clip
-except ImportError:
-    # 如果环境里没装，尝试去上一级目录找 (假设你把 CLIP 放到了项目旁边的文件夹)
-    sys.path.append(os.path.join(os.path.dirname(__file__), "../../../CLIP")) 
-    try:
-        import clip
-    except ImportError:
-        print("⚠️ Warning: CLIP not found. Text encoder will fail.")
-
-# 2. 尝试导入你的 Prompt Generator
-# 假设 prompt_generator.py 放在项目根目录
-try:
-    from prompt_generator import TextGuidedPointGenerator
-except ImportError:
-    # 这一步是为了让 python 能找到根目录下的 prompt_generator
-    sys.path.append(os.path.join(os.path.dirname(__file__), "../../.."))
-    try:
-        from prompt_generator import TextGuidedPointGenerator
-    except ImportError:
-        print("⚠️ Warning: prompt_generator.py not found. Please check file path.")
 
 # =============================================================================
 # [新增] TextSam 类 (End-to-End Multi-modal SAM)
 # =============================================================================
+# =============================================================================
+# [新增] TextSam 类 (End-to-End Multi-modal SAM)
+# =============================================================================
 class TextSam(Sam):
+    """
+    支持双向语义引导（Bi-directional Semantic Prompting）的 SAM 变体。
+    """
     def __init__(
         self, 
         image_encoder, 
         prompt_encoder, 
-        mask_decoder, 
-        clip_model_name="ViT-B/16", 
-        text_dim=512, 
+        mask_decoder,
+        pixel_mean=[123.675, 116.28, 103.53],
+        pixel_std=[58.395, 57.12, 57.375],
+        clip_model_name="ViT-B/16",
+        text_dim=512,
         embed_dim=256
     ):
-        super().__init__(image_encoder, prompt_encoder, mask_decoder)
+        super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
         
-        # 冻结 SAM 参数
-        for param in self.parameters():
-            param.requires_grad = False
-            
-        # 解冻 Mask Decoder
-        for param in self.mask_decoder.parameters():
-            param.requires_grad = True
-            
-        self.prompt_generator = TextGuidedPointGenerator(embed_dim=embed_dim, text_dim=text_dim)
-        
-        # 加载 CLIP (Dummy embedding for simplicity if not using real text)
-        # 这里假设 prompt_generator 内部已经处理好了，或者我们传入固定的 embedding
-        # 为了简化，我们在 forward 里生成 dummy text embedding
-        self.register_buffer("text_embedding", torch.randn(1, 2, text_dim)) # [1, N_Class, Dim]
+        # 1. 初始化 CLIP (加载并缓存特征，节省显存)
+        # ... (保持原样) ...
+        print(f"Loading CLIP model: {clip_model_name}...")
+        clip_model, _ = clip.load(clip_model_name, device="cpu")
+        bi_prompts = ["Nuclei", "Background"]
+        text_tokens = clip.tokenize(bi_prompts)
+        with torch.no_grad():
+            text_features = clip_model.encode_text(text_tokens)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            text_features = text_features.float()
+        self.register_buffer("text_features_static", text_features.unsqueeze(0)) 
+        del clip_model 
 
-    def forward(self, batched_input, multimask_output=True):
-        # 1. Image Encoder
-        input_images = torch.stack([x["image"] for x in batched_input], dim=0)
-        # input_images is [B, 3, 256, 256] (0-255)
+        # 2. 初始化 Prompt Generator
+        self.prompt_generator = TextGuidedPointGenerator(
+            embed_dim=embed_dim,
+            text_dim=text_dim
+        )
         
-        input_images_processed = self.preprocess(input_images)
-        image_embeddings = self.image_encoder(input_images_processed) # [B, 256, 64, 64]
+        # 3. ❄️ 精细化冻结策略 (The Fine-grained Freeze Strategy) ❄️
         
-        # 2. Prompt Generator
-        # 使用 dummy text embedding (2 classes: nuclei, bg)
-        # 实际项目中应该传入真实的 CLIP embedding
+        # A. 首先，冻结 SAM 的所有参数 (保护 ViT 骨干)
+        for param in self.image_encoder.parameters(): param.requires_grad = False
+        for param in self.prompt_encoder.parameters(): param.requires_grad = False
+        
+        # B. 解冻 Mask Decoder (必须训练，否则无法理解新的 Prompt)
+        for param in self.mask_decoder.parameters(): param.requires_grad = True
+        
+        # C. 【关键】解冻 Adapter！让随机初始化的层可以被训练
+        # 我们遍历 image_encoder，只解冻名字里带 "Adapter" 的层
+        adapter_count = 0
+        for name, param in self.image_encoder.named_parameters():
+            if "Adapter" in name:
+                param.requires_grad = True
+                adapter_count += 1
+        
+        print(f"✅ TextSam Strategy: ViT Backbone Frozen | {adapter_count} Adapter Layers Unfrozen for Training.")
+
+    def forward(self, batched_input, multimask_output=False):
+        # 1. 图像编码
+        input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
+        image_embeddings = self.image_encoder(input_images) 
+
+        # 2. 准备文本特征
         B = len(batched_input)
-        text_embed = self.text_embedding.expand(B, -1, -1) # [B, 2, 512]
+        text_features = self.text_features_static.expand(B, -1, -1) 
+
+        # 3. 生成热力图
+        heatmap_logits = self.prompt_generator(image_embeddings, text_features)
         
-        heatmap_logits = self.prompt_generator(image_embeddings, text_embed)
+        # 4. 提取点
+        points_in_feat, point_labels = self.prompt_generator.get_points_from_heatmap(heatmap_logits, topk=1)
         
-        # 3. Get Points from Heatmap
-        points, labels = self.prompt_generator.get_points_from_heatmap(heatmap_logits, topk=1)
-        # points shape: [B, K, 2], coordinates in Feature Map scale (e.g., 0-64)
+        # 5. 坐标映射 (Feature Map -> Image Size)
+        # [Fix] 修复坐标不匹配问题
+        feat_size = image_embeddings.shape[-1] # 64
+        input_size = input_images.shape[-1]    # 256 (or 1024)
+        scale_factor = input_size / feat_size
         
-        # === 🚨 CRITICAL FIX: Rescale Points to Input Image Size ===
-        # 特征图大小
-        feat_h, feat_w = image_embeddings.shape[-2:] # 64, 64
-        # 输入图片大小 (padding 前)
-        input_h, input_w = input_images.shape[-2:]   # 256, 256
+        # 映射坐标并居中
+        point_coords = (points_in_feat * scale_factor) + (scale_factor * 0.5)
+
+        # 6. SAM 解码
+        sparse_embeddings, dense_embeddings = self.prompt_encoder(
+            points=(point_coords, point_labels),
+            boxes=None,
+            masks=None,
+        )
         
-        # 计算缩放比例
-        scale_x = input_w / feat_w
-        scale_y = input_h / feat_h
+        low_res_masks, iou_predictions = self.mask_decoder(
+            image_embeddings=image_embeddings,
+            image_pe=self.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=multimask_output,
+        )
         
-        # 映射坐标到原图尺度 (并加 0.5 居中)
-        points_rescaled = points.clone()
-        points_rescaled[:, :, 0] = points[:, :, 0] * scale_x + (scale_x / 2)
-        points_rescaled[:, :, 1] = points[:, :, 1] * scale_y + (scale_y / 2)
-        # ==========================================================
-        
+        # 7. 结果封装
         outputs = []
-        for i, curr_embedding in enumerate(image_embeddings):
-            # 构造 SAM 需要的点提示格式 (B, N, 2)
-            # points_rescaled[i] is [K, 2]
-            point_coords = points_rescaled[i].unsqueeze(0) # [1, K, 2]
-            point_labels = labels[i].unsqueeze(0)          # [1, K]
-            
-            sparse_embeddings, dense_embeddings = self.prompt_encoder(
-                points=(point_coords, point_labels),
-                boxes=None,
-                masks=None,
-            )
-            
-            low_res_masks, iou_predictions = self.mask_decoder(
-                image_embeddings=curr_embedding.unsqueeze(0),
-                image_pe=self.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=multimask_output,
-            )
-            
-            # Postprocess
-            # input_size should be the size before padding, i.e., 256x256
-            input_size = batched_input[i]["image"].shape[-2:]
-            original_size = batched_input[i]["original_size"]
-            
-            masks = self.postprocess_masks(
-                low_res_masks,
-                input_size=input_size,
-                original_size=original_size,
+        for i in range(len(batched_input)):
+            # 后处理 Mask 到原始尺寸
+            # 注意：这里我们要用 batched_input 里的原始尺寸，而不是 padding 后的 input_images 尺寸
+            mask_post = self.postprocess_masks(
+                low_res_masks[i],
+                input_size=batched_input[i]["image"].shape[-2:], 
+                original_size=batched_input[i]["original_size"],
             )
             
             outputs.append({
-                "masks": masks,
-                "iou_predictions": iou_predictions,
+                "masks": mask_post,
+                "iou_predictions": iou_predictions[i],
+                "low_res_masks": low_res_masks[i],
                 "heatmap_logits": heatmap_logits[i].unsqueeze(0)
             })
             
