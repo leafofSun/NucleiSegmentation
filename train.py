@@ -76,32 +76,27 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             
             for i, out in enumerate(outputs):
                 # A. Segmentation Mask Loss
-                # 取最确定的 mask (index 0)
                 if out['masks'].ndim == 4:
                     pred_mask = out['masks'][0, 0, :, :] 
                 else:
                     pred_mask = out['masks'][0, :, :]
                 
                 gt_mask = labels[i].float()
-                # 尺寸对齐
                 if pred_mask.shape != gt_mask.shape[-2:]:
                     gt_mask = F.interpolate(gt_mask.unsqueeze(0), size=pred_mask.shape[-2:], mode='nearest').squeeze(0)
 
                 pred_iou = out['iou_predictions'][0]
                 
-                # Mask Loss (Dice + BCE)
                 loss_m = criterion(pred_mask.unsqueeze(0).unsqueeze(0), gt_mask.unsqueeze(0), pred_iou.unsqueeze(0))
                 
-                # B. Heatmap Loss (Semantic Guidance)
-                pred_heatmap = out['heatmap_logits'] # [2, 64, 64]
+                # B. Heatmap Loss
+                pred_heatmap = out['heatmap_logits'] 
                 current_feat_size = pred_heatmap.shape[-2:] 
                 
-                # 动态生成 GT Heatmap
                 with torch.no_grad():
                     gt_nuclei = F.interpolate(labels[i].float().unsqueeze(0), size=current_feat_size, mode='nearest').squeeze(0)
                     gt_background = 1.0 - gt_nuclei
 
-                # Channel 0: Nuclei, Channel 1: Background
                 loss_h_pos = point_guidance_loss(pred_heatmap[0:1].unsqueeze(0), gt_nuclei.unsqueeze(0))
                 loss_h_neg = point_guidance_loss(pred_heatmap[1:2].unsqueeze(0), gt_background.unsqueeze(0))
                 loss_h = loss_h_pos + loss_h_neg
@@ -181,7 +176,7 @@ def validate_one_epoch(args, model, val_loader, epoch):
             for k, v in batch_res.items():
                 val_metrics[k].append(v)
         except Exception as e:
-            pass # 忽略单个 batch 的计算错误
+            pass 
             
     avg_results = {k: np.mean(v) for k, v in val_metrics.items() if len(v) > 0}
     return avg_results
@@ -192,7 +187,7 @@ def main(args):
     logger = get_logger(os.path.join(args.work_dir, "logs", f"{args.run_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.log"))
     logger.info(f"Args: {args}")
 
-    # 1. Dataset (全量训练策略)
+    # 1. Dataset (Full Data)
     train_dataset = TrainingDataset(
         args.data_path, 
         image_size=args.image_size, 
@@ -203,7 +198,6 @@ def main(args):
         attribute_info_path=args.attribute_info_path 
     )
     
-    # 验证集复用测试数据
     val_dataset = TrainingDataset(
         args.data_path, 
         image_size=args.image_size, 
@@ -225,7 +219,6 @@ def main(args):
     
     if args.sam_checkpoint and os.path.exists(args.sam_checkpoint):
         try:
-            # 兼容 PyTorch 2.6+
             ckpt = torch.load(args.sam_checkpoint, map_location=args.device, weights_only=False)
         except TypeError:
             ckpt = torch.load(args.sam_checkpoint, map_location=args.device)
@@ -282,7 +275,7 @@ def main(args):
         
         logger.info(f"Ep {epoch+1} | Loss: {avg_loss:.4f} (M:{avg_msk:.3f} H:{avg_ht:.3f}) | Val Dice: {d:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}")
         
-        # Save Best by AJI
+        # Save Best
         if aji > best_aji:
             best_aji = aji
             save_path = os.path.join(args.work_dir, "models", args.run_name, "best_model.pth")

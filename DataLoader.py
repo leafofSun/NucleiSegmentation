@@ -39,9 +39,7 @@ class TrainingDataset(Dataset):
         self.requires_name = requires_name
         self.point_num = point_num
         self.mask_num = mask_num
-        # 移除 DataLoader 中的 Normalization 参数，交给模型处理
-        # self.pixel_mean = ... (Removed)
-        # self.pixel_std = ... (Removed)
+        # [Fix] 移除 DataLoader 中的 Normalization 参数，交给 SAM 模型处理
         self.data_path = data_path
         
         self.attribute_info = {}
@@ -147,19 +145,19 @@ class TrainingDataset(Dataset):
                     mask = mask_utils.decode(ann['segmentation'])
                     label = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST).astype(np.float32)
                 except:
+                    # Fallback to box mask
                     x1, y1, x2, y2 = boxes[0].int().tolist()
                     label[y1:y2, x1:x2] = 1.0
             elif 'bbox' in ann:
+                # No mask available, create rectangle mask from box
                 x1, y1, x2, y2 = boxes[0].int().tolist()
                 label[y1:y2, x1:x2] = 1.0
 
         return self._pack(image, label, boxes, (ori_h, ori_w), img_path)
 
     def _pack(self, image, label, boxes, ori_size, path):
-        # [核心修复] 移除这里的归一化！SAM 模型内部会自己做。
-        # image = (image - self.pixel_mean) / self.pixel_std  <-- 删除这行
-        
-        # 保持 0-255 范围，仅转为 Float Tensor
+        # [核心修复] 彻底移除了归一化操作！
+        # 保持 0-255，让 SAM 模型内部去处理
         image = torch.tensor(image).permute(2, 0, 1).float()
         
         if not isinstance(label, torch.Tensor): label = torch.tensor(label).float().unsqueeze(0)
@@ -181,7 +179,7 @@ class TestingDataset(Dataset):
     def __init__(self, data_path, image_size=256, mode='test', requires_name=True, point_num=1, return_ori_mask=True, prompt_path=None, attribute_info_path=None):
         self.image_size = image_size
         self.requires_name = requires_name
-        # 移除 Testing 中的 Normalization 参数
+        # [Fix] 移除 Normalization 参数
         self.data_path = data_path
         
         # 1. 尝试寻找 Legacy JSON
@@ -210,7 +208,7 @@ class TestingDataset(Dataset):
                 img_dir = os.path.join(data_path, 'Images')
                 if not os.path.exists(img_dir): img_dir = data_path
                 self.image_paths = sorted(glob.glob(os.path.join(img_dir, '*.png')) + glob.glob(os.path.join(img_dir, '*.tif')))
-                self.label_paths = [] 
+                self.label_paths = [] # 暂无Label
 
     def __len__(self):
         if self.dataset_type == 'sa1b': return len(self.json_files)
@@ -297,10 +295,8 @@ class TestingDataset(Dataset):
         return self._pack(image_resized, label_resized, boxes_tensor, original_size, img_path)
 
     def _pack(self, image, label, boxes, ori_size, path):
-        # [核心修复] 移除这里的归一化！
-        # 保持 0-255，让 SAM 模型内部去处理
+        # [核心修复] 移除归一化
         image = torch.tensor(image).permute(2, 0, 1).float()
-        
         label_tensor = torch.tensor(label).unsqueeze(0).float()
         
         sample = {
