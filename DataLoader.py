@@ -39,8 +39,9 @@ class TrainingDataset(Dataset):
         self.requires_name = requires_name
         self.point_num = point_num
         self.mask_num = mask_num
-        self.pixel_mean = [123.675, 116.28, 103.53]
-        self.pixel_std = [58.395, 57.12, 57.375]
+        # 移除 DataLoader 中的 Normalization 参数，交给模型处理
+        # self.pixel_mean = ... (Removed)
+        # self.pixel_std = ... (Removed)
         self.data_path = data_path
         
         self.attribute_info = {}
@@ -146,19 +147,21 @@ class TrainingDataset(Dataset):
                     mask = mask_utils.decode(ann['segmentation'])
                     label = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST).astype(np.float32)
                 except:
-                    # Fallback to box mask
                     x1, y1, x2, y2 = boxes[0].int().tolist()
                     label[y1:y2, x1:x2] = 1.0
             elif 'bbox' in ann:
-                # No mask available, create rectangle mask from box
                 x1, y1, x2, y2 = boxes[0].int().tolist()
                 label[y1:y2, x1:x2] = 1.0
 
         return self._pack(image, label, boxes, (ori_h, ori_w), img_path)
 
     def _pack(self, image, label, boxes, ori_size, path):
-        image = (image - self.pixel_mean) / self.pixel_std
+        # [核心修复] 移除这里的归一化！SAM 模型内部会自己做。
+        # image = (image - self.pixel_mean) / self.pixel_std  <-- 删除这行
+        
+        # 保持 0-255 范围，仅转为 Float Tensor
         image = torch.tensor(image).permute(2, 0, 1).float()
+        
         if not isinstance(label, torch.Tensor): label = torch.tensor(label).float().unsqueeze(0)
         
         sample = {
@@ -178,8 +181,8 @@ class TestingDataset(Dataset):
     def __init__(self, data_path, image_size=256, mode='test', requires_name=True, point_num=1, return_ori_mask=True, prompt_path=None, attribute_info_path=None):
         self.image_size = image_size
         self.requires_name = requires_name
-        self.pixel_mean = [123.675, 116.28, 103.53]
-        self.pixel_std = [58.395, 57.12, 57.375]
+        # 移除 Testing 中的 Normalization 参数
+        self.data_path = data_path
         
         # 1. 尝试寻找 Legacy JSON
         json_path = os.path.join(data_path, f'image2label_{mode}.json')
@@ -207,7 +210,7 @@ class TestingDataset(Dataset):
                 img_dir = os.path.join(data_path, 'Images')
                 if not os.path.exists(img_dir): img_dir = data_path
                 self.image_paths = sorted(glob.glob(os.path.join(img_dir, '*.png')) + glob.glob(os.path.join(img_dir, '*.tif')))
-                self.label_paths = [] # 暂无Label
+                self.label_paths = [] 
 
     def __len__(self):
         if self.dataset_type == 'sa1b': return len(self.json_files)
@@ -219,7 +222,6 @@ class TestingDataset(Dataset):
         else:
             return self._getitem_legacy(index)
 
-    # --- [修复核心] 强制解耦 Box 读取和 Mask 读取 ---
     def _getitem_sa1b(self, index):
         json_path = self.json_files[index]
         base_path = os.path.splitext(json_path)[0]
@@ -245,12 +247,10 @@ class TestingDataset(Dataset):
         boxes_list = []
         
         for idx, ann in enumerate(anns):
-            # 1. 无论有没有 Mask，只要有 Box 就先读出来！(用于画绿框)
             if 'bbox' in ann:
                 x, y, w, h = ann['bbox']
                 boxes_list.append([x, y, x+w, y+h])
 
-            # 2. 如果有 Mask，再尝试解码 Mask (用于算 Dice)
             if 'segmentation' in ann and mask_utils:
                 try:
                     mask = mask_utils.decode(ann['segmentation'])
@@ -258,10 +258,8 @@ class TestingDataset(Dataset):
                 except:
                     pass
         
-        # Resize GT Mask
         label_resized = cv2.resize(gt_mask.astype(np.float32), (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
         
-        # 处理 Box Tensor (缩放到 1024x1024)
         if len(boxes_list) == 0:
             boxes_tensor = torch.tensor([[0,0,1,1]]).float()
         else:
@@ -299,8 +297,10 @@ class TestingDataset(Dataset):
         return self._pack(image_resized, label_resized, boxes_tensor, original_size, img_path)
 
     def _pack(self, image, label, boxes, ori_size, path):
-        image = (image - self.pixel_mean) / self.pixel_std
+        # [核心修复] 移除这里的归一化！
+        # 保持 0-255，让 SAM 模型内部去处理
         image = torch.tensor(image).permute(2, 0, 1).float()
+        
         label_tensor = torch.tensor(label).unsqueeze(0).float()
         
         sample = {
