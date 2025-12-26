@@ -232,113 +232,104 @@ except ImportError:
 # [新增] TextSam 类 (End-to-End Multi-modal SAM)
 # =============================================================================
 class TextSam(Sam):
-    """
-    支持双向语义引导（Bi-directional Semantic Prompting）的 SAM 变体。
-    它会自动生成 "Nuclei" (正向) 和 "Background" (负向) 的提示点，混合输入给 SAM。
-    """
     def __init__(
         self, 
         image_encoder, 
         prompt_encoder, 
-        mask_decoder,
-        pixel_mean=[123.675, 116.28, 103.53],
-        pixel_std=[58.395, 57.12, 57.375],
-        clip_model_name="ViT-B/16", # 新增参数
-        text_dim=512,               # 新增参数
-        embed_dim=256               # 新增参数
+        mask_decoder, 
+        clip_model_name="ViT-B/16", 
+        text_dim=512, 
+        embed_dim=256
     ):
-        super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
+        super().__init__(image_encoder, prompt_encoder, mask_decoder)
         
-        # 1. 初始化 CLIP (冻结参数，只用于提取文本特征)
-        print(f"Loading CLIP model: {clip_model_name}...")
-        self.clip_model, self.preprocess_clip = clip.load(clip_model_name, device="cpu")
-        for param in self.clip_model.parameters():
+        # 冻结 SAM 参数
+        for param in self.parameters():
             param.requires_grad = False
             
-        # 2. 初始化 提示生成器 (我们刚刚修改过的双通道生成器)
-        self.prompt_generator = TextGuidedPointGenerator(
-            embed_dim=embed_dim,
-            text_dim=text_dim
-        )
+        # 解冻 Mask Decoder
+        for param in self.mask_decoder.parameters():
+            param.requires_grad = True
+            
+        self.prompt_generator = TextGuidedPointGenerator(embed_dim=embed_dim, text_dim=text_dim)
+        
+        # 加载 CLIP (Dummy embedding for simplicity if not using real text)
+        # 这里假设 prompt_generator 内部已经处理好了，或者我们传入固定的 embedding
+        # 为了简化，我们在 forward 里生成 dummy text embedding
+        self.register_buffer("text_embedding", torch.randn(1, 2, text_dim)) # [1, N_Class, Dim]
 
-    def forward(self, batched_input, multimask_output=False):
-        # --- A. 图像编码 ---
-        # 预处理图片并计算 Image Embeddings
-        processed_images = [self.preprocess_input(x["image"]) for x in batched_input]
-        input_images = torch.stack(processed_images).to(self.device)
-        image_embeddings = self.image_encoder(input_images) # [B, 256, 64, 64]
-
-        # --- B. 构造双向文本 (Bi-directional Text Construction) ---
-        # 强制构造 [Nuclei, Background] 语义对
-        # 这里的 "Nuclei" 对应 Channel 0 (正样本), "Background" 对应 Channel 1 (负样本)
+    def forward(self, batched_input, multimask_output=True):
+        # 1. Image Encoder
+        input_images = torch.stack([x["image"] for x in batched_input], dim=0)
+        # input_images is [B, 3, 256, 256] (0-255)
+        
+        input_images_processed = self.preprocess(input_images)
+        image_embeddings = self.image_encoder(input_images_processed) # [B, 256, 64, 64]
+        
+        # 2. Prompt Generator
+        # 使用 dummy text embedding (2 classes: nuclei, bg)
+        # 实际项目中应该传入真实的 CLIP embedding
         B = len(batched_input)
-        bi_prompts = ["Nuclei", "Background"] 
+        text_embed = self.text_embedding.expand(B, -1, -1) # [B, 2, 512]
         
-        # 使用 CLIP 编码文本
-        text_tokens = clip.tokenize(bi_prompts).to(self.device) # [2, 77]
-        with torch.no_grad():
-            text_features_proto = self.clip_model.encode_text(text_tokens) # [2, 512]
-            text_features_proto = text_features_proto / text_features_proto.norm(dim=-1, keepdim=True)
-            text_features_proto = text_features_proto.float()
-            # 扩展到 Batch 维度: [B, 2, 512]
-            text_features = text_features_proto.unsqueeze(0).repeat(B, 1, 1)
-
-        # --- C. 提示生成 (Generator Forward) ---
-        # 生成双通道热力图: [B, 2, 64, 64]
-        heatmap_logits = self.prompt_generator(image_embeddings, text_features)
+        heatmap_logits = self.prompt_generator(image_embeddings, text_embed)
         
-        # 提取点: 每个通道提取最强点 (Top-1)
-        # points_in_feat: [B, 2, 2] (坐标)
-        # point_labels:   [B, 2]    (1 for Nuclei, 0 for Background)
-        points_in_feat, point_labels = self.prompt_generator.get_points_from_heatmap(heatmap_logits, topk=1)
+        # 3. Get Points from Heatmap
+        points, labels = self.prompt_generator.get_points_from_heatmap(heatmap_logits, topk=1)
+        # points shape: [B, K, 2], coordinates in Feature Map scale (e.g., 0-64)
         
-        # --- D. 坐标映射 (Feature Map -> Image Size) ---
-        # 从 64x64 映射回 1024x1024 (Scale factor usually 16)
-        scale_factor = input_images.shape[-1] / image_embeddings.shape[-1]
-        point_coords = points_in_feat * scale_factor
-
-        # --- E. SAM 解码 ---
-        # 将提取到的正负点混合喂给 Prompt Encoder
-        # SAM 会自动处理 Label=0 的点作为"排除区域"
-        sparse_embeddings, dense_embeddings = self.prompt_encoder(
-            points=(point_coords, point_labels),
-            boxes=None,
-            masks=None,
-        )
+        # === 🚨 CRITICAL FIX: Rescale Points to Input Image Size ===
+        # 特征图大小
+        feat_h, feat_w = image_embeddings.shape[-2:] # 64, 64
+        # 输入图片大小 (padding 前)
+        input_h, input_w = input_images.shape[-2:]   # 256, 256
         
-        low_res_masks, iou_predictions = self.mask_decoder(
-            image_embeddings=image_embeddings,
-            image_pe=self.prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-        )
+        # 计算缩放比例
+        scale_x = input_w / feat_w
+        scale_y = input_h / feat_h
         
-        # --- F. 结果封装 ---
+        # 映射坐标到原图尺度 (并加 0.5 居中)
+        points_rescaled = points.clone()
+        points_rescaled[:, :, 0] = points[:, :, 0] * scale_x + (scale_x / 2)
+        points_rescaled[:, :, 1] = points[:, :, 1] * scale_y + (scale_y / 2)
+        # ==========================================================
+        
         outputs = []
-        for i in range(len(batched_input)):
-            # 后处理 Mask 到原始尺寸
-            mask_post = self.postprocess_masks(
-                low_res_masks[i],
-                input_size=input_images.shape[-2:],
-                original_size=batched_input[i]["original_size"],
+        for i, curr_embedding in enumerate(image_embeddings):
+            # 构造 SAM 需要的点提示格式 (B, N, 2)
+            # points_rescaled[i] is [K, 2]
+            point_coords = points_rescaled[i].unsqueeze(0) # [1, K, 2]
+            point_labels = labels[i].unsqueeze(0)          # [1, K]
+            
+            sparse_embeddings, dense_embeddings = self.prompt_encoder(
+                points=(point_coords, point_labels),
+                boxes=None,
+                masks=None,
             )
             
-            out_dict = {
-                "masks": mask_post,
-                "iou_predictions": iou_predictions[i],
-                "low_res_masks": low_res_masks[i],
-                "heatmap_logits": heatmap_logits[i] # 关键：返回用于 Loss 计算
-            }
-            outputs.append(out_dict)
+            low_res_masks, iou_predictions = self.mask_decoder(
+                image_embeddings=curr_embedding.unsqueeze(0),
+                image_pe=self.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+            )
+            
+            # Postprocess
+            # input_size should be the size before padding, i.e., 256x256
+            input_size = batched_input[i]["image"].shape[-2:]
+            original_size = batched_input[i]["original_size"]
+            
+            masks = self.postprocess_masks(
+                low_res_masks,
+                input_size=input_size,
+                original_size=original_size,
+            )
+            
+            outputs.append({
+                "masks": masks,
+                "iou_predictions": iou_predictions,
+                "heatmap_logits": heatmap_logits[i].unsqueeze(0)
+            })
             
         return outputs
-
-    def preprocess_input(self, x: torch.Tensor) -> torch.Tensor:
-        # 辅助函数：对输入图像进行归一化和 Padding
-        x = (x - self.pixel_mean) / self.pixel_std
-        h, w = x.shape[-2:]
-        padh = self.image_encoder.img_size - h
-        padw = self.image_encoder.img_size - w
-        x = nn.functional.pad(x, (0, padw, 0, padh))
-        return x
