@@ -1,296 +1,260 @@
 import torch
 import numpy as np
-from skimage import measure
+import cv2
 from scipy.optimize import linear_sum_assignment
+from skimage import measure
 
-def _threshold(x, threshold=None):
-    if threshold is not None:
-        return (x > threshold).type(x.dtype)
-    else:
-        return x
-
-def _list_tensor(x, y):
-    m = torch.nn.Sigmoid()
-    if isinstance(x, list):
-        x = torch.tensor(np.array(x))
-        y = torch.tensor(np.array(y))
-        if x.min() < 0:
-            x = m(x)
-    else:
-        if x.min() < 0:
-            x = m(x)
-    return x, y
-
-def get_bounding_box(img):
-    """获取二值图像的边界框，用于加速计算"""
-    rows = np.any(img, axis=1)
-    cols = np.any(img, axis=0)
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    return rmin, rmax + 1, cmin, cmax + 1
-
-def compute_aji_single_image(pred, gt):
-    """计算单张图像的 Aggregated Jaccard Index (AJI)"""
-    # 确保输入是实例 ID 映射 (H, W)，如果是二值图则进行连通域标记
-    if pred.max() <= 1:
-        pred = measure.label(pred)
-    if gt.max() <= 1:
-        gt = measure.label(gt)
-
+def get_fast_aji(true, pred):
+    """
+    使用矩阵运算加速 AJI 计算
+    true: (H, W) 实例图
+    pred: (H, W) 实例图
+    """
+    true = np.copy(true)
+    pred = np.copy(pred)
+    
+    # 确保 ID 是连续的，方便矩阵索引
+    true_id_list = list(np.unique(true))
     pred_id_list = list(np.unique(pred))
-    gt_id_list = list(np.unique(gt))
-    
-    # 移除背景 (0)
+
+    # 移除背景
+    if 0 in true_id_list: true_id_list.remove(0)
     if 0 in pred_id_list: pred_id_list.remove(0)
-    if 0 in gt_id_list: gt_id_list.remove(0)
-
-    pred_masks = {p: (pred == p).astype(np.uint8) for p in pred_id_list}
-    gt_masks = {g: (gt == g).astype(np.uint8) for g in gt_id_list}
-
-    pairwise_inter = np.zeros([len(gt_id_list), len(pred_id_list)], dtype=np.float64)
-    pairwise_union = np.zeros([len(gt_id_list), len(pred_id_list)], dtype=np.float64)
-
-    # 计算成对的交集和并集
-    for i, gt_id in enumerate(gt_id_list):
-        g_mask = gt_masks[gt_id]
-        rmin1, rmax1, cmin1, cmax1 = get_bounding_box(g_mask)
-        
-        # 只检查有重叠的预测区域
-        g_mask_crop = g_mask[rmin1:rmax1, cmin1:cmax1]
-        pred_crop = pred[rmin1:rmax1, cmin1:cmax1]
-        overlap_ids = np.unique(pred_crop[g_mask_crop > 0])
-        
-        for pred_id in overlap_ids:
-            if pred_id == 0: continue
-            j = pred_id_list.index(pred_id)
-            p_mask = pred_masks[pred_id]
-            
-            total = (g_mask + p_mask).sum()
-            intersect = (g_mask * p_mask).sum()
-            pairwise_inter[i, j] = intersect
-            pairwise_union[i, j] = (g_mask + p_mask > 0).sum()
-
-    pairwise_iou = pairwise_inter / (pairwise_union + 1.0e-6)
     
-    overall_inter = 0.0
-    overall_union = 0.0
+    if len(true_id_list) == 0 and len(pred_id_list) == 0: return 1.0
+    if len(true_id_list) == 0 or len(pred_id_list) == 0: return 0.0
+
+    # 重映射 ID 到 0..N (为了构建混淆矩阵)
+    # 这是一个优化技巧：将不连续的 ID 映射为连续索引
+    t_map = {uid: i for i, uid in enumerate(true_id_list)}
+    p_map = {uid: i for i, uid in enumerate(pred_id_list)}
     
-    if len(gt_id_list) > 0 and len(pred_id_list) > 0:
-        # 为每个GT找到最佳匹配的Pred
-        paired_pred_indices = np.argmax(pairwise_iou, axis=1)
-        max_ious = np.max(pairwise_iou, axis=1)
+    # 构建 Intersection 矩阵
+    # 这种方法比双重 for 循环快得多
+    # 我们只关心有重叠的像素
+    mask = (true > 0) & (pred > 0)
+    true_masked = true[mask]
+    pred_masked = pred[mask]
+    
+    # 使用 bincount 或 histogram 计算重叠矩阵 (Intersection)
+    # 这是一个稀疏矩阵的思想
+    if len(true_masked) > 0:
+        # 将二维坐标 (t_idx, p_idx) 编码为一维索引
+        # idx = t_idx * num_pred + p_idx
+        t_indices = np.array([t_map[t] for t in true_masked])
+        p_indices = np.array([p_map[p] for p in pred_masked])
         
-        # 记录已匹配的 Pred ID
-        matched_pred_indices = []
-        
-        for i, iou in enumerate(max_ious):
-            if iou > 0:
-                j = paired_pred_indices[i]
-                overall_inter += pairwise_inter[i, j]
-                overall_union += pairwise_union[i, j]
-                matched_pred_indices.append(j)
-            else:
-                # GT 未匹配到任何 Pred，计入 Union
-                overall_union += gt_masks[gt_id_list[i]].sum()
-        
-        # 处理未匹配的 Prediction (假阳性)
-        unmatched_pred_indices = set(range(len(pred_id_list))) - set(matched_pred_indices)
-        for j in unmatched_pred_indices:
-            overall_union += pred_masks[pred_id_list[j]].sum()
-            
+        flat_indices = t_indices * len(pred_id_list) + p_indices
+        inter_counts = np.bincount(flat_indices, minlength=len(true_id_list)*len(pred_id_list))
+        pairwise_inter = inter_counts.reshape(len(true_id_list), len(pred_id_list))
     else:
-        # 处理完全无匹配的情况
-        for g in gt_id_list: overall_union += gt_masks[g].sum()
-        for p in pred_id_list: overall_union += pred_masks[p].sum()
+        pairwise_inter = np.zeros((len(true_id_list), len(pred_id_list)))
 
-    return overall_inter / (overall_union + 1.0e-6)
+    # 计算 Union 矩阵
+    # Union[i, j] = Area[i] + Area[j] - Inter[i, j]
+    true_areas = np.array([np.sum(true == t) for t in true_id_list])
+    pred_areas = np.array([np.sum(pred == p) for p in pred_id_list])
+    
+    # 利用广播机制计算 Union
+    pairwise_union = true_areas[:, None] + pred_areas[None, :] - pairwise_inter
 
-def compute_pq_stats_single_image(pred, gt, match_iou=0.5):
-    """计算单张图像的 PQ, SQ, DQ 统计数据"""
-    if pred.max() <= 1: pred = measure.label(pred)
-    if gt.max() <= 1: gt = measure.label(gt)
+    # 匈牙利匹配 (AJI 核心)
+    # 我们要最大化 Intersection 的总和 (或者说 Jaccard，但在 AJI 定义里通常是匹配 Intersection)
+    # AJI 分子是匹配对的 Intersection 之和
+    # AJI 分母是匹配对的 Union 之和 + 未匹配 GT 的面积 + 未匹配 Pred 的面积
+    
+    # 使用 linear_sum_assignment 寻找最大重叠匹配
+    # cost 设为负的 intersection，求解最小 cost 等于最大 intersection
+    row_ind, col_ind = linear_sum_assignment(-pairwise_inter)
 
+    aji_numerator = 0.0
+    aji_denominator = 0.0
+    
+    used_true_indices = set(row_ind)
+    used_pred_indices = set(col_ind)
+
+    # 累加匹配对
+    for r, c in zip(row_ind, col_ind):
+        # 只有真正有交集才算匹配
+        if pairwise_inter[r, c] > 0:
+            aji_numerator += pairwise_inter[r, c]
+            aji_denominator += pairwise_union[r, c]
+        else:
+            # 虽然算法配对了，但交集为0，视为未匹配
+            aji_denominator += true_areas[r]
+            used_pred_indices.remove(c) # 这个 Pred 实际上没被用掉
+
+    # 累加未匹配的 GT
+    for i in range(len(true_id_list)):
+        if i not in used_true_indices:
+            aji_denominator += true_areas[i]
+            
+    # 累加未匹配的 Pred
+    for j in range(len(pred_id_list)):
+        if j not in used_pred_indices:
+            aji_denominator += pred_areas[j]
+
+    if aji_denominator == 0: return 0.0
+    return aji_numerator / aji_denominator
+
+def get_fast_pq(true, pred, match_iou=0.5):
+    """
+    使用矩阵运算加速 PQ 计算
+    """
+    true = np.copy(true)
+    pred = np.copy(pred)
+    
+    true_id_list = list(np.unique(true))
     pred_id_list = list(np.unique(pred))
-    gt_id_list = list(np.unique(gt))
+
+    if 0 in true_id_list: true_id_list.remove(0)
     if 0 in pred_id_list: pred_id_list.remove(0)
-    if 0 in gt_id_list: gt_id_list.remove(0)
-
-    # 构建 IoU 矩阵
-    iou_matrix = np.zeros((len(gt_id_list), len(pred_id_list)))
     
-    if len(gt_id_list) > 0 and len(pred_id_list) > 0:
-        for i, gt_id in enumerate(gt_id_list):
-            g_mask = (gt == gt_id).astype(np.uint8)
-            rmin, rmax, cmin, cmax = get_bounding_box(g_mask)
-            
-            g_mask_crop = g_mask[rmin:rmax, cmin:cmax]
-            pred_crop = pred[rmin:rmax, cmin:cmax]
-            overlap_ids = np.unique(pred_crop[g_mask_crop > 0])
-            
-            for pred_id in overlap_ids:
-                if pred_id == 0: continue
-                j = pred_id_list.index(pred_id)
-                p_mask = (pred == pred_id).astype(np.uint8)
-                
-                intersect = (g_mask * p_mask).sum()
-                union = (g_mask + p_mask > 0).sum()
-                iou_matrix[i, j] = intersect / (union + 1e-6)
+    if len(true_id_list) == 0 and len(pred_id_list) == 0: return 1.0, 1.0, 1.0
+    if len(true_id_list) == 0 or len(pred_id_list) == 0: return 0.0, 0.0, 0.0
 
-        # 使用匈牙利算法进行最大匹配 (IoU > 0.5 实际上可以直接贪心，但匈牙利更通用)
-        # 这里按照 tiseg 逻辑，对于 threshold >= 0.5，唯一匹配是确定的
-        paired_gt_indices, paired_pred_indices = np.nonzero(iou_matrix > match_iou)
+    # 类似 AJI 的矩阵构建逻辑
+    t_map = {uid: i for i, uid in enumerate(true_id_list)}
+    p_map = {uid: i for i, uid in enumerate(pred_id_list)}
+    
+    mask = (true > 0) & (pred > 0)
+    true_masked = true[mask]
+    pred_masked = pred[mask]
+    
+    if len(true_masked) > 0:
+        t_indices = np.array([t_map[t] for t in true_masked])
+        p_indices = np.array([p_map[p] for p in pred_masked])
+        flat_indices = t_indices * len(pred_id_list) + p_indices
+        inter_counts = np.bincount(flat_indices, minlength=len(true_id_list)*len(pred_id_list))
+        pairwise_inter = inter_counts.reshape(len(true_id_list), len(pred_id_list))
     else:
-        paired_gt_indices, paired_pred_indices = [], []
+        pairwise_inter = np.zeros((len(true_id_list), len(pred_id_list)))
 
-    tp = len(paired_gt_indices)
+    true_areas = np.array([np.sum(true == t) for t in true_id_list])
+    pred_areas = np.array([np.sum(pred == p) for p in pred_id_list])
+    pairwise_union = true_areas[:, None] + pred_areas[None, :] - pairwise_inter
+    
+    # 计算 IoU 矩阵
+    pairwise_iou = pairwise_inter / (pairwise_union + 1e-6)
+
+    # 匹配：IoU > 0.5
+    # 因为阈值是 0.5，一个 GT 最多只能匹配一个 Pred，反之亦然，所以不需要匈牙利算法，直接贪心即可
+    tp = 0
+    iou_sum = 0
+    
+    # 获取所有满足条件的匹配索引
+    # rows, cols 是匹配上的索引对
+    rows, cols = np.where(pairwise_iou > match_iou)
+    
+    # 因为 > 0.5，所以不用去重，直接统计
+    tp = len(rows)
+    iou_sum = np.sum(pairwise_iou[rows, cols])
+    
     fp = len(pred_id_list) - tp
-    fn = len(gt_id_list) - tp
-    
-    # 计算匹配对象的总 IoU
-    iou_sum = 0.0
-    if tp > 0:
-        iou_sum = iou_matrix[paired_gt_indices, paired_pred_indices].sum()
+    fn = len(true_id_list) - tp
 
-    return tp, fp, fn, iou_sum
-
-def iou(pr, gt, eps=1e-7, threshold=0.5):
-    # 保持原有的语义分割 IoU 逻辑，但改为按 Batch 平均
-    pr_, gt_ = _list_tensor(pr, gt)
-    pr_ = _threshold(pr_, threshold=threshold)
-    gt_ = _threshold(gt_, threshold=threshold)
+    dq = tp / (tp + 0.5 * fp + 0.5 * fn + 1e-6)
+    sq = iou_sum / (tp + 1e-6)
+    pq = dq * sq
     
-    # 修改为按样本计算 (dim=[1,2,3] 假设是 BCHW)
-    intersection = torch.sum(gt_ * pr_, dim=[1, 2, 3])
-    union = torch.sum(gt_, dim=[1, 2, 3]) + torch.sum(pr_, dim=[1, 2, 3]) - intersection
-    return ((intersection + eps) / (union + eps)).cpu().numpy()
-
-def dice(pr, gt, eps=1e-7, threshold=0.5):
-    # 保持原有的语义分割 Dice 逻辑
-    pr_, gt_ = _list_tensor(pr, gt)
-    pr_ = _threshold(pr_, threshold=threshold)
-    gt_ = _threshold(gt_, threshold=threshold)
-    
-    intersection = torch.sum(gt_ * pr_, dim=[1, 2, 3])
-    union = torch.sum(gt_, dim=[1, 2, 3]) + torch.sum(pr_, dim=[1, 2, 3])
-    return ((2. * intersection + eps) / (union + eps)).cpu().numpy()
+    return pq, dq, sq
 
 def SegMetrics(pred, label, metrics):
     """
-    计算分割指标。
-    pred: (B, C, H, W) 或 (B, H, W) 的预测结果（logits、binary 或 instance map）
-    label: (B, C, H, W) 或 (B, H, W) 的真实标签（binary 或 instance map）
-    metrics: 字符串列表，如 ['mDice', 'mAJI', 'mPQ', 'mDQ', 'mSQ']
+    计算分割指标的总入口
     """
     results = {}
 
     if isinstance(metrics, str):
         metrics = [metrics, ]
-    
 
-    # 1. 统一转换为 Tensor/Numpy 并在 CPU 上操作
-    if isinstance(pred, list):
-        pred = np.array(pred)
+    # 1. 转换为 Numpy
     if isinstance(pred, torch.Tensor):
         pred = pred.detach().cpu().numpy()
-        
-
-    if isinstance(label, list):
-        label = np.array(label)
     if isinstance(label, torch.Tensor):
         label = label.detach().cpu().numpy()
         
+    # 2. 维度处理 (B, H, W)
+    # 如果输入是 (B, C, H, W)，压缩 C
+    if pred.ndim == 4: pred = pred.squeeze(1)
+    if label.ndim == 4: label = label.squeeze(1)
+    # 如果输入是 (H, W)，增加 B
+    if pred.ndim == 2: pred = pred[np.newaxis, ...]
+    if label.ndim == 2: label = label[np.newaxis, ...]
 
-    # 2. 判断是否为实例图 (Max > 1)
-    is_instance_map = (pred.max() > 1) or (label.max() > 1)
+    batch_size = pred.shape[0]
+
+    # 3. 预处理 (二值化 & 实例标记)
+    # 注意：我们在这里统一处理，避免后面重复计算
     
-
-    if is_instance_map:
-        # 如果已经是实例图，直接取整
-        pr_np = pred.astype(int)
-        gt_np = label.astype(int)
+    # 3.1 二值图 (用于 Dice/IoU)
+    # 假设 pred 已经是 logits 或 prob，需要阈值化
+    # 如果 pred max > 1，说明已经是实例图，转化为二值图
+    if pred.max() > 1:
+        pr_bin = (pred > 0).astype(np.uint8)
     else:
-        # 如果是二值 Logits (0~1 或 负数)，需要阈值化
-        # 注意：这里假设输入已经是 sigmoid 后的概率，或者 logits
-        # 为了保险，如果 max <= 1 且 min < 0，做 sigmoid
-        if pred.min() < 0:
-            pred = 1 / (1 + np.exp(-pred)) # Sigmoid
-            
+        # 如果是 logits/prob
+        if pred.min() < 0: pred = 1 / (1 + np.exp(-pred)) # Sigmoid
+        pr_bin = (pred > 0.5).astype(np.uint8)
 
-        pr_np = (pred > 0.5).astype(int)
-        gt_np = (label > 0.5).astype(int)
+    if label.max() > 1:
+        gt_bin = (label > 0).astype(np.uint8)
+    else:
+        gt_bin = (label > 0.5).astype(np.uint8)
 
-
-
-    # 3. 维度对齐 (B, H, W)
-    if pr_np.ndim == 4: pr_np = pr_np.squeeze(1)
-    if gt_np.ndim == 4: gt_np = gt_np.squeeze(1)
-    if pr_np.ndim == 2: pr_np = pr_np[np.newaxis, ...]
-    if gt_np.ndim == 2: gt_np = gt_np[np.newaxis, ...]
+    # 3.2 实例图 (用于 AJI/PQ)
+    # 如果需要计算 AJI/PQ，且输入不是实例图，则进行连通域分析
+    need_instance = any(m in metrics for m in ['mAJI', 'mPQ', 'mDQ', 'mSQ'])
     
+    if need_instance:
+        pr_inst_batch = []
+        gt_inst_batch = []
+        
+        for i in range(batch_size):
+            # 处理 Prediction
+            if pred[i].max() > 1: # 已经是实例图
+                pr_inst_batch.append(pred[i].astype(np.int32))
+            else: # 需要生成实例图
+                pr_inst_batch.append(measure.label(pr_bin[i]))
+            
+            # 处理 GT
+            if label[i].max() > 1:
+                gt_inst_batch.append(label[i].astype(np.int32))
+            else:
+                gt_inst_batch.append(measure.label(gt_bin[i]))
 
-    # 4. 如果 GT 是二值图但 Pred 是实例图，需要对 GT 做连通域标记 (用于 AJI/PQ)
-    # 这种情况常见于测试集 GT 是二值 mask 的情况
-    if is_instance_map and gt_np.max() <= 1:
-        gt_np_instance = np.zeros_like(gt_np)
-        for i in range(gt_np.shape[0]):
-            gt_np_instance[i] = measure.label(gt_np[i])
-        gt_np = gt_np_instance
-
-
-
-    batch_size = pr_np.shape[0]
-
-
-
+    # 4. 指标计算
     for metric in metrics:
-        if metric == 'iou':
-            # IoU 通常基于二值图
-            pr_bin = (pr_np > 0).astype(int)
-            gt_bin = (gt_np > 0).astype(int)
-            intersection = (pr_bin * gt_bin).sum()
-            union = pr_bin.sum() + gt_bin.sum() - intersection
-            results['iou'] = (intersection + 1e-7) / (union + 1e-7)
-            
-
-        elif metric == 'dice' or metric == 'mDice':
-            # Dice 基于二值图
-            pr_bin = (pr_np > 0).astype(int)
-            gt_bin = (gt_np > 0).astype(int)
-            
-
+        if metric == 'dice':
             dice_sum = 0.0
             for i in range(batch_size):
                 inter = (pr_bin[i] * gt_bin[i]).sum()
                 union = pr_bin[i].sum() + gt_bin[i].sum()
-                dice_sum += (2. * inter + 1e-7) / (union + 1e-7)
+                dice_sum += (2. * inter + 1e-6) / (union + 1e-6)
             results['dice'] = dice_sum / batch_size
             
+        elif metric == 'iou':
+            iou_sum = 0.0
+            for i in range(batch_size):
+                inter = (pr_bin[i] * gt_bin[i]).sum()
+                union = (pr_bin[i] | gt_bin[i]).sum()
+                iou_sum += (inter + 1e-6) / (union + 1e-6)
+            results['iou'] = iou_sum / batch_size
 
         elif metric == 'mAJI':
-            # AJI 必须基于实例图
             aji_sum = 0.0
             for i in range(batch_size):
-                aji_sum += compute_aji_single_image(pr_np[i], gt_np[i])
+                aji_sum += get_fast_aji(gt_inst_batch[i], pr_inst_batch[i])
             results['mAJI'] = aji_sum / batch_size
-            
 
         elif metric in ['mPQ', 'mDQ', 'mSQ']:
-            # PQ 必须基于实例图
-            pq_list, dq_list, sq_list = [], [], []
+            pq_sum, dq_sum, sq_sum = 0.0, 0.0, 0.0
             for i in range(batch_size):
-                tp, fp, fn, iou_sum = compute_pq_stats_single_image(pr_np[i], gt_np[i])
-                dq = tp / (tp + 0.5 * fp + 0.5 * fn + 1e-6)
-                sq = iou_sum / (tp + 1e-6)
-                pq = dq * sq
-                pq_list.append(pq)
-                dq_list.append(dq)
-                sq_list.append(sq)
+                pq, dq, sq = get_fast_pq(gt_inst_batch[i], pr_inst_batch[i])
+                pq_sum += pq; dq_sum += dq; sq_sum += sq
             
-
-            if metric == 'mPQ': results['mPQ'] = np.mean(pq_list)
-            if metric == 'mDQ': results['mDQ'] = np.mean(dq_list)
-            if metric == 'mSQ': results['mSQ'] = np.mean(sq_list)
-
-
+            if metric == 'mPQ': results['mPQ'] = pq_sum / batch_size
+            if metric == 'mDQ': results['mDQ'] = dq_sum / batch_size
+            if metric == 'mSQ': results['mSQ'] = sq_sum / batch_size
 
     return results

@@ -1,196 +1,193 @@
-"""
-转换 global_label_*.json 为 DataLoader.py 期望的 attribute_info 格式
-
-将 PromptNu 风格的全局标签转换为 PNuRL 需要的格式：
-- 从列表格式转换为字典格式
-- 提取属性文本作为 attribute_prompts
-- 根据文本映射到类别索引，生成 attribute_labels
-"""
-
-import json
 import os
-from typing import Dict, List, Any
+import json
+import cv2
+import numpy as np
+import glob
+from tqdm import tqdm
+from skimage import measure
 
-# 属性类别映射（根据 PNuRL 的默认配置：3, 5, 4, 3, 3）
-# 顺序：[颜色, 形状, 排列, 大小, 分布]
-ATTRIBUTE_MAPPINGS = {
-    # Color (3 classes)
-    'color': {
-        'deep purple': 0,
-        'light pink': 1,
-        'other': 2,  # 默认类别
-    },
-    # Shape (5 classes)
-    'shape': {
-        'elliptical/oval': 0,
-        'spindle': 1,
-        'irregular': 2,
-        'round': 3,
-        'other': 4,  # 默认类别
-    },
-    # Arrangement (4 classes)
-    'arrange': {
-        'scattered': 0,
-        'clustered': 1,
-        'linear': 2,
-        'other': 3,  # 默认类别
-    },
-    # Size (3 classes)
-    'size': {
-        'small': 0,
-        'medium': 1,
-        'large': 2,
-    },
-    # Distribution/Density (3 classes)
-    'density': {
-        'sparsely distributed': 0,
-        'moderately dense': 1,
-        'densely packed': 2,
-    },
-}
+# 尝试导入 pycocotools，这是解析 SA-1B RLE 的标准工具
+try:
+    from pycocotools import mask as coco_mask
+except ImportError:
+    print("⚠️ 请安装 pycocotools: pip install pycocotools")
+    exit()
 
+# === 配置路径 ===
+# 指向包含图片和对应 json 的文件夹
+DATA_ROOT = "data/MoNuSeg_SA1B/train" 
+OUTPUT_JSON = "data/MoNuSeg_SA1B/attribute_info_train.json"
 
-def text_to_class_index(text: str, attr_type: str) -> int:
+def decode_sa1b_mask(json_path, shape=None):
     """
-    将属性文本转换为类别索引
-    
-    Args:
-        text: 属性文本（如 "deep purple"）
-        attr_type: 属性类型（"color", "shape", "arrange", "size", "density"）
-    
-    Returns:
-        类别索引
+    从 SA-1B 格式的 JSON 中解析出二值 Mask
     """
-    text_lower = text.lower().strip()
-    mapping = ATTRIBUTE_MAPPINGS.get(attr_type, {})
+    with open(json_path, 'r') as f:
+        data = json.load(f)
     
-    # 精确匹配
-    if text_lower in mapping:
-        return mapping[text_lower]
+    # SA-1B 标注通常在 'annotations' 列表里
+    anns = data.get('annotations', [])
+    if not anns and isinstance(data, list): anns = data # 兼容直接是 list 的情况
     
-    # 模糊匹配（包含关键词）
-    for key, idx in mapping.items():
-        if key in text_lower or text_lower in key:
-            return idx
-    
-    # 返回默认类别（通常是最后一个）
-    if mapping:
-        return max(mapping.values())
-    return 0
+    # 如果不知道图像尺寸，尝试从 json 或第一条标注推断，或者由外部传入
+    # 这里我们建立一个全黑底图
+    if shape is None:
+        # 尝试读取同名图片获取尺寸
+        img_path = json_path.replace(".json", ".tif") 
+        if not os.path.exists(img_path):
+             img_path = json_path.replace(".json", ".png")
+        if os.path.exists(img_path):
+            temp_img = cv2.imread(img_path)
+            h, w = temp_img.shape[:2]
+        else:
+            # 兜底：如果找不到图，默认 1000x1000 (MoNuSeg标准)
+            h, w = 1000, 1000
+    else:
+        h, w = shape
 
+    full_mask = np.zeros((h, w), dtype=np.uint8)
 
-def class_index_to_onehot(idx: int, num_classes: int) -> List[int]:
-    """
-    将类别索引转换为 one-hot 编码
+    for ann in anns:
+        if 'segmentation' in ann:
+            seg = ann['segmentation']
+            # 情况 A: RLE 格式 (SA-1B 标准)
+            if isinstance(seg, dict) and 'counts' in seg:
+                rle_mask = coco_mask.decode(seg)
+                full_mask[rle_mask > 0] = 1
+            # 情况 B: Polygon 格式 (点列表)
+            elif isinstance(seg, list):
+                for poly in seg:
+                    pts = np.array(poly, dtype=np.int32).reshape((-1, 2))
+                    cv2.fillPoly(full_mask, [pts], 1)
     
-    Args:
-        idx: 类别索引
-        num_classes: 类别数量
-    
-    Returns:
-        one-hot 编码列表
-    """
-    onehot = [0] * num_classes
-    if 0 <= idx < num_classes:
-        onehot[idx] = 1
-    return onehot
+    return full_mask
 
+def analyze_mask(mask):
+    """
+    对 Mask 进行连通域分析，提取 PromptNu 所需的 5 大属性
+    """
+    # 连通域标记
+    labels = measure.label(mask)
+    props = measure.regionprops(labels)
+    
+    if len(props) == 0:
+        return None
 
-def convert_global_labels(
-    input_path: str,
-    output_path: str,
-    num_classes_per_attr: List[int] = [3, 5, 4, 3, 3]
-) -> None:
-    """
-    转换 global_label JSON 文件为 attribute_info 格式
+    # --- 1. Size (大小) ---
+    areas = [p.area for p in props]
+    mean_area = np.mean(areas)
     
-    Args:
-        input_path: 输入的 global_label JSON 文件路径
-        output_path: 输出的 attribute_info JSON 文件路径
-        num_classes_per_attr: 每个属性的类别数量 [颜色, 形状, 排列, 大小, 分布]
-    """
-    # 读取原始文件
-    with open(input_path, 'r', encoding='utf-8') as f:
-        global_labels = json.load(f)
-    
-    # 转换后的字典
-    attribute_info = {}
-    
-    # 属性顺序：[颜色, 形状, 排列, 大小, 分布]
-    attr_order = ['color', 'shape', 'arrange', 'size', 'density']
-    
-    for item in global_labels:
-        # 获取图像ID
-        image_ids = item.get('id', [])
-        if isinstance(image_ids, str):
-            image_ids = [image_ids]
+    size_tags = []
+    # 阈值可微调
+    if mean_area < 250: size_tags.append("small")
+    elif mean_area < 650: size_tags.append("medium")
+    else: size_tags.append("large")
         
-        # 提取属性文本
-        color_text = item.get('color', ['other'])[0] if isinstance(item.get('color'), list) else item.get('color', 'other')
-        shape_text = item.get('shape', ['other'])[0] if isinstance(item.get('shape'), list) else item.get('shape', 'other')
-        arrange_text = item.get('arrange', ['other'])[0] if isinstance(item.get('arrange'), list) else item.get('arrange', 'other')
-        size_text = item.get('size', ['medium'])[0] if isinstance(item.get('size'), list) else item.get('size', 'medium')
-        density_text = item.get('density', ['moderately dense'])[0] if isinstance(item.get('density'), list) else item.get('density', 'moderately dense')
+    # --- 2. Density (密度) ---
+    h, w = mask.shape
+    foreground_ratio = np.sum(mask) / (h * w)
+    count = len(props)
+    
+    density_tags = []
+    if foreground_ratio > 0.20 or count > 400:
+        density_tags.append("densely packed")
+    elif foreground_ratio > 0.05 or count > 100:
+        density_tags.append("moderately dense")
+    else:
+        density_tags.append("sparsely distributed")
+
+    # --- 3. Shape (形状) ---
+    eccentricities = [p.eccentricity for p in props]
+    mean_ecc = np.mean(eccentricities)
+    
+    shape_tags = []
+    if mean_ecc > 0.85:
+        shape_tags.extend(["elongated", "spindle-shaped"])
+    elif mean_ecc < 0.5:
+        shape_tags.extend(["round", "spherical"])
+    else:
+        shape_tags.append("elliptical/oval")
         
-        # 构建 attribute_prompts（按顺序：[颜色, 形状, 排列, 大小, 分布]）
-        attribute_prompts = [
-            color_text,
-            shape_text,
-            arrange_text,
-            size_text,
-            density_text
-        ]
+    solidities = [p.solidity for p in props]
+    if np.mean(solidities) < 0.85:
+        shape_tags.append("irregular")
+
+    # --- 4. Arrange (排列) ---
+    arrange_tags = ["scattered"]
+    if "densely packed" in density_tags:
+        arrange_tags.append("clustered")
         
-        # 转换为类别索引并生成 one-hot 编码
-        attribute_labels = []
-        attr_texts = [color_text, shape_text, arrange_text, size_text, density_text]
-        attr_types = ['color', 'shape', 'arrange', 'size', 'density']
-        
-        for i, (text, attr_type, num_classes) in enumerate(zip(attr_texts, attr_types, num_classes_per_attr)):
-            class_idx = text_to_class_index(text, attr_type)
-            onehot = class_index_to_onehot(class_idx, num_classes)
-            attribute_labels.append(onehot)
-        
-        # 为每个图像ID创建条目
-        for img_id in image_ids:
-            # 移除可能的扩展名
-            img_id = img_id.split('.')[0] if '.' in img_id else img_id
+    # --- 5. Color (颜色) ---
+    color_tags = ["deep purple"] # H&E 固定
+
+    # === 构造 Rich Text ===
+    # 类似于: "Deep purple small elliptical/oval nuclei, densely packed"
+    rich_text = f"{color_tags[0]} {size_tags[0]} "
+    if len(shape_tags) > 0: rich_text += f"{shape_tags[0]} "
+    rich_text += "nuclei"
+    if "densely packed" in density_tags: rich_text += ", densely packed"
+    elif "sparsely distributed" in density_tags: rich_text += ", scattered"
+
+    return {
+        "color": list(set(color_tags)),
+        "size": list(set(size_tags)),
+        "density": list(set(density_tags)),
+        "arrange": list(set(arrange_tags)),
+        "shape": list(set(shape_tags)),
+        "rich_text": rich_text,
+        "target_text": rich_text # 兼容旧代码 Key
+    }
+
+def main():
+    # 扫描所有 .json 文件 (排除掉我们自己生成的 attribute json)
+    json_files = glob.glob(os.path.join(DATA_ROOT, "**", "*.json"), recursive=True)
+    
+    # 过滤掉非 GT 的 json (比如生成的 prompt json)
+    json_files = [f for f in json_files if "attribute_info" not in f and "global_label" not in f]
+    
+    print(f"🔍 Found {len(json_files)} SA-1B JSON files. Analyzing...")
+    
+    prompt_dict = {} # 用于保存结果的字典
+    
+    for json_path in tqdm(json_files):
+        filename = os.path.basename(json_path)
+        # 假设图片名和json名一致 (e.g., img.tif, img.json)
+        # 或者是 img.tif 对应 img.json
+        # 我们用图片文件名作为 Key
+        img_name = filename.replace(".json", ".tif") 
+        # 如果您的数据集中是 .png，请改为 .png
+        if not os.path.exists(os.path.join(os.path.dirname(json_path), img_name)):
+             img_name = filename.replace(".json", ".png")
+
+        # 1. 解码 Mask
+        try:
+            mask = decode_sa1b_mask(json_path)
+        except Exception as e:
+            print(f"❌ Error decoding {filename}: {e}")
+            continue
             
-            attribute_info[img_id] = {
-                'attribute_prompts': attribute_prompts,
-                'attribute_labels': attribute_labels
-            }
-    
-    # 保存转换后的文件
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(attribute_info, f, indent=2, ensure_ascii=False)
-    
-    print(f"✓ 成功转换 {len(attribute_info)} 个图像")
-    print(f"  输入文件: {input_path}")
-    print(f"  输出文件: {output_path}")
-    print(f"  属性类别数: {num_classes_per_attr}")
+        # 2. 分析属性
+        if np.sum(mask) == 0:
+            continue # 空 Mask 跳过
+            
+        attrs = analyze_mask(mask)
+        
+        # 3. 记录
+        # 添加 PromptNu 风格的 attribute_prompts 字段
+        all_prompts = []
+        for k in ["color", "size", "shape", "density", "arrange"]:
+            all_prompts.extend(attrs[k])
+        attrs["attribute_prompts"] = all_prompts
+        
+        # 以图片文件名 (xxx.tif) 为 Key
+        prompt_dict[img_name] = attrs
 
+    # 保存为 Dict 格式 (供 DataLoader 使用)
+    with open(OUTPUT_JSON, 'w') as f:
+        json.dump(prompt_dict, f, indent=4)
+        
+    print(f"✅ Saved attributes to {OUTPUT_JSON}")
+    print(f"   Total processed: {len(prompt_dict)}")
 
-if __name__ == '__main__':
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='转换 global_label JSON 为 attribute_info 格式')
-    parser.add_argument('--input', type=str, required=True, help='输入的 global_label JSON 文件路径')
-    parser.add_argument('--output', type=str, required=True, help='输出的 attribute_info JSON 文件路径')
-    parser.add_argument('--num_classes', nargs=5, type=int, default=[3, 5, 4, 3, 3],
-                        help='每个属性的类别数量 [颜色, 形状, 排列, 大小, 分布]')
-    
-    args = parser.parse_args()
-    
-    convert_global_labels(
-        input_path=args.input,
-        output_path=args.output,
-        num_classes_per_attr=args.num_classes
-    )
-
-
-
-
-
-
+if __name__ == "__main__":
+    main()
