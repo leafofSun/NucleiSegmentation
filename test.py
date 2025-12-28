@@ -278,7 +278,8 @@ def main(args):
         
         # 🔥 [关键] 强制使用 Organ Prompt
         # prompt_text, organ_name = get_smart_prompt(filename)
-        prompt_text = "Cell nuclei"  # <--- 强制回退到通用提示
+        prompt_text = "A photo of a cat"  # <--- 强制回退到通用提示
+        print(f"🧪 DEBUG TEST: Prompt is {prompt_text}")
         organ_name = "Generic"
         # 打印出来确认一下！
         # tqdm.write(f"Processing {filename} -> Organ: {organ_name} | Prompt: {prompt_text[:30]}...")

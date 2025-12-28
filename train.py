@@ -246,14 +246,14 @@ def validate_one_epoch(args, model, val_loader, epoch):
     return avg_results
 
 def main(args):
-    setup_seed(args.seed)rk_dir, "models", args.run_name), exist_ok=True)
+    setup_seed(args.seed)
+    os.makedirs(os.path.join(args.work_dir, "models", args.run_name), exist_ok=True)
     os.makedirs(os.path.join(args.work_dir, "logs"), exist_ok=True)
     
-    logger = get_logger(os.path.join
-    os.makedirs(os.path.join(args.wo(args.work_dir, "logs", f"{args.run_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.log"))
+    logger = get_logger(os.path.join(args.work_dir, "logs", f"{args.run_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.log"))
     logger.info(f"Args: {args}")
 
-    # ===显式分离训练集和测试集路径 ===
+    # === 🔥 [关键修改] 显式分离训练集和测试集路径 ===
     # 假设您的目录结构是 data/MoNuSeg_SA1B/train 和 data/MoNuSeg_SA1B/test
     train_root = os.path.join(args.data_path, "train")
     val_root = os.path.join(args.data_path, "test")
@@ -289,9 +289,26 @@ def main(args):
         requires_name=True,
         prompt_path=args.prompt_path 
     )
-    
     logger.info(f"Train Data: {len(train_dataset)} | Val Data: {len(val_dataset)}")
 
+    # === DataLoader ===
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=True, 
+        collate_fn=stack_dict_batched
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=1, 
+        shuffle=False, 
+        num_workers=2, 
+        pin_memory=True, 
+        collate_fn=stack_dict_batched
+    )
     # === Model ===
     logger.info("Building TextSam...")
     vanilla_sam = sam_model_registry[args.model_type](args)

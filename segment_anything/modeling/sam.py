@@ -157,16 +157,12 @@ class TextSam(Sam):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
         
         print(f"Loading CLIP model: {clip_model_name}...")
-        clip_model, _ = clip.load(clip_model_name, device="cpu")
-        bi_prompts = ["Nuclei", "Background"]
-        text_tokens = clip.tokenize(bi_prompts)
-        with torch.no_grad():
-            text_features = clip_model.encode_text(text_tokens)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            text_features = text_features.float()
-        self.register_buffer("text_features_static", text_features.unsqueeze(0)) 
-        del clip_model 
-
+        # 🔥 [修改 1] 保留 CLIP 模型，转到 GPU
+        self.clip_model, _ = clip.load(clip_model_name, device="cpu")
+        # 冻结 CLIP 参数以节省显存/防止破坏预训练
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+            
         self.prompt_generator = TextGuidedPointGenerator(
             embed_dim=embed_dim,
             text_dim=text_dim
@@ -187,31 +183,47 @@ class TextSam(Sam):
 
     def forward(self, batched_input, multimask_output=False):
         # 1. 图像编码
-        # 注意：这里的 input_images 是 padding 后的（例如 1024x1024）
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         image_embeddings = self.image_encoder(input_images) 
 
-        # 2. 文本特征
-        B = len(batched_input)
-        text_features = self.text_features_static.expand(B, -1, -1) 
+        # === 🔥 [修改 2] 动态生成文本特征 ===
+        # 获取当前 batch 的所有文本
+        # 假设 batched_input[i]["text_prompt"] 是 "Kidney cell"
+        # 我们需要构造配对: ["Kidney cell", "Background"]
+        
+        device = image_embeddings.device
+        # 确保 CLIP 在正确的设备上
+        if self.clip_model.visual.conv1.weight.device != device:
+            self.clip_model = self.clip_model.to(device)
 
-        # 3. 热力图
+        batch_text_features = []
+        for x in batched_input:
+            prompt = x.get("text_prompt", "Nuclei") # 获取 Prompt
+            # 构造正负样本对: [Prompt, "Background"]
+            # 注意: PromptNu 可能是用 "Background" 或者 "Tissue" 作为负样本
+            pair_prompts = [prompt, "Background"] 
+            
+            text_tokens = clip.tokenize(pair_prompts).to(device)
+            with torch.no_grad():
+                # [2, 512]
+                feats = self.clip_model.encode_text(text_tokens)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                feats = feats.float()
+            batch_text_features.append(feats)
+            
+        # 堆叠成 [B, 2, 512]
+        text_features = torch.stack(batch_text_features, dim=0)
+
+        # 3. 热力图 (使用动态生成的 text_features)
         heatmap_logits = self.prompt_generator(image_embeddings, text_features)
         
         # 4. 提取点 (Feature Map Scale)
         points_in_feat, point_labels = self.prompt_generator.get_points_from_heatmap(heatmap_logits, topk=1)
         
-        # 5. 坐标映射 (Feature Map -> Image Scale)
-        # [CRITICAL FIX]
-        # 特征图大小: 64
+        # 5. 坐标映射
         feat_size = image_embeddings.shape[-1] 
-        # 输入图大小: 1024 (ImageEncoderViT 的默认输入尺寸)
         input_size = self.image_encoder.img_size 
-        
-        # 计算缩放倍率 (1024 / 64 = 16)
         scale_factor = input_size / feat_size
-        
-        # 映射坐标并居中
         point_coords = (points_in_feat * scale_factor) + (scale_factor * 0.5)
 
         # 6. SAM 解码
@@ -232,7 +244,6 @@ class TextSam(Sam):
         # 7. 结果封装
         outputs = []
         for i in range(len(batched_input)):
-            # 后处理: 还原到原始图片的实际大小 (例如 256x256)
             mask_post = self.postprocess_masks(
                 low_res_masks[i],
                 input_size=batched_input[i]["image"].shape[-2:], 
