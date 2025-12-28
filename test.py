@@ -180,7 +180,7 @@ def postprocess_watershed(prob_map, thresh=0.35, min_distance=3):
     
     return (final_mask > 0).astype(np.uint8)
 
-def sliding_window_inference(model, image, device, patch_size=256, stride=128, text_prompt="Cell nuclei"):
+def sliding_window_inference(model, image, device, patch_size=256, stride=128, text_prompt="Cell nuclei",filename=None):
     h, w = image.shape[:2]
     # Padding
     pad_h = (patch_size - h % patch_size) % patch_size
@@ -211,7 +211,13 @@ def sliding_window_inference(model, image, device, patch_size=256, stride=128, t
                 
                 outputs = model(input_sample, multimask_output=True)
                 out = outputs[0]
-                
+                # 🔥 [新增] 可视化 Heatmap
+                heatmap = out['heatmap_logits'] # [1, 2, H, W]
+                # 取出前景通道 (Channel 0)
+                fg_map = torch.sigmoid(heatmap[0, 0]).cpu().numpy() 
+                # 归一化到 0-255 并保存
+                fg_map_vis = (fg_map * 255).astype(np.uint8)
+                cv2.imwrite(f"workdir/debug_heatmap_{filename}.png", fg_map_vis)
                 scores = out['iou_predictions'].squeeze()
                 best_idx = torch.argmax(scores).item()
                 logits = out['masks'][0, best_idx, :, :]
@@ -289,7 +295,8 @@ def main(args):
             model, image_rgb, args.device, 
             patch_size=args.patch_size, 
             stride=args.stride,
-            text_prompt=prompt_text # 传入精准文本
+            text_prompt=prompt_text,# 传入精准文本
+            filename=filename
         )
         
         # Post-process
