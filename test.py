@@ -8,6 +8,7 @@ from collections import defaultdict
 from segment_anything import sam_model_registry
 from segment_anything.modeling.sam import TextSam 
 from metrics import SegMetrics
+import torch.nn.functional as F
 
 # 后处理库
 from skimage.segmentation import watershed
@@ -22,7 +23,6 @@ except ImportError:
     pass
 
 # === 🔥 [核心] MoNuSeg 测试集器官映射表 (Hardcoded) ===
-# 只要文件名包含 Key，就自动使用对应的 Prompt
 ORGAN_MAP = {
     "TCGA-2Z-A9J9": "Prostate", "TCGA-44-2665": "Kidney", 
     "TCGA-69-7764": "Kidney", "TCGA-A6-2675": "Colorectal",
@@ -33,28 +33,27 @@ ORGAN_MAP = {
     "TCGA-HC-7209": "Lung", "TCGA-HT-8564": "Brain"
 }
 
-def get_smart_prompt(filename):
+def get_organ_prompt(filename):
     """根据文件名自动返回最精准的 Organ Prompt"""
-    organ = "tissue"
     for key, val in ORGAN_MAP.items():
         if key in filename:
-            organ = val
-            break
-            
-    # 构造 Rich Text
-    # 这里的形容词是我们根据病理经验加的，强迫模型关注形态
-    prompt = f"Deep purple {organ} cell nuclei, densely packed, H&E stained"
-    return prompt, organ
+            return f"{val} cell nuclei"
+    return "Cell nuclei"
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work_dir", type=str, default="workdir")
     parser.add_argument("--run_name", type=str, default="text-guided-sam-rich") 
-    parser.add_argument("--patch_size", type=int, default=256)
+    
+    # 🔥 [关键设置]
+    # patch_size: 滑动窗口大小 (从原图切多大)，建议 256
+    parser.add_argument("--patch_size", type=int, default=256, help="Sliding window crop size")
+    # image_size: 模型输入大小 (必须与训练时一致，即 1024)
+    parser.add_argument("--image_size", type=int, default=1024, help="Model input resolution")
+    
     parser.add_argument("--stride", type=int, default=128)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument("--data_path", type=str, default="data/MoNuSeg_SA1B/test") 
-    parser.add_argument("--prompt_path", type=str, default=None, help="Deprecated. We use hardcoded map.")
     parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'])
     parser.add_argument("--model_type", type=str, default="vit_b")
     parser.add_argument("--checkpoint", type=str, required=True)
@@ -64,13 +63,9 @@ def parse_args():
     return parser.parse_args()
 
 def load_gt_mask(img_path):
-    """
-    全能型 GT 加载函数：支持 JSON, PNG, _mask, Labels 目录等多种变体
-    """
-    import json # <--- 🔥 [关键修复] 强制在函数内引入 json 模块
+    """全能型 GT 加载函数"""
+    import json
     import os
-    import cv2
-    import numpy as np
     try:
         from pycocotools import mask as coco_mask
     except ImportError:
@@ -79,22 +74,18 @@ def load_gt_mask(img_path):
     base_name = os.path.splitext(os.path.basename(img_path))[0]
     dir_name = os.path.dirname(img_path)
     
-    # 1. 尝试同名 SA-1B JSON
-    json_path = os.path.splitext(img_path)[0] + ".json"
-    
-    # 尝试读取图片获取尺寸
+    # 读取图片尺寸
     temp_img = cv2.imread(img_path)
-    if temp_img is None: 
-        # print(f"⚠️ Image not found: {img_path}")
-        return None
+    if temp_img is None: return None
     h, w = temp_img.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     
-    # === 策略 A: 读取 JSON ===
+    # 1. 尝试 JSON
+    json_path = os.path.splitext(img_path)[0] + ".json"
     if os.path.exists(json_path):
         try:
             with open(json_path, 'r') as f:
-                data = json.load(f) # 现在这里绝对不会报 name 'json' is not defined 了
+                data = json.load(f)
             anns = data.get('annotations', [])
             if not anns and isinstance(data, list): anns = data
             found_ann = False
@@ -109,78 +100,48 @@ def load_gt_mask(img_path):
                         for poly in seg:
                             pts = np.array(poly, dtype=np.int32).reshape((-1, 2))
                             cv2.fillPoly(mask, [pts], 1)
-            if found_ann: 
-                # print(f"✅ Loaded GT from JSON: {json_path}")
-                return mask
+            if found_ann: return mask
         except Exception as e:
             print(f"⚠️ Error parsing JSON {json_path}: {e}")
 
-    # === 策略 B: 读取 PNG/TIF Mask ===
-    # MoNuSeg 常见的 Mask 存放位置
+    # 2. 尝试 PNG/TIF
     candidates = [
-        # 1. 同目录下同名
         os.path.join(dir_name, base_name + ".png"),
         os.path.join(dir_name, base_name + ".tif"),
-        # 2. 同目录下加后缀
         os.path.join(dir_name, base_name + "_mask.png"),
-        os.path.join(dir_name, base_name + "_label.png"),
-        # 3. 父目录下的 Labels/BinaryMask 文件夹
         img_path.replace("Images", "Labels").replace(".tif", ".png"),
         img_path.replace("test", "test/Labels").replace(".tif", ".png"),
-        # 4. 暴力替换扩展名
-        img_path.replace(".tif", ".png"),
-        img_path.replace(".tif", "_mask.png")
+        img_path.replace(".tif", ".png")
     ]
     
     for p in candidates:
         if os.path.exists(p):
-            m = cv2.imread(p, 0) # 读取灰度
+            m = cv2.imread(p, 0)
             if m is not None:
-                # print(f"✅ Loaded GT from PNG: {p}")
-                # 确保尺寸一致
                 if m.shape != (h, w):
                     m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
                 return (m > 0).astype(np.uint8)
-    
-    # print(f"❌ No GT found for {base_name}")
     return None
 
-from skimage.segmentation import watershed
-from skimage.feature import peak_local_max
-from skimage.morphology import remove_small_objects, opening, disk
-from scipy import ndimage
-
 def postprocess_watershed(prob_map, thresh=0.35, min_distance=3):
-    """
-    适配 TextSam 的距离变换分水岭
-    """
-    # 1. 激进的二值化：只要有 35% 把握就认为是前景，先召回再切分
+    """分水岭后处理"""
     binary_mask = prob_map > thresh
     binary_mask = opening(binary_mask, disk(1))
-    # 2. 稍微腐蚀一点点，断开极其细微的粘连
-    # binary_mask = opening(binary_mask, disk(1)) 
-    
-    # 3. 计算距离场：越靠近细胞中心，值越大
     distance = ndimage.distance_transform_edt(binary_mask)
-    
-    # 4. 寻找山峰 (种子点)
-    # min_distance=3 是关键！允许两个细胞核中心距离只有3像素
-    # 这能解决 MoNuSeg 中那种极其拥挤的细胞粘连
+    # min_distance 越小，切分越细致
     coords = peak_local_max(distance, min_distance=min_distance, labels=binary_mask)
-    
     mask = np.zeros(distance.shape, dtype=bool)
     mask[tuple(coords.T)] = True
     markers, _ = ndimage.label(mask)
-    
-    # 5. 执行分水岭：让水从 markers 开始流，填满 binary_mask
     labels = watershed(-distance, markers, mask=binary_mask)
-    
-    # 6. 去除噪点
     final_mask = remove_small_objects(labels, min_size=15)
-    
     return (final_mask > 0).astype(np.uint8)
 
-def sliding_window_inference(model, image, device, patch_size=256, stride=128, text_prompt="Cell nuclei",filename=None):
+def sliding_window_inference(model, image, device, patch_size=256, image_size=1024, stride=128, text_prompt="Cell nuclei", filename=None):
+    """
+    🔥 显微镜模式推理逻辑：
+    Input(256) -> Resize(1024) -> Model(1024) -> Output(1024) -> Resize(256) -> Stitch
+    """
     h, w = image.shape[:2]
     # Padding
     pad_h = (patch_size - h % patch_size) % patch_size
@@ -200,30 +161,46 @@ def sliding_window_inference(model, image, device, patch_size=256, stride=128, t
     with torch.no_grad():
         for y in y_steps:
             for x in x_steps:
+                # 1. 切片 (256x256)
                 patch = image_pad[y:y+patch_size, x:x+patch_size, :]
-                img_tensor = torch.from_numpy(patch).permute(2, 0, 1).float().to(device)
+                
+                # 2. 🔥 放大 (Resize 256 -> 1024)
+                # 这里的 interpolation 必须用线性插值，保证图像平滑
+                patch_large = cv2.resize(patch, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+                
+                img_tensor = torch.from_numpy(patch_large).permute(2, 0, 1).float().to(device)
                 
                 input_sample = [{
                     'image': img_tensor,
-                    'original_size': (patch_size, patch_size),
+                    # 告诉模型：现在的图是 1024 的。SAM 会输出 1024 的 Mask。
+                    'original_size': (image_size, image_size), 
                     'text_prompt': text_prompt
                 }]
                 
+                # 3. 推理 (输出也是 1024x1024)
                 outputs = model(input_sample, multimask_output=True)
                 out = outputs[0]
-                # 🔥 [新增] 可视化 Heatmap
-                heatmap = out['heatmap_logits'] # [1, 2, H, W]
-                # 取出前景通道 (Channel 0)
-                fg_map = torch.sigmoid(heatmap[0, 0]).cpu().numpy() 
-                # 归一化到 0-255 并保存
-                fg_map_vis = (fg_map * 255).astype(np.uint8)
-                cv2.imwrite(f"workdir/debug_heatmap_{filename}.png", fg_map_vis)
+                
+                # 可选：保存 Heatmap 调试
+                if filename and y==0 and x==0:
+                    heatmap = out['heatmap_logits']
+                    fg_map = torch.sigmoid(heatmap[0, 0]).cpu().numpy()
+                    fg_map_vis = (fg_map * 255).astype(np.uint8)
+                    cv2.imwrite(f"workdir/debug_heatmap_{filename}.png", fg_map_vis)
+                
+                # 获取 Mask logits (1024x1024)
                 scores = out['iou_predictions'].squeeze()
                 best_idx = torch.argmax(scores).item()
-                logits = out['masks'][0, best_idx, :, :]
-                prob = torch.sigmoid(logits).cpu().numpy()
+                logits_large = out['masks'][0, best_idx, :, :] 
                 
-                prob_map_full[y:y+patch_size, x:x+patch_size] += prob
+                # 4. 🔥 缩小 (Resize 1024 -> 256)
+                # 把高分辨率的预测结果还原回原图切片尺寸
+                logits_large = logits_large.unsqueeze(0).unsqueeze(0) # [1, 1, 1024, 1024]
+                logits_small = F.interpolate(logits_large, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
+                prob_small = torch.sigmoid(logits_small).squeeze().cpu().numpy() # [256, 256]
+                
+                # 5. 累加
+                prob_map_full[y:y+patch_size, x:x+patch_size] += prob_small
                 count_map_full[y:y+patch_size, x:x+patch_size] += 1.0
                 
     count_map_full[count_map_full == 0] = 1.0
@@ -233,12 +210,12 @@ def sliding_window_inference(model, image, device, patch_size=256, stride=128, t
 def main(args):
     print('*'*60)
     print(f"🚀 Running Inference: {args.run_name}")
-    print(f"   Patch: {args.patch_size} | Watershed: {args.use_watershed}")
-    print(f"   Prompt Strategy: Hardcoded Organ Mapping (Robust)")
+    print(f"   Input Patch (Crop): {args.patch_size} -> Model Input (Zoom): {args.image_size}")
+    print(f"   Strategy: Microscope Mode (Zoom-in & Stitch)")
+    print(f"   Watershed: {args.use_watershed}")
     print('*'*60)
 
-    args.image_size = args.patch_size 
-    args.sam_checkpoint = None 
+    # ❌ 绝对不要写 args.image_size = args.patch_size，否则前功尽弃
 
     # Model
     vanilla_sam = sam_model_registry[args.model_type](args)
@@ -253,11 +230,12 @@ def main(args):
     
     # Checkpoint
     if os.path.exists(args.checkpoint):
+        print(f"🔄 Loading checkpoint: {args.checkpoint}")
+        # 这里已经是 1024 的权重了，不需要再做 resize_pos_embed
         checkpoint = torch.load(args.checkpoint, map_location=args.device)
         state_dict = checkpoint.get('model', checkpoint)
         model.load_state_dict(state_dict, strict=False)
-        model.eval()
-        print("✅ Checkpoint Loaded.")
+        print("✅ Checkpoint Loaded Successfully.")
     else:
         print(f"❌ Checkpoint not found at {args.checkpoint}")
         return
@@ -271,7 +249,6 @@ def main(args):
     
     print(f"📂 Found {len(image_files)} test images.")
     all_metrics = defaultdict(list)
-    
     save_dir = os.path.join(args.work_dir, args.run_name, "viz_final")
     if args.save_pred: os.makedirs(save_dir, exist_ok=True)
 
@@ -282,31 +259,29 @@ def main(args):
         if image is None: continue
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # 🔥 [关键] 强制使用 Organ Prompt
-        # prompt_text, organ_name = get_smart_prompt(filename)
-        prompt_text = "A photo of a cat"  # <--- 强制回退到通用提示
-        print(f"🧪 DEBUG TEST: Prompt is {prompt_text}")
-        organ_name = "Generic"
-        # 打印出来确认一下！
-        # tqdm.write(f"Processing {filename} -> Organ: {organ_name} | Prompt: {prompt_text[:30]}...")
+        # 获取 Prompt
+        prompt_text = get_organ_prompt(filename)
+        # prompt_text = "A photo of a cat" # 👈 测试用：如果想测鲁棒性，取消这行注释
         
-        # Inference
+        # 推理
         pred_prob = sliding_window_inference(
             model, image_rgb, args.device, 
-            patch_size=args.patch_size, 
+            patch_size=args.patch_size, # 256
+            image_size=args.image_size, # 1024 (关键！)
             stride=args.stride,
-            text_prompt=prompt_text,# 传入精准文本
+            text_prompt=prompt_text,
             filename=filename
         )
         
-        # Post-process
+        # 后处理
         if args.use_watershed:
-            # 调整参数：thresh=0.4 (捕获更多), min_distance=5 (切得更细)
-            pred_mask = postprocess_watershed(pred_prob, thresh=0.4, min_distance=5)
+            # 这里的参数可以根据 1024 训练后的表现微调
+            # 如果发现粘连还是多，把 min_distance 改成 4 或 5
+            pred_mask = postprocess_watershed(pred_prob, thresh=0.4, min_distance=3)
         else:
             pred_mask = (pred_prob > 0.5).astype(np.uint8)
         
-        # Metrics
+        # 指标计算
         gt_mask = load_gt_mask(img_path)
         if gt_mask is not None:
             if gt_mask.shape != pred_mask.shape:
@@ -315,20 +290,21 @@ def main(args):
             for k, v in res.items():
                 all_metrics[k].append(v)
         
-        # Viz
+        # 可视化
         if args.save_pred:
             vis = image.copy()
             cnts, _ = cv2.findContours(pred_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(vis, cnts, -1, (0, 255, 0), 2)
-            cv2.putText(vis, f"{organ_name}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            cv2.putText(vis, f"{prompt_text[:15]}...", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
             cv2.imwrite(os.path.join(save_dir, filename.replace('.tif','.jpg')), vis)
 
     print("\n" + "="*40)
-    print(f"📊 Final Results (Watershed+, RichPrompt):")
+    print(f"📊 Final Results (Microscope Mode):")
     for k, v in all_metrics.items():
         if len(v) > 0:
             print(f"{k:>10}: {np.mean(v):.4f}")
     print("="*40)
 
 if __name__ == '__main__':
-    main(parse_args())
+    args = parse_args()
+    main(args)

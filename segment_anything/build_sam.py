@@ -49,7 +49,7 @@ def build_sam_vit_b(args):
         encoder_num_heads=12,
         encoder_global_attn_indexes=[2, 5, 8, 11],
         image_size=args.image_size,
-        checkpoint=args.sam_checkpoint,
+        checkpoint=args.checkpoint,
         encoder_adapter = args.encoder_adapter,
         use_multimodal_prompt=getattr(args, 'use_multimodal_prompt', False),
         clip_model_path=getattr(args, 'clip_model_path', None),

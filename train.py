@@ -39,7 +39,8 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default="text-guided-sam-rich", help="run model name")
     parser.add_argument("--epochs", type=int, default=100, help="number of epochs")
     parser.add_argument("--batch_size", type=int, default=2, help="train batch size")
-    parser.add_argument("--image_size", type=int, default=256, help="image_size")
+    parser.add_argument("--image_size", type=int, default=1024, help="image_size")
+    parser.add_argument("--crop_size", type=int, default=256, help="crop size for augmentation")
     parser.add_argument("--mask_num", type=int, default=1, help="get mask number")
     parser.add_argument("--data_path", type=str, default="data/MoNuSeg_SA1B", help="train data path")
     parser.add_argument("--prompt_path", type=str, default="data/MoNuSeg_SA1B/attribute_info_train.json", help="Path to the prompt JSON file")
@@ -245,6 +246,38 @@ def validate_one_epoch(args, model, val_loader, epoch):
         
     return avg_results
 
+def resize_pos_embed(state_dict, model_state_dict):
+    """
+    自动调整 ViT 位置编码的尺寸 (256 -> 1024)
+    """
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k in model_state_dict:
+            # 检查形状是否一致
+            if v.shape != model_state_dict[k].shape:
+                # print(f"⚠️ Resizing {k}: {v.shape} -> {model_state_dict[k].shape}")
+                
+                # 1. 处理绝对位置编码 (pos_embed)
+                # v: [1, H_old, W_old, C] -> [1, H_new, W_new, C]
+                if 'pos_embed' in k:
+                    v = v.permute(0, 3, 1, 2) # [1, C, H, W]
+                    v = F.interpolate(v, size=model_state_dict[k].shape[1:3], mode='bicubic', align_corners=False)
+                    v = v.permute(0, 2, 3, 1) # [1, H, W, C]
+                
+                # 2. 处理相对位置编码 (rel_pos)
+                # v: [2*H_old-1, C] -> [2*H_new-1, C]
+                elif 'rel_pos' in k:
+                    # 变为 [1, C, L] 格式进行插值
+                    v = v.unsqueeze(0).permute(0, 2, 1) 
+                    target_len = model_state_dict[k].shape[0]
+                    v = F.interpolate(v, size=target_len, mode='linear', align_corners=False)
+                    v = v.permute(0, 2, 1).squeeze(0)
+            
+            new_state_dict[k] = v
+        else:
+            # 如果 key 不在模型里（比如 head），还是保留
+            new_state_dict[k] = v
+    return new_state_dict
 def main(args):
     setup_seed(args.seed)
     os.makedirs(os.path.join(args.work_dir, "models", args.run_name), exist_ok=True)
@@ -253,7 +286,7 @@ def main(args):
     logger = get_logger(os.path.join(args.work_dir, "logs", f"{args.run_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.log"))
     logger.info(f"Args: {args}")
 
-    # === 🔥 [关键修改] 显式分离训练集和测试集路径 ===
+    # === 显式分离训练集和测试集路径 ===
     # 假设您的目录结构是 data/MoNuSeg_SA1B/train 和 data/MoNuSeg_SA1B/test
     train_root = os.path.join(args.data_path, "train")
     val_root = os.path.join(args.data_path, "test")
@@ -269,7 +302,8 @@ def main(args):
     # 1. 训练集: 读取 Rich Prompt (JSON)
     train_dataset = TrainingDataset(
         train_root,  # <--- 指向 train 文件夹
-        image_size=args.image_size, 
+        image_size=args.image_size,
+        crop_size=args.crop_size, 
         mode='train', 
         point_num=1, 
         mask_num=args.mask_num, 
@@ -282,7 +316,8 @@ def main(args):
     # DataLoader 查不到测试图的 Key，会自动回退到 "Cell nuclei"，这正是我们想要的 Zero-shot 验证！
     val_dataset = TrainingDataset(
         val_root,    # <--- 指向 test 文件夹
-        image_size=args.image_size, 
+        image_size=args.image_size,
+        crop_size=args.crop_size, 
         mode='test', # 验证模式 (无随机增强)
         point_num=1, 
         mask_num=args.mask_num, 
@@ -312,14 +347,22 @@ def main(args):
     # === Model ===
     logger.info("Building TextSam...")
     vanilla_sam = sam_model_registry[args.model_type](args)
+    # Checkpoint
     if args.sam_checkpoint and os.path.exists(args.sam_checkpoint):
         try:
             ckpt = torch.load(args.sam_checkpoint, map_location=args.device, weights_only=False)
         except:
             ckpt = torch.load(args.sam_checkpoint, map_location=args.device)
+        
         state_dict = ckpt.get("model", ckpt)
+        
+        # 调用插值函数
+        print("🔄 Detected resolution mismatch. Interpolating position embeddings...")
+        state_dict = resize_pos_embed(state_dict, vanilla_sam.state_dict())
+        
+        # 加载调整后的权重
         vanilla_sam.load_state_dict(state_dict, strict=False)
-        logger.info("Loaded vanilla SAM checkpoint.")
+        logger.info("✅ Loaded & Resized SAM checkpoint (256 -> 1024).")
 
     model = TextSam(
         image_encoder=vanilla_sam.image_encoder,
