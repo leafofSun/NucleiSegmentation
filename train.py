@@ -19,7 +19,6 @@ except ImportError:
     from torch.cuda.amp import autocast, GradScaler
 
 from segment_anything import sam_model_registry
-# 假设 TextSam 类定义在 segment_anything.modeling.sam 中
 from segment_anything.modeling.sam import TextSam 
 from DataLoader import TrainingDataset, stack_dict_batched
 from utils import FocalDiceloss_IoULoss, get_logger
@@ -35,22 +34,29 @@ from metrics import SegMetrics
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work_dir", type=str, default="workdir", help="work dir")
-    # 建议修改 run_name 以区分之前的实验
-    parser.add_argument("--run_name", type=str, default="text-guided-sam-rich", help="run model name")
+    parser.add_argument("--run_name", type=str, default="text-guided-sam-dynamic", help="run model name")
     parser.add_argument("--epochs", type=int, default=100, help="number of epochs")
     parser.add_argument("--batch_size", type=int, default=2, help="train batch size")
+    
+    # 🔥 Microscope mode must be 1024
     parser.add_argument("--image_size", type=int, default=1024, help="image_size")
     parser.add_argument("--crop_size", type=int, default=256, help="crop size for augmentation")
+    
     parser.add_argument("--mask_num", type=int, default=1, help="get mask number")
     parser.add_argument("--data_path", type=str, default="data/MoNuSeg_SA1B", help="train data path")
-    parser.add_argument("--prompt_path", type=str, default="data/MoNuSeg_SA1B/attribute_info_train.json", help="Path to the prompt JSON file")
-    parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'], help="metrics")
+    
+    # 🔥 Path to Dynamic Attributes
+    parser.add_argument("--dynamic_path", type=str, default="data/MoNuSeg_SA1B/dynamic_instance_attributes.json", help="Path to dynamic attributes")
+    
+    # 🔥 Added extra metrics here
+    parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ', 'mDQ', 'mSQ'], help="metrics")
+    
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument("--lr", type=float, default=1e-4, help="learning rate") # 建议 1e-4
+    parser.add_argument("--lr", type=float, default=1e-4, help="learning rate") 
     parser.add_argument("--min_lr", type=float, default=1e-6, help="min learning rate")
     parser.add_argument("--resume", type=str, default=None, help="load resume")
     parser.add_argument("--model_type", type=str, default="vit_b", help="sam model_type")
-    # 建议使用原始权重重新开始训练
+    
     parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d_b.pth", help="sam checkpoint")
     parser.add_argument("--use_amp", action='store_true', default=False, help="use amp")
     parser.add_argument("--encoder_adapter", action='store_true', default=True, help="use adapter")
@@ -79,7 +85,6 @@ def to_device(batch_input, device):
                 try:
                     device_input[key] = value.to(device)
                 except:
-                    # 对于字符串列表等无法 .to(device) 的数据，保持原样
                     device_input[key] = value
         else:
             device_input[key] = value
@@ -95,16 +100,14 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
     
     for batch, batched_input in enumerate(pbar):
         batched_input = to_device(batched_input, args.device)
-        labels = batched_input['label']
+        labels = batched_input['label'] 
         
         optimizer.zero_grad()
 
-        # === 🔥 [核心修改] 注入文本 Prompt ===
+        # === Inject Dynamic Prompt ===
         model_input = []
         images = batched_input['image']
         
-        # 获取 batch 里的文本列表
-        # 如果 DataLoader 没有返回 text_prompt，则使用默认值
         if 'text_prompt' in batched_input:
             texts = batched_input['text_prompt']
         else:
@@ -113,51 +116,56 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         for i in range(len(images)):
             sample = {
                 'image': images[i],
-                'text_prompt': texts[i]  # 显式注入文本!
+                'text_prompt': texts[i],
+                'original_size': (args.image_size, args.image_size)
             }
             if 'original_size' in batched_input:
                 sample['original_size'] = batched_input['original_size'][i]
             model_input.append(sample)
 
         with autocast('cuda', enabled=args.use_amp):
-            # 传入 model_input，TextSam 内部会处理 text_prompt
             outputs = model(model_input, multimask_output=True)
             
-            # --- Loss 计算 ---
             loss_batch = 0
             loss_m_val = 0
             loss_h_val = 0
             
             for i, out in enumerate(outputs):
-                # 1. Mask Loss
+                iou_preds = out['iou_predictions']
+                if iou_preds.ndim == 2:
+                    iou_preds = iou_preds.squeeze(0)
+                
+                best_idx = torch.argmax(iou_preds).item()
+                
                 if out['masks'].ndim == 4:
-                    pred_mask = out['masks'][0, 0, :, :] 
+                    pred_mask = out['masks'][0, best_idx, :, :] 
                 else:
-                    pred_mask = out['masks'][0, :, :]
+                    pred_mask = out['masks'][best_idx, :, :]
                 
-                gt_mask = labels[i].float()
-                if pred_mask.shape != gt_mask.shape[-2:]:
-                    gt_mask = F.interpolate(gt_mask.unsqueeze(0), size=pred_mask.shape[-2:], mode='nearest').squeeze(0)
+                pred_iou = iou_preds[best_idx]
+                gt_mask = labels[i].squeeze(0).float()
+                
+                if pred_mask.shape != gt_mask.shape:
+                    gt_mask = F.interpolate(gt_mask.unsqueeze(0).unsqueeze(0), size=pred_mask.shape, mode='nearest').squeeze()
 
-                pred_iou = out['iou_predictions'][0]
+                # === Loss Unpacking ===
+                loss_m, loss_dict = criterion(pred_mask.unsqueeze(0).unsqueeze(0), gt_mask.unsqueeze(0).unsqueeze(0), pred_iou.unsqueeze(0))
                 
-                # criterion 要求 [B, C, H, W]
-                loss_m = criterion(pred_mask.unsqueeze(0).unsqueeze(0), gt_mask.unsqueeze(0), pred_iou.unsqueeze(0))
-                
-                # 2. Heatmap Loss
+                # Heatmap Loss
                 pred_heatmap = out['heatmap_logits'] 
                 current_feat_size = pred_heatmap.shape[-2:] 
                 
                 with torch.no_grad():
                     gt_nuclei = F.interpolate(labels[i].float().unsqueeze(0), size=current_feat_size, mode='nearest').squeeze(0)
+                    # Handle Ignore Regions (255)
+                    valid_mask = (gt_nuclei != 255).float()
+                    gt_nuclei[gt_nuclei == 255] = 0 
                     gt_background = 1.0 - gt_nuclei
 
                 loss_h_pos = point_guidance_loss(pred_heatmap[0:1].unsqueeze(0), gt_nuclei.unsqueeze(0))
                 loss_h_neg = point_guidance_loss(pred_heatmap[1:2].unsqueeze(0), gt_background.unsqueeze(0))
                 loss_h = loss_h_pos + loss_h_neg
                 
-                # === 权重调整 ===
-                # 强迫 Decoder 输出 (2.0)，辅助 Heatmap (0.1)
                 loss_i = 2.0 * loss_m + 0.1 * loss_h
                 
                 loss_batch += loss_i
@@ -178,106 +186,109 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         mask_losses.append(loss_m_val / len(labels))
         heatmap_losses.append(loss_h_val / len(labels))
         
-        pbar.set_postfix(L=f"{final_loss.item():.3f}", M=f"{np.mean(mask_losses):.3f}", H=f"{np.mean(heatmap_losses):.3f}")
+        pbar.set_postfix(L=f"{final_loss.item():.3f}", Prompt=texts[0][:10])
 
     return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses)
 
 @torch.no_grad()
 def validate_one_epoch(args, model, val_loader, epoch):
     model.eval()
+    
+    # Record Positive Metrics (Generic)
     val_results = {k: [] for k in args.metrics}
-    obj_dices = [] # 记录有前景物体的 Dice
+    obj_dices = []
+    
+    # Record Negative Metrics (Rejection)
+    neg_responses = [] 
     
     pbar = tqdm(val_loader, desc=f"Val Ep {epoch+1}")
     
     for batch, batched_input in enumerate(pbar):
         batched_input = to_device(batched_input, args.device)
-        labels = batched_input['label'].cpu().numpy()
-        
-        # === 同样需要注入文本 ===
-        model_input = []
+        labels = batched_input['label'].cpu().numpy() 
         images = batched_input['image']
         
-        if 'text_prompt' in batched_input:
-            texts = batched_input['text_prompt']
-        else:
-            texts = ["Cell nuclei" for _ in range(len(images))]
-            
-        for i in range(len(images)):
-            sample = {
-                'image': images[i],
-                'text_prompt': texts[i]
-            }
-            if 'original_size' in batched_input:
-                sample['original_size'] = batched_input['original_size'][i]
-            model_input.append(sample)
-            
-        outputs = model(model_input, multimask_output=True)
+        # ==========================================
+        # 🟢 Round 1: Positive Validation (Generic Prompt)
+        # ==========================================
+        model_input_pos = []
+        texts_pos = ["Cell nuclei" for _ in range(len(images))]
         
-        for i, out in enumerate(outputs):
-            if out['masks'].ndim == 4:
-                logit = out['masks'][0, 0, :, :]
-            else:
-                logit = out['masks'][0, :, :]
+        for i in range(len(images)):
+            model_input_pos.append({
+                'image': images[i],
+                'text_prompt': texts_pos[i],
+                'original_size': (args.image_size, args.image_size)
+            })
             
-            prob = torch.sigmoid(logit).cpu().numpy()
-            pred_mask = (prob > 0.5).astype(np.uint8)
+        outputs_pos = model(model_input_pos, multimask_output=True)
+        
+        for i, out in enumerate(outputs_pos):
+            best_idx = torch.argmax(out['iou_predictions']).item()
+            pred_mask = (torch.sigmoid(out['masks'][0, best_idx]).cpu().numpy() > 0.5).astype(np.uint8)
             
             gt = labels[i]
             if gt.ndim == 3: gt = gt[0]
             
-            # 计算指标
+            # Calculate Metrics
             res = SegMetrics(pred_mask, gt, args.metrics)
             
-            # 如果 GT 有东西，记录 Obj Dice
-            if gt.sum() > 0:
-                obj_dices.append(res['dice'])
+            if gt.sum() > 0: obj_dices.append(res['dice'])
             
             for k, v in res.items():
-                if k in val_results:
-                    val_results[k].append(v)
-            
-    avg_results = {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in val_results.items()}
-    
-    if len(obj_dices) > 0:
-        avg_results['obj_dice'] = np.mean(obj_dices)
-    else:
-        avg_results['obj_dice'] = 0.0
+                if k in val_results: val_results[k].append(v)
+
+        # ==========================================
+        # 🔴 Round 2: Negative Validation (Negative Prompt)
+        # ==========================================
+        model_input_neg = []
+        texts_neg = ["A photo of a cat" for _ in range(len(images))] 
         
-    return avg_results
+        for i in range(len(images)):
+            model_input_neg.append({
+                'image': images[i],
+                'text_prompt': texts_neg[i], 
+                'original_size': (args.image_size, args.image_size)
+            })
+            
+        outputs_neg = model(model_input_neg, multimask_output=True)
+        
+        for i, out in enumerate(outputs_neg):
+            best_idx = torch.argmax(out['iou_predictions']).item()
+            pred_prob = torch.sigmoid(out['masks'][0, best_idx])
+            pred_mask_neg = (pred_prob > 0.5).float()
+            
+            # Response Ratio (should be close to 0)
+            response_ratio = pred_mask_neg.mean().item()
+            neg_responses.append(response_ratio)
+
+    # === Summary ===
+    avg_results = {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in val_results.items()}
+    avg_results['obj_dice'] = np.mean(obj_dices) if len(obj_dices) > 0 else 0.0
+    
+    avg_neg_response = np.mean(neg_responses) if len(neg_responses) > 0 else 0.0
+        
+    return avg_results, avg_neg_response
 
 def resize_pos_embed(state_dict, model_state_dict):
-    """
-    自动调整 ViT 位置编码的尺寸 (256 -> 1024)
-    """
     new_state_dict = {}
     for k, v in state_dict.items():
         if k in model_state_dict:
-            # 检查形状是否一致
             if v.shape != model_state_dict[k].shape:
-                # print(f"⚠️ Resizing {k}: {v.shape} -> {model_state_dict[k].shape}")
-                
-                # 1. 处理绝对位置编码 (pos_embed)
-                # v: [1, H_old, W_old, C] -> [1, H_new, W_new, C]
                 if 'pos_embed' in k:
-                    v = v.permute(0, 3, 1, 2) # [1, C, H, W]
+                    v = v.permute(0, 3, 1, 2)
                     v = F.interpolate(v, size=model_state_dict[k].shape[1:3], mode='bicubic', align_corners=False)
-                    v = v.permute(0, 2, 3, 1) # [1, H, W, C]
-                
-                # 2. 处理相对位置编码 (rel_pos)
-                # v: [2*H_old-1, C] -> [2*H_new-1, C]
+                    v = v.permute(0, 2, 3, 1)
                 elif 'rel_pos' in k:
-                    # 变为 [1, C, L] 格式进行插值
                     v = v.unsqueeze(0).permute(0, 2, 1) 
                     target_len = model_state_dict[k].shape[0]
                     v = F.interpolate(v, size=target_len, mode='linear', align_corners=False)
                     v = v.permute(0, 2, 1).squeeze(0)
-            
             new_state_dict[k] = v
         else:
-            # 如果 key 不在模型里（比如 head），还是保留
             new_state_dict[k] = v
     return new_state_dict
+
 def main(args):
     setup_seed(args.seed)
     os.makedirs(os.path.join(args.work_dir, "models", args.run_name), exist_ok=True)
@@ -286,83 +297,53 @@ def main(args):
     logger = get_logger(os.path.join(args.work_dir, "logs", f"{args.run_name}_{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.log"))
     logger.info(f"Args: {args}")
 
-    # === 显式分离训练集和测试集路径 ===
-    # 假设您的目录结构是 data/MoNuSeg_SA1B/train 和 data/MoNuSeg_SA1B/test
     train_root = os.path.join(args.data_path, "train")
     val_root = os.path.join(args.data_path, "test")
     
-    if not os.path.exists(train_root):
-        logger.warning(f"⚠️ Train dir {train_root} not found! Fallback to {args.data_path}")
-        train_root = args.data_path
-    if not os.path.exists(val_root):
-        logger.warning(f"⚠️ Test dir {val_root} not found! Fallback to {args.data_path}")
-        val_root = args.data_path
+    if not os.path.exists(train_root): train_root = args.data_path
+    if not os.path.exists(val_root): val_root = args.data_path
 
     # === Dataset ===
-    # 1. 训练集: 读取 Rich Prompt (JSON)
     train_dataset = TrainingDataset(
-        train_root,  # <--- 指向 train 文件夹
+        train_root, 
         image_size=args.image_size,
         crop_size=args.crop_size, 
         mode='train', 
-        point_num=1, 
         mask_num=args.mask_num, 
         requires_name=True,
-        prompt_path=args.prompt_path # 这里加载 attribute_info_train.json
+        dynamic_attr_path=args.dynamic_path
     )
     
-    # 2. 验证集: 指向 test 文件夹 (严格隔离)
-    # 注意: 这里的 prompt_path 虽然传了，但因为 JSON 里只有训练集文件名，
-    # DataLoader 查不到测试图的 Key，会自动回退到 "Cell nuclei"，这正是我们想要的 Zero-shot 验证！
     val_dataset = TrainingDataset(
-        val_root,    # <--- 指向 test 文件夹
+        val_root, 
         image_size=args.image_size,
         crop_size=args.crop_size, 
-        mode='test', # 验证模式 (无随机增强)
-        point_num=1, 
+        mode='test', 
         mask_num=args.mask_num, 
         requires_name=True,
-        prompt_path=args.prompt_path 
+        dynamic_attr_path=args.dynamic_path 
     )
     logger.info(f"Train Data: {len(train_dataset)} | Val Data: {len(val_dataset)}")
 
     # === DataLoader ===
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
-        num_workers=4, 
-        pin_memory=True, 
-        collate_fn=stack_dict_batched
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=1, 
-        shuffle=False, 
-        num_workers=2, 
-        pin_memory=True, 
-        collate_fn=stack_dict_batched
-    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=stack_dict_batched)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=2, pin_memory=True, collate_fn=stack_dict_batched)
+
     # === Model ===
     logger.info("Building TextSam...")
+    args.checkpoint = args.sam_checkpoint 
     vanilla_sam = sam_model_registry[args.model_type](args)
-    # Checkpoint
+    
     if args.sam_checkpoint and os.path.exists(args.sam_checkpoint):
         try:
             ckpt = torch.load(args.sam_checkpoint, map_location=args.device, weights_only=False)
         except:
             ckpt = torch.load(args.sam_checkpoint, map_location=args.device)
-        
         state_dict = ckpt.get("model", ckpt)
-        
-        # 调用插值函数
-        print("🔄 Detected resolution mismatch. Interpolating position embeddings...")
+        print("🔄 Interpolating position embeddings...")
         state_dict = resize_pos_embed(state_dict, vanilla_sam.state_dict())
-        
-        # 加载调整后的权重
         vanilla_sam.load_state_dict(state_dict, strict=False)
-        logger.info("✅ Loaded & Resized SAM checkpoint (256 -> 1024).")
+        logger.info("✅ Loaded & Resized SAM checkpoint.")
 
     model = TextSam(
         image_encoder=vanilla_sam.image_encoder,
@@ -374,14 +355,12 @@ def main(args):
     ).to(args.device)
     del vanilla_sam
 
-    # === Adapter Zero Init ===
-    print("\n🧹 [Force Reset] Enforcing Zero Initialization for Adapters...")
-    reset_cnt = 0
+    # === Reset Adapters ===
+    print("\n🧹 Enforcing Zero Initialization for Adapters...")
     for name, param in model.image_encoder.named_parameters():
         if "Adapter" in name and ("spatial.2.weight" in name or "channel.2.weight" in name):
             torch.nn.init.zeros_(param)
-            reset_cnt += 1
-    print(f"✅ Reset {reset_cnt} Adapter weights.")
+    print("✅ Adapters Reset.")
 
     # --- Optimizer & Scheduler ---
     params_to_optimize = [
@@ -393,7 +372,7 @@ def main(args):
         params_to_optimize.append({'params': adapter_params, 'lr': args.lr})
 
     optimizer = optim.AdamW(params_to_optimize, weight_decay=1e-4)
-    criterion = FocalDiceloss_IoULoss()
+    criterion = FocalDiceloss_IoULoss(ignore_index=255)
     scaler = GradScaler() if args.use_amp else None
 
     scheduler = None
@@ -402,25 +381,41 @@ def main(args):
 
     best_dice = 0.0
     
-    logger.info("Start Text-Guided Training (Rich Prompts)...")
+    logger.info("Start Dynamic Text-Guided Training...")
+    
     for epoch in range(args.epochs):
         avg_loss, avg_msk, avg_ht = train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler)
         
-        val_metrics = validate_one_epoch(args, model, val_loader, epoch)
+        val_metrics, val_neg_resp = validate_one_epoch(args, model, val_loader, epoch)
+        
         current_lr = optimizer.param_groups[0]["lr"]
         
-        # 安全获取指标
-        m_aji = val_metrics.get('mAJI', 0.0)
-        m_pq = val_metrics.get('mPQ', 0.0)
-        obj_dice = val_metrics.get('obj_dice', 0.0)
+        # 🔥 Extract Metrics for Logging
+        dice_score = val_metrics.get('dice', 0.0)
+        iou_score = val_metrics.get('iou', 0.0)
+        aji_score = val_metrics.get('mAJI', 0.0)
+        pq_score  = val_metrics.get('mPQ', 0.0)
+        dq_score  = val_metrics.get('mDQ', 0.0)
+        sq_score  = val_metrics.get('mSQ', 0.0)
         
-        logger.info(f"Ep {epoch+1} | LR: {current_lr:.2e} | Loss: {avg_loss:.4f} (M:{avg_msk:.3f} H:{avg_ht:.3f}) | Val Dice: {val_metrics['dice']:.4f} | Obj Dice: {obj_dice:.4f} | AJI: {m_aji:.4f} | PQ: {m_pq:.4f}")
+        # 🔥 Beautiful Logging
+        logger.info(
+            f"Ep {epoch+1} | "
+            f"Loss: {avg_loss:.4f} | "
+            f"Dice: {dice_score:.4f} | "
+            f"IoU: {iou_score:.4f} | "
+            f"AJI: {aji_score:.4f} | "
+            f"PQ: {pq_score:.4f} | "
+            f"DQ: {dq_score:.4f} | "
+            f"SQ: {sq_score:.4f} | "
+            f"NegResp: {val_neg_resp:.4f}"
+        )
         
         if scheduler is not None:
             scheduler.step()
             
-        if val_metrics['dice'] > best_dice:
-            best_dice = val_metrics['dice']
+        if dice_score > best_dice:
+            best_dice = dice_score
             torch.save(model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, "best_model.pth"))
             logger.info(f"⭐ Saved Best Model (Dice: {best_dice:.4f})")
             
