@@ -202,7 +202,7 @@ class TextSam(Sam):
             # 构造正负样本对: [Prompt, "Background"]
             # 注意: PromptNu 可能是用 "Background" 或者 "Tissue" 作为负样本
             pair_prompts = [prompt, "Background"] 
-            print(f"🕵️ Sam Internal: Receiving prompt -> '{prompt}'")
+            # print(f"🕵️ Sam Internal: Receiving prompt -> '{prompt}'")
             
             text_tokens = clip.tokenize(pair_prompts).to(device)
             with torch.no_grad():

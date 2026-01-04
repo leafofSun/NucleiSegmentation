@@ -8,8 +8,8 @@ from pycocotools import mask as coco_mask
 from sklearn.cluster import KMeans
 
 # === 配置路径 ===
-DATA_ROOT = "data/MoNuSeg_SA1B/train" 
-OUTPUT_JSON = "data/MoNuSeg_SA1B/dynamic_instance_attributes.json"
+DATA_ROOT = "data/MoNuSeg_SA1B/test" 
+OUTPUT_JSON = "data/MoNuSeg_SA1B/test_dynamic_instance_attributes.json"
 
 def calculate_morphology(binary_mask):
     """
