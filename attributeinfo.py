@@ -5,100 +5,139 @@ import numpy as np
 import glob
 from tqdm import tqdm
 from pycocotools import mask as coco_mask
-from sklearn.cluster import KMeans
 
-# === 配置路径 ===
-DATA_ROOT = "data/MoNuSeg_SA1B/test" 
-OUTPUT_JSON = "data/MoNuSeg_SA1B/test_dynamic_instance_attributes.json"
+# ==========================================
+# ⚙️ 配置区域
+# ==========================================
+# 建议先运行 "test" 模式来修复您的评估尺子
+MODE = "test"  
+
+if MODE == "test":
+    DATA_ROOT = "data/MoNuSeg_SA1B/test"
+    OUTPUT_JSON = "data/MoNuSeg_SA1B/test_dynamic_instance_attributes.json"
+else:
+    DATA_ROOT = "data/MoNuSeg_SA1B/train"
+    OUTPUT_JSON = "data/MoNuSeg_SA1B/train_dynamic_instance_attributes.json"
+
+# ==========================================
+# 🏥 器官映射表 (Source: NCI GDC & MoNuSeg Official)
+# ==========================================
+
+# 1. 训练集映射 (来自您的 PDF: Training Patient Organ information)
+TRAIN_ORGAN_MAP = {
+    # Breast
+    "TCGA-A7-A13E": "Breast", "TCGA-A7-A13F": "Breast", "TCGA-AR-A1AK": "Breast",
+    "TCGA-AR-A1AS": "Breast", "TCGA-E2-A1B5": "Breast", "TCGA-E2-A14V": "Breast",
+    # Kidney
+    "TCGA-B0-5711": "Kidney", "TCGA-HE-7128": "Kidney", "TCGA-HE-7129": "Kidney",
+    "TCGA-HE-7130": "Kidney", "TCGA-B0-5710": "Kidney", "TCGA-B0-5698": "Kidney",
+    # Liver (原发灶不明或肺癌肝转移，但组织纹理为肝脏)
+    "TCGA-18-5592": "Liver", "TCGA-38-6178": "Liver", "TCGA-49-4488": "Liver",
+    "TCGA-50-5931": "Liver", "TCGA-21-5784": "Liver", "TCGA-21-5786": "Liver",
+    # Prostate
+    "TCGA-G9-6336": "Prostate", "TCGA-G9-6348": "Prostate", "TCGA-G9-6356": "Prostate",
+    "TCGA-G9-6363": "Prostate", "TCGA-CH-5767": "Prostate", "TCGA-G9-6362": "Prostate",
+    # Bladder
+    "TCGA-DK-A216": "Bladder", "TCGA-G2-A2EK": "Bladder",
+    # Colon
+    "TCGA-AY-A8YK": "Colon", "TCGA-NH-A8F7": "Colon",
+    # Stomach
+    "TCGA-KB-A93J": "Stomach", "TCGA-RD-A8N9": "Stomach"
+}
+
+# 2. 测试集映射 (经过 NCI GDC 核对)
+TEST_ORGAN_MAP = {
+    "TCGA-2Z-A9J9": "Kidney",    
+    "TCGA-69-7764": "Lung",   
+    "TCGA-GL-A4EM": "Kidney",    
+    "TCGA-EJ-A46H": "Prostate",  
+    "TCGA-FG-A4MU": "Brain",  
+    "TCGA-AO-A0J2": "Breast",    
+    "TCGA-AC-A2FO": "Breast",    
+    "TCGA-CU-A0YN": "Bladder",  
+    "TCGA-A6-2675": "Colorectal", 
+    "TCGA-A6-2680": "Colorectal", 
+    "TCGA-A6-5662": "Colorectal", 
+    "TCGA-HC-7209": "Prostate", 
+    "TCGA-44-2665": "Lung",      
+    "TCGA-HT-8564": "Brain"       
+}
+
+# 根据模式选择字典
+CURRENT_MAP = TEST_ORGAN_MAP if MODE == "test" else TRAIN_ORGAN_MAP
+
+# ==========================================
+# 📊 统计学阈值配置 (PromptNu Style)
+# ==========================================
+STATS_CONFIG = {
+    # 面积：Large 必须显著大于均值 (Mean + 1.0 * Std)
+    "area":        {"alpha_low": 0.5, "alpha_high": 1.0}, 
+    "roundness":   {"alpha_low": 1.0, "alpha_high": 0.5},
+    "aspect_ratio":{"alpha_low": 0.0, "alpha_high": 1.0},
+    "solidity":    {"alpha_low": 1.0, "alpha_high": 0.0}
+}
+
+def get_organ(filename):
+    # 模糊匹配文件名中的ID
+    for k, v in CURRENT_MAP.items():
+        if k in filename: return v
+    return "Unknown"
 
 def calculate_morphology(binary_mask):
-    """
-    计算单个实例的形态学特征
-    """
+    """计算准确的形态学特征 (修正版)"""
     binary_mask = binary_mask.astype(np.uint8)
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return None
     
     cnt = contours[0]
-    
-    # 1. Area
     area = cv2.contourArea(cnt)
     if area < 10: return None 
 
-    # 2. Roundness
     perimeter = cv2.arcLength(cnt, True)
     if perimeter == 0: return None
     roundness = (4 * np.pi * area) / (perimeter ** 2)
 
-    # 3. Aspect Ratio
+    # 修正长宽比：确保 >= 1.0
     if len(cnt) >= 5:
-        (x, y), (MA, ma), angle = cv2.fitEllipse(cnt)
-        if ma == 0: aspect_ratio = 1.0
-        else: aspect_ratio = MA / ma
+        (x, y), (d1, d2), angle = cv2.fitEllipse(cnt)
+        major, minor = max(d1, d2), min(d1, d2)
+        aspect_ratio = major / minor if minor > 0 else 1.0
     else:
         aspect_ratio = 1.0
 
-    # 4. Solidity
-    hull = cv2.convexHull(cnt)
-    hull_area = cv2.contourArea(hull)
-    if hull_area == 0: solidity = 1.0
-    else: solidity = area / hull_area
-
-    return {
-        "area": float(area),
-        "roundness": float(roundness),
-        "aspect_ratio": float(aspect_ratio),
-        "solidity": float(solidity)
-    }
+    return {"area": float(area), "roundness": float(roundness), "aspect_ratio": float(aspect_ratio)}
 
 def main():
-    print(f"🚀 Starting Instance-level Attribute Mining from {DATA_ROOT}...")
-    
+    print(f"🚀 Generating Attributes for [{MODE.upper()}] Set...")
+    print(f"📂 Reading from: {DATA_ROOT}")
+    print(f"📚 Using Organ Map with {len(CURRENT_MAP)} entries (Source: NCI GDC).")
+
     json_files = glob.glob(os.path.join(DATA_ROOT, "*.json"))
     all_data = {}
-    
-    global_stats = {
-        "area": [],
-        "roundness": [],
-        "aspect_ratio": [],
-        "solidity": []
-    }
+    global_stats = {"area": [], "roundness": [], "aspect_ratio": []}
 
-    # === 步骤 1: 遍历所有文件收集属性 ===
+    # === Step 1: 提取特征 ===
     for json_file in tqdm(json_files):
-        filename = os.path.basename(json_file).replace(".json", ".tif")
-        # 兼容性检查
-        if not os.path.exists(os.path.join(DATA_ROOT, filename)):
-            filename = filename.replace(".tif", ".png")
-            
-        with open(json_file, 'r') as f:
-            data = json.load(f)
-            
-        anns = data.get('annotations', [])
-        if not anns and isinstance(data, list): anns = data
+        fname = os.path.basename(json_file).replace(".json", "")
+        organ = get_organ(fname)
         
-        image_instances = []
+        with open(json_file, 'r') as f: data = json.load(f)
+        anns = data.get('annotations', data)
         
+        img_instances = []
         for idx, ann in enumerate(anns):
             if 'segmentation' not in ann: continue
             
-            seg = ann['segmentation']
+            # Mask Decoding
             mask = None
-            
-            # Case A: RLE (常见)
+            seg = ann['segmentation']
             if isinstance(seg, dict) and 'counts' in seg:
                 mask = coco_mask.decode(seg)
-            
-            # Case B: Polygon (补全逻辑)
             elif isinstance(seg, list):
-                # 尝试通过 bbox 获取尺寸，如果没有 bbox 则估算
-                bbox = ann.get('bbox', [0, 0, 1024, 1024]) # x, y, w, h
-                h = int(bbox[1] + bbox[3])
-                w = int(bbox[0] + bbox[2])
-                # 稍微给大一点防止越界，或者如果有原图尺寸最好
-                h = max(h, 1024) 
-                w = max(w, 1024)
-                
+                # 如果是多边形，创建画布
+                bbox = ann.get('bbox', [0, 0, 1024, 1024])
+                h = max(int(bbox[1]+bbox[3]), 1024)
+                w = max(int(bbox[0]+bbox[2]), 1024)
                 mask = np.zeros((h, w), dtype=np.uint8)
                 for poly in seg:
                     pts = np.array(poly, dtype=np.int32).reshape((-1, 2))
@@ -107,80 +146,56 @@ def main():
             if mask is not None:
                 feats = calculate_morphology(mask)
                 if feats:
-                    instance_info = {
-                        "id": idx, 
-                        "bbox": ann.get('bbox', []),
-                        "attrs": feats
-                    }
-                    image_instances.append(instance_info)
-                    for k, v in feats.items():
-                        global_stats[k].append(v)
+                    img_instances.append({
+                        "id": idx, "organ": organ, 
+                        "bbox": ann.get('bbox', []), "attrs": feats
+                    })
+                    for k, v in feats.items(): global_stats[k].append(v)
         
-        all_data[filename] = image_instances
+        all_data[os.path.basename(json_file).replace(".json", ".tif")] = img_instances
 
-    # === 步骤 2: 计算全局阈值 (修正缩进：必须在循环外！) ===
-    cluster_centers = {} 
-    print("\n📊 Calculating Adaptive Thresholds via K-Means...")
-    
+    # === Step 2: 计算全局阈值 (Mean +/- Std) ===
+    thresholds = {}
+    print("\n📊 Global Statistics (PromptNu Style):")
     for k, v in global_stats.items():
-        if len(v) < 3: continue 
+        if not v: continue
+        arr = np.array(v)
+        mean, std = np.mean(arr), np.std(arr)
         
-        data = np.array(v).reshape(-1, 1)
-        kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-        kmeans.fit(data)
+        low = max(0, mean - STATS_CONFIG[k]["alpha_low"] * std)
+        high = mean + STATS_CONFIG[k]["alpha_high"] * std
         
-        centers = sorted(kmeans.cluster_centers_.flatten())
-        
-        # 计算分界线
-        thresh_low = (centers[0] + centers[1]) / 2
-        thresh_high = (centers[1] + centers[2]) / 2
-        
-        cluster_centers[k] = {"low": float(thresh_low), "high": float(thresh_high)}
-        print(f"  - {k}: Low < {thresh_low:.2f} | High > {thresh_high:.2f} (Centers: {[round(c,2) for c in centers]})")
+        thresholds[k] = {"low": low, "high": high, "mean": mean}
+        print(f"  - {k.ljust(12)}: Mean={mean:.2f} | Small < {low:.2f} | Large > {high:.2f}")
 
-    # === 步骤 3: 打标签 (修正缩进：必须在循环外！) ===
-    print("\n🏷️ Tagging instances based on K-Means boundaries...")
-    final_output = {
-        "meta": {
-            "method": "K-Means Adaptive Quantization (K=3)",
-            "thresholds": cluster_centers,
-            "description": "Auto-generated instance attributes for Dynamic GT Masking"
-        },
-        "images": {}
-    }
-
+    # === Step 3: 打标签 ===
+    final_output = {"meta": {"mode": MODE, "thresholds": thresholds}, "images": {}}
     for fname, instances in all_data.items():
-        tagged_instances = []
+        processed_insts = []
         for inst in instances:
-            attrs = inst['attrs']
             tags = []
+            attrs = inst['attrs']
             
-            # Size
-            if 'area' in cluster_centers:
-                if attrs['area'] < cluster_centers['area']['low']: tags.append("Small")
-                elif attrs['area'] > cluster_centers['area']['high']: tags.append("Large")
-                else: tags.append("Medium")
+            # Size Tagging
+            if attrs['area'] < thresholds['area']['low']: tags.append("Small")
+            elif attrs['area'] > thresholds['area']['high']: tags.append("Large")
+            else: tags.append("Medium")
             
-            # Shape
-            if 'roundness' in cluster_centers:
-                if attrs['roundness'] > cluster_centers['roundness']['high']: tags.append("Round")
-                elif attrs['roundness'] < cluster_centers['roundness']['low']: tags.append("Irregular")
-                else: tags.append("Semi-round")
+            # Organ Tagging
+            if inst['organ'] != "Unknown": tags.append(f"{inst['organ']}-like")
             
-            # Elongation
-            if 'aspect_ratio' in cluster_centers:
-                if attrs['aspect_ratio'] < cluster_centers['aspect_ratio']['low']: tags.append("Elongated")
+            # Shape Tagging
+            if 'roundness' in thresholds:
+                 if attrs['roundness'] < thresholds['roundness']['low']: tags.append("Irregular")
+                 elif attrs['roundness'] > 0.85: tags.append("Round")
             
             inst['tags'] = tags
-            tagged_instances.append(inst)
-            
-        final_output['images'][fname] = tagged_instances
+            processed_insts.append(inst)
+        final_output['images'][fname] = processed_insts
 
-    # === 保存 ===
     with open(OUTPUT_JSON, 'w') as f:
         json.dump(final_output, f, indent=2)
-    
-    print(f"✅ Done! Saved attribute database to {OUTPUT_JSON}")
+    print(f"✅ Done! Saved attributes to {OUTPUT_JSON}")
 
 if __name__ == "__main__":
     main()

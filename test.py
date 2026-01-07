@@ -281,7 +281,8 @@ def main(args):
             filename=filename
         )
         
-        if args.use_watershed:
+        # if args.use_watershed:
+        if False:
             pred_mask = postprocess_watershed(pred_prob, thresh=0.4, min_distance=3)
         else:
             pred_mask = (pred_prob > 0.5).astype(np.uint8)

@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument("--data_path", type=str, default="data/MoNuSeg_SA1B", help="train data path")
     
     # 🔥 Path to Dynamic Attributes
-    parser.add_argument("--dynamic_path", type=str, default="data/MoNuSeg_SA1B/dynamic_instance_attributes.json", help="Path to dynamic attributes")
+    parser.add_argument("--dynamic_path", type=str, default="data/MoNuSeg_SA1B/train_dynamic_instance_attributes.json", help="Path to dynamic attributes")
     
     # 🔥 Added extra metrics here
     parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ', 'mDQ', 'mSQ'], help="metrics")
