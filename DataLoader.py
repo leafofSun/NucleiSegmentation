@@ -42,25 +42,29 @@ def stack_dict_batched(batch):
 class TrainingDataset(data.Dataset):
     def __init__(self, data_dir, image_size=1024, crop_size=256, mode='train', 
                  mask_num=1, requires_name=True, 
-                 # 🔥 这里指向你生成的那个包含所有图片统计信息的全局 JSON
-                 dynamic_attr_path="data/MoNuSeg_SA1B/train_dynamic_instance_attributes.json"):
+                 # 🔥 修改：指向统计学文件 (dataset_stats.json)
+                 dynamic_attr_path="data/MoNuSeg_SA1B/dataset_stats.json"):
         
         self.data_dir = data_dir
         self.image_size = image_size
         self.crop_size = crop_size
         self.mode = mode
         
-        # === 1. 加载动态属性数据库 (Global Stats) ===
-        self.dynamic_attrs = {}
+        # === 1. 加载统计学阈值 (PromptNu Logic) ===
+        # 默认备用值 (万一文件读不到，防止报错)
+        self.size_thresholds = {"small_upper": 300, "large_lower": 600}
+        
         if os.path.exists(dynamic_attr_path):
-            print(f"📖 [DataLoader] Loading Dynamic Attributes from {dynamic_attr_path}...")
+            print(f"📖 [DataLoader] Loading Statistics from {dynamic_attr_path}...")
             with open(dynamic_attr_path, 'r') as f:
-                content = json.load(f)
-                # 你的 JSON 结构里，数据是在 "images" 键下
-                self.dynamic_attrs = content.get("images", {})
+                stats = json.load(f)
+                # 读取阈值
+                if "thresholds" in stats:
+                    self.size_thresholds = stats["thresholds"]
+                    print(f"   ✅ Using Statistical Thresholds: Small < {self.size_thresholds['small_upper']:.1f}, Large > {self.size_thresholds['large_lower']:.1f}")
         else:
             if mode == 'train':
-                print(f"⚠️ [DataLoader] CRITICAL WARNING: {dynamic_attr_path} not found!")
+                print(f"⚠️ [DataLoader] Stats file not found at {dynamic_attr_path}. Using default fallback.")
 
         # === 2. 扫描文件 ===
         self.image_paths = []
@@ -107,7 +111,7 @@ class TrainingDataset(data.Dataset):
     def __len__(self):
         return len(self.image_paths)
 
-   # === 修改 1: 实时计算面积，不再依赖 JSON 字段 ===
+   # === 修改: 使用统计学阈值 ===
     def decode_sa1b_mask(self, annotations, h, w, size_mode=None):
         """
         解码并根据大小过滤
@@ -115,6 +119,10 @@ class TrainingDataset(data.Dataset):
         """
         mask = np.zeros((h, w), dtype=np.uint8)
         valid_pixel_count = 0
+        
+        # 获取动态阈值
+        small_thresh = self.size_thresholds['small_upper']
+        large_thresh = self.size_thresholds['large_lower']
         
         for ann in annotations:
             if 'segmentation' in ann:
@@ -137,9 +145,11 @@ class TrainingDataset(data.Dataset):
                     
                     keep = False
                     if size_mode == 'large':
-                        if area > 300: keep = True # 阈值
+                        # 🔥 使用统计学阈值 (Mean + 2*Std)
+                        if area > large_thresh: keep = True 
                     elif size_mode == 'small':
-                        if area < 150: keep = True # 阈值
+                        # 🔥 使用统计学阈值 (Mean)
+                        if area < small_thresh: keep = True 
                     else:
                         keep = True # Generic 模式，全留
                     

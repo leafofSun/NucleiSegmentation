@@ -40,7 +40,7 @@ def parse_args():
     
     # 🔥 Microscope mode must be 1024
     parser.add_argument("--image_size", type=int, default=1024, help="image_size")
-    parser.add_argument("--crop_size", type=int, default=256, help="crop size for augmentation")
+    parser.add_argument("--crop_size", type=int, default=1024, help="crop size for augmentation")
     
     parser.add_argument("--mask_num", type=int, default=1, help="get mask number")
     parser.add_argument("--data_path", type=str, default="data/MoNuSeg_SA1B", help="train data path")
@@ -166,8 +166,8 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 loss_h_neg = point_guidance_loss(pred_heatmap[1:2].unsqueeze(0), gt_background.unsqueeze(0))
                 loss_h = loss_h_pos + loss_h_neg
                 
-                loss_i = 2.0 * loss_m + 0.1 * loss_h
-                
+                # loss_i = 2.0 * loss_m + 0.1 * loss_h
+                loss_i = 2.0*loss_m + 0.0*loss_h
                 loss_batch += loss_i
                 loss_m_val += loss_m.item()
                 loss_h_val += loss_h.item()
