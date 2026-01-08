@@ -34,15 +34,15 @@ def stack_dict_batched(batch):
         if key == 'text_prompt' or key == 'name':
             tensor_dict[key] = [sample[key] for sample in batch]
         elif isinstance(value, torch.Tensor):
-            tensor_dict[key] = torch.stack([sample[key] for sample in batch] )
+            tensor_dict[key] = torch.stack([sample[key] for sample in batch])
         else:
             tensor_dict[key] = [sample[key] for sample in batch]
     return tensor_dict
 
 class TrainingDataset(data.Dataset):
-    def __init__(self, data_dir, image_size=1024, crop_size=256, mode='train', 
+    def __init__(self, data_dir, image_size=1024, crop_size=1024, mode='train', 
                  mask_num=1, requires_name=True, 
-                 # 🔥 修改：指向统计学文件 (dataset_stats.json)
+                 # 🔥 指向统计学文件
                  dynamic_attr_path="data/MoNuSeg_SA1B/dataset_stats.json"):
         
         self.data_dir = data_dir
@@ -51,17 +51,17 @@ class TrainingDataset(data.Dataset):
         self.mode = mode
         
         # === 1. 加载统计学阈值 (PromptNu Logic) ===
-        # 默认备用值 (万一文件读不到，防止报错)
+        # 默认备用值 (万一文件读不到)
         self.size_thresholds = {"small_upper": 300, "large_lower": 600}
         
         if os.path.exists(dynamic_attr_path):
             print(f"📖 [DataLoader] Loading Statistics from {dynamic_attr_path}...")
             with open(dynamic_attr_path, 'r') as f:
                 stats = json.load(f)
-                # 读取阈值
+                # 读取 PromptNu 计算出的阈值 (Small < Mean, Large > Mean + 2*Std)
                 if "thresholds" in stats:
                     self.size_thresholds = stats["thresholds"]
-                    print(f"   ✅ Using Statistical Thresholds: Small < {self.size_thresholds['small_upper']:.1f}, Large > {self.size_thresholds['large_lower']:.1f}")
+                    print(f"   ✅ Using PromptNu Statistical Thresholds: Small < {self.size_thresholds['small_upper']:.1f}, Large > {self.size_thresholds['large_lower']:.1f}")
         else:
             if mode == 'train':
                 print(f"⚠️ [DataLoader] Stats file not found at {dynamic_attr_path}. Using default fallback.")
@@ -75,10 +75,9 @@ class TrainingDataset(data.Dataset):
         # 过滤掉 mask 文件
         self.image_paths = [p for p in self.image_paths if "mask" not in p.lower()]
         
-        # SA-1B 格式检查：只保留有对应本地 .json 的图片
+        # SA-1B 格式检查
         valid_paths = []
         for p in self.image_paths:
-            # 假设 image.tif 对应 image.json
             json_path = os.path.splitext(p)[0] + ".json"
             if os.path.exists(json_path):
                 valid_paths.append(p)
@@ -89,21 +88,44 @@ class TrainingDataset(data.Dataset):
         else:
             print(f"⚠️ [DataLoader] No valid pairs found! SA-1B mode requires local JSONs.")
 
-        # === 3. 增强策略 ===
+        # === 3. 增强策略 (关键修改：修复 CropSizeError) ===
         if mode == 'train':
             self.transform = A.Compose([
+                # 🔥 第一步：PadIfNeeded
+                # 如果原图(1000)小于 crop_size(1024)，先填充边缘，防止 RandomCrop 报错
+                # 同时也保证了训练时看到的细胞尺寸与测试时一致 (1:1)
+                A.PadIfNeeded(
+                    min_height=crop_size, 
+                    min_width=crop_size, 
+                    border_mode=cv2.BORDER_CONSTANT, 
+                    value=0, 
+                    mask_value=0
+                ),
+                # 🔥 第二步：RandomCrop
+                # 在 Pad 后的图上随机切 1024 (如果 Pad 到 1024，这就等于全图)
                 A.RandomCrop(width=crop_size, height=crop_size, p=1.0),
+                
+                # 其他增强
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
                 A.RandomRotate90(p=0.5),
                 A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.2),
                 A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
+                
+                # 最后 Resize (虽然 crop_size=1024=image_size，但这步留着保险)
                 A.Resize(height=image_size, width=image_size, interpolation=cv2.INTER_LINEAR),
                 ToTensorV2(),
             ])
         else:
             self.transform = A.Compose([
-                # 测试时通常 CenterCrop 或者 Resize
+                # 测试时：直接 Pad 到 1024，保持原始比例和分辨率
+                A.PadIfNeeded(
+                    min_height=image_size, 
+                    min_width=image_size, 
+                    border_mode=cv2.BORDER_CONSTANT, 
+                    value=0, 
+                    mask_value=0
+                ),
                 A.Resize(height=image_size, width=image_size, interpolation=cv2.INTER_LINEAR),
                 ToTensorV2(),
             ])
@@ -111,18 +133,17 @@ class TrainingDataset(data.Dataset):
     def __len__(self):
         return len(self.image_paths)
 
-   # === 修改: 使用统计学阈值 ===
+    # === 基于 PromptNu 统计数据的解码 ===
     def decode_sa1b_mask(self, annotations, h, w, size_mode=None):
         """
-        解码并根据大小过滤
-        size_mode: None (全部), 'large', 'small'
+        解码并根据 dataset_stats.json 里的阈值进行过滤
         """
         mask = np.zeros((h, w), dtype=np.uint8)
         valid_pixel_count = 0
         
-        # 获取动态阈值
-        small_thresh = self.size_thresholds['small_upper']
-        large_thresh = self.size_thresholds['large_lower']
+        # 从加载的统计数据中获取动态阈值
+        small_thresh = self.size_thresholds['small_upper']  # Mean
+        large_thresh = self.size_thresholds['large_lower']  # Mean + 2*Std
         
         for ann in annotations:
             if 'segmentation' in ann:
@@ -140,18 +161,18 @@ class TrainingDataset(data.Dataset):
                         cv2.fillPoly(m, [pts], 1)
                 
                 if m is not None:
-                    # 🔥 核心修正：这里实时计算面积！
+                    # 实时计算面积
                     area = np.sum(m > 0)
                     
                     keep = False
                     if size_mode == 'large':
-                        # 🔥 使用统计学阈值 (Mean + 2*Std)
+                        # PromptNu 定义: Area > Mean + 2*Std
                         if area > large_thresh: keep = True 
                     elif size_mode == 'small':
-                        # 🔥 使用统计学阈值 (Mean)
+                        # PromptNu 定义: Area < Mean
                         if area < small_thresh: keep = True 
                     else:
-                        keep = True # Generic 模式，全留
+                        keep = True # Generic 模式
                     
                     if keep:
                         mask[m > 0] = 1
@@ -182,17 +203,17 @@ class TrainingDataset(data.Dataset):
             except:
                 pass
 
-        # === 策略调整 ===
+        # === 采样逻辑 ===
         rand = random.random()
         text_prompt = "Cell nuclei"
         target_mask = np.zeros((h, w), dtype=np.uint8)
         
-        # ⬇️ 修正点：降低负样本比例，只有 10%
+        # 1. 负样本 (10%)
         if self.mode == 'train' and rand < 0.1:
             text_prompt = random.choice(NEGATIVE_PROMPTS)
             target_mask = np.zeros((h, w), dtype=np.uint8)
             
-        # ⬇️ 修正点：属性训练 (45%)
+        # 2. 属性训练 (45%)
         elif self.mode == 'train' and rand < 0.55 and len(annotations) > 0:
             if random.random() < 0.5:
                 # Large
@@ -203,19 +224,19 @@ class TrainingDataset(data.Dataset):
                 text_prompt = random.choice(["Small nuclei", "Lymphocyte nuclei"])
                 target_mask, px_count = self.decode_sa1b_mask(annotations, h, w, size_mode='small')
             
-            # 🔥 救命机制：如果过滤完发现全是黑的（比如这图里根本没有大细胞）
-            # 强制回退到“Generic”模式，不要训练黑Mask！
+            # 🔥 兜底机制：如果当前图没有符合统计阈值的细胞（全黑），回退到 Generic
             if target_mask.sum() == 0:
                 text_prompt = "Cell nuclei"
                 target_mask, _ = self.decode_sa1b_mask(annotations, h, w, size_mode=None)
 
-        # ⬇️ 修正点：通用训练 (45%) - 提高基础能力权重
+        # 3. 通用训练 (45%)
         else:
             text_prompt = "Cell nuclei"
             target_mask, _ = self.decode_sa1b_mask(annotations, h, w, size_mode=None)
         
-        # 增强
+        # 增强 (此时 target_mask 尺寸是原始的，增强后变成 1024)
         augmented = self.transform(image=image, mask=target_mask)
+        
         return {
             "image": augmented['image'].float(),
             "label": augmented['mask'].long().unsqueeze(0),
