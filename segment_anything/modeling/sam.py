@@ -142,6 +142,92 @@ class Sam(nn.Module):
         return x
 
 
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from .sam import Sam # 假设您原来的 Sam 类在这里
+import clip
+
+# === 1. 定义 CoOp 提示学习器 ===
+class PromptLearner(nn.Module):
+    def __init__(self, clip_model, n_ctx=16, ctx_init=None):
+        super().__init__()
+        n_cls = 1
+        n_ctx = n_ctx  # 上下文向量的数量 (例如 16 个单词长度)
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+        dtype = clip_model.dtype
+
+        # 初始化可学习的上下文向量 (Context Vectors)
+        if ctx_init:
+            # 如果有初始化词 (比如 "microscopy pathology image")
+            ctx_init = ctx_init.replace("_", " ")
+            n_ctx = len(ctx_init.split(" "))
+            prompt = clip.tokenize(ctx_init).to(ctx_vectors.device)
+            with torch.no_grad():
+                embedding = clip_model.token_embedding(prompt).type(dtype)
+            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
+            prompt_prefix = ctx_init
+        else:
+            # 随机初始化
+            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
+
+        print(f"🧠 CoOp Initialized: {n_ctx} learnable context tokens.")
+
+        self.ctx = nn.Parameter(ctx_vectors) # [n_ctx, dim]
+        
+        # 保存 CLIP 的组件以供前向传播使用
+        self.clip_token_embedding = clip_model.token_embedding
+        self.clip_transformer = clip_model.transformer
+        self.clip_ln_final = clip_model.ln_final
+        self.clip_text_projection = clip_model.text_projection
+        self.dtype = dtype
+        self.n_ctx = n_ctx
+
+    def forward(self, tokenized_prompts):
+        # tokenized_prompts: [batch, 77]
+        
+        # 1. 获取输入文本的 Embedding (Specific Descriptions)
+        # [batch, 77, dim]
+        embedding = self.clip_token_embedding(tokenized_prompts).type(self.dtype)
+
+        # 2. 获取可学习的上下文 Embedding (General Context)
+        # [n_ctx, dim] -> [batch, n_ctx, dim]
+        ctx = self.ctx.unsqueeze(0).expand(len(tokenized_prompts), -1, -1)
+
+        # 3. 拼接: [SOS] + [CTX] + [Specific Text] + [EOS]
+        # CLIP 的 SOS 在 index 0
+        prefix = embedding[:, :1, :] 
+        # 截断原始文本的前半部分，给 CTX 腾位置
+        # 注意：这里假设输入的 specific text 不会超级长，否则会被截断
+        suffix = embedding[:, 1 : 77 - self.n_ctx, :] 
+
+        x = torch.cat([prefix, ctx, suffix], dim=1) # [batch, 77, dim]
+
+        # 4. 通过 CLIP Transformer
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.clip_transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        
+        # 5. 提取特征
+        x = self.clip_ln_final(x).type(self.dtype)
+
+        # 6. 找到 EOS 位置并提取特征
+        # 由于我们插入了 n_ctx 个 token，EOS 的位置向后移动了 n_ctx
+        # 原始 tokenized_prompts.argmax(dim=-1) 是原始 EOS 位置
+        original_eos_idx = tokenized_prompts.argmax(dim=-1)
+        eos_idx = original_eos_idx + self.n_ctx
+        # 限制最大索引防止越界
+        eos_idx = torch.clamp(eos_idx, max=76)
+        
+        # 提取 [EOS] 处的特征作为句子特征
+        text_features = x[torch.arange(x.shape[0]), eos_idx] @ self.clip_text_projection
+
+        return text_features
+
+
+# === 2. 修改后的 TextSam 类 ===
 class TextSam(Sam):
     def __init__(
         self, 
@@ -157,18 +243,27 @@ class TextSam(Sam):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
         
         print(f"Loading CLIP model: {clip_model_name}...")
-        # 🔥 [修改 1] 保留 CLIP 模型，转到 GPU
+        # 加载 CLIP (CPU 加载，稍后转 GPU)
         self.clip_model, _ = clip.load(clip_model_name, device="cpu")
-        # 冻结 CLIP 参数以节省显存/防止破坏预训练
+        
+        # 🔥 [关键] 冻结原始 CLIP 的所有参数
         for param in self.clip_model.parameters():
             param.requires_grad = False
             
+        # 🔥 [关键] 初始化 CoOp Prompt Learner
+        # n_ctx=16 表示学习 16 个上下文单词，足以捕捉 "pathology microscopy" 等语义
+        self.prompt_learner = PromptLearner(self.clip_model, n_ctx=16)
+        
+        # 🔥 [关键] 只解冻 Prompt Learner 的参数 (ctx)
+        for param in self.prompt_learner.parameters():
+            param.requires_grad = True
+
         self.prompt_generator = TextGuidedPointGenerator(
             embed_dim=embed_dim,
             text_dim=text_dim
         )
         
-        # 冻结策略
+        # 冻结其他部分
         for param in self.image_encoder.parameters(): param.requires_grad = False
         for param in self.prompt_encoder.parameters(): param.requires_grad = False
         for param in self.mask_decoder.parameters(): param.requires_grad = True
@@ -179,46 +274,53 @@ class TextSam(Sam):
             if "Adapter" in name:
                 param.requires_grad = True
                 adapter_count += 1
-        print(f"✅ TextSam Initialized: {adapter_count} Adapter Layers Unfrozen.")
+                
+        print(f"✅ TextSam Initialized: {adapter_count} Adapter Layers & CoOp Context Unfrozen.")
 
     def forward(self, batched_input, multimask_output=False):
         # 1. 图像编码
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         image_embeddings = self.image_encoder(input_images) 
 
-        # === 🔥 [修改 2] 动态生成文本特征 ===
-        # 获取当前 batch 的所有文本
-        # 假设 batched_input[i]["text_prompt"] 是 "Kidney cell"
-        # 我们需要构造配对: ["Kidney cell", "Background"]
-        
         device = image_embeddings.device
-        # 确保 CLIP 在正确的设备上
+        
+        # 确保 CLIP 组件在正确的设备上 (CoOp 的参数会自动随模型移动，但 CLIP 的 buffer 可能需要手动)
         if self.clip_model.visual.conv1.weight.device != device:
             self.clip_model = self.clip_model.to(device)
+            # prompt_learner 是 nn.Module，通常不需要手动 to(device) 如果整个 TextSam 已经 to(device)
 
+        # === 🔥 动态生成文本特征 (结合 CoOp) ===
         batch_text_features = []
+        
+        # 收集所有文本以进行批处理 (Batch Processing 效率更高)
+        all_prompts = []
         for x in batched_input:
-            prompt = x.get("text_prompt", "Nuclei") # 获取 Prompt
-            # 构造正负样本对: [Prompt, "Background"]
-            # 注意: PromptNu 可能是用 "Background" 或者 "Tissue" 作为负样本
-            pair_prompts = [prompt, "Background"] 
-            # print(f"🕵️ Sam Internal: Receiving prompt -> '{prompt}'")
+            # 这里的 text_prompt 现在是 "Microscopic image of large..." 这样的长句
+            positive_prompt = x.get("text_prompt", "Cell nuclei")
+            # 负样本: Background
+            # 我们也让 CoOp 学习 Background 的上下文，保持域一致性
+            all_prompts.extend([positive_prompt, "Background"])
             
-            text_tokens = clip.tokenize(pair_prompts).to(device)
-            with torch.no_grad():
-                # [2, 512]
-                feats = self.clip_model.encode_text(text_tokens)
-                feats = feats / feats.norm(dim=-1, keepdim=True)
-                feats = feats.float()
-            batch_text_features.append(feats)
-            
-        # 堆叠成 [B, 2, 512]
-        text_features = torch.stack(batch_text_features, dim=0)
+        # 统一 Tokenize
+        text_tokens = clip.tokenize(all_prompts, truncate=True).to(device)
+        
+        # 通过 Prompt Learner 编码 (而不是直接用 clip.encode_text)
+        # 这里会注入可学习的 [CTX] 向量
+        text_features_all = self.prompt_learner(text_tokens)
+        
+        # 归一化
+        text_features_all = text_features_all / text_features_all.norm(dim=-1, keepdim=True)
+        text_features_all = text_features_all.float()
+        
+        # 重新变回 [B, 2, 512]
+        # all_prompts 是 [P1, Neg1, P2, Neg2, ...]
+        batch_size = len(batched_input)
+        text_features = text_features_all.view(batch_size, 2, -1)
 
-        # 3. 热力图 (使用动态生成的 text_features)
+        # 3. 热力图
         heatmap_logits = self.prompt_generator(image_embeddings, text_features)
         
-        # 4. 提取点 (Feature Map Scale)
+        # 4. 提取点
         points_in_feat, point_labels = self.prompt_generator.get_points_from_heatmap(heatmap_logits, topk=1)
         
         # 5. 坐标映射

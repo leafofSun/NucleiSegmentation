@@ -33,35 +33,44 @@ from metrics import SegMetrics
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--work_dir", type=str, default="workdir", help="work dir")
-    parser.add_argument("--run_name", type=str, default="text-guided-sam-dynamic", help="run model name")
-    parser.add_argument("--epochs", type=int, default=100, help="number of epochs")
-    parser.add_argument("--batch_size", type=int, default=2, help="train batch size")
     
-    # 🔥 Microscope mode must be 1024
-    parser.add_argument("--image_size", type=int, default=1024, help="image_size")
-    parser.add_argument("--crop_size", type=int, default=1024, help="crop size for augmentation")
-    
-    parser.add_argument("--mask_num", type=int, default=1, help="get mask number")
-    parser.add_argument("--data_path", type=str, default="data/MoNuSeg_SA1B", help="train data path")
-    
-    # 🔥 Path to Dynamic Attributes
-    parser.add_argument("--dynamic_path", type=str, default="data/MoNuSeg_SA1B/train_dynamic_instance_attributes.json", help="Path to dynamic attributes")
-    
-    # 🔥 Added extra metrics here
-    parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ', 'mDQ', 'mSQ'], help="metrics")
-    
+    # === 基础配置 ===
+    parser.add_argument("--work_dir", type=str, default="workdir", help="Work directory for logs and checkpoints")
+    parser.add_argument("--run_name", type=str, default="text-guided-sam-coop", help="Experiment name")
+    parser.add_argument("--epochs", type=int, default=100, help="Total training epochs")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument("--lr", type=float, default=1e-4, help="learning rate") 
-    parser.add_argument("--min_lr", type=float, default=1e-6, help="min learning rate")
-    parser.add_argument("--resume", type=str, default=None, help="load resume")
-    parser.add_argument("--model_type", type=str, default="vit_b", help="sam model_type")
     
-    parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d_b.pth", help="sam checkpoint")
-    parser.add_argument("--use_amp", action='store_true', default=False, help="use amp")
-    parser.add_argument("--encoder_adapter", action='store_true', default=True, help="use adapter")
-    parser.add_argument("--seed", type=int, default=42, help="random seed")
-    parser.add_argument("--scheduler", type=str, default="cosine", choices=["cosine", "step", "none"], help="lr scheduler")
+    # === 数据相关 ===
+    parser.add_argument("--data_path", type=str, default="data/MoNuSeg_SA1B", help="Root path to data")
+    # 🔥 [修改] 分离两个关键库的路径，不再硬编码
+    parser.add_argument("--stats_path", type=str, default="data/MoNuSeg_SA1B/dataset_stats.json", help="Path to statistical thresholds (dataset_stats.json)")
+    parser.add_argument("--prompts_path", type=str, default="data/MoNuSeg_SA1B/specific_prompts.json", help="Path to specific prompts library (specific_prompts.json)")
+    
+    parser.add_argument("--image_size", type=int, default=1024, help="Input image size")
+    parser.add_argument("--crop_size", type=int, default=1024, help="Crop size during training (Keep 1024 for consistency)")
+    parser.add_argument("--mask_num", type=int, default=1, help="Number of masks")
+    
+    # === 模型配置 ===
+    parser.add_argument("--model_type", type=str, default="vit_b", help="SAM model type (vit_b, vit_l, vit_h)")
+    parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d_b.pth", help="Path to pretrained SAM checkpoint")
+    parser.add_argument("--clip_model", type=str, default="ViT-B/16", help="CLIP model type")
+    parser.add_argument("--encoder_adapter", action='store_true', default=True, help="Enable adapter in image encoder")
+    
+    # === 优化器与训练 ===
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate") 
+    parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
+    parser.add_argument("--scheduler", type=str, default="cosine", choices=["cosine", "step", "none"], help="LR scheduler")
+    parser.add_argument("--use_amp", action='store_true', default=False, help="Use Automatic Mixed Precision")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    
+    # === 🔥 [新增] Loss 权重配置 ===
+    parser.add_argument("--mask_weight", type=float, default=2.0, help="Weight for mask loss (Focal+Dice+IoU)")
+    parser.add_argument("--heatmap_weight", type=float, default=1.0, help="Weight for heatmap guidance loss (Default 0.0 to avoid conflict)")
+    
+    parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ', 'mDQ', 'mSQ'], help="Evaluation metrics")
     
     args = parser.parse_args()
     return args
@@ -104,7 +113,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         
         optimizer.zero_grad()
 
-        # === Inject Dynamic Prompt ===
+        # === Data Formatting ===
         model_input = []
         images = batched_input['image']
         
@@ -145,19 +154,20 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 pred_iou = iou_preds[best_idx]
                 gt_mask = labels[i].squeeze(0).float()
                 
+                # Resize GT if needed
                 if pred_mask.shape != gt_mask.shape:
                     gt_mask = F.interpolate(gt_mask.unsqueeze(0).unsqueeze(0), size=pred_mask.shape, mode='nearest').squeeze()
 
-                # === Loss Unpacking ===
+                # === 1. Mask Loss ===
                 loss_m, loss_dict = criterion(pred_mask.unsqueeze(0).unsqueeze(0), gt_mask.unsqueeze(0).unsqueeze(0), pred_iou.unsqueeze(0))
                 
-                # Heatmap Loss
+                # === 2. Heatmap Loss ===
                 pred_heatmap = out['heatmap_logits'] 
                 current_feat_size = pred_heatmap.shape[-2:] 
                 
                 with torch.no_grad():
+                    # Resize GT to feature map size for heatmap supervision
                     gt_nuclei = F.interpolate(labels[i].float().unsqueeze(0), size=current_feat_size, mode='nearest').squeeze(0)
-                    # Handle Ignore Regions (255)
                     valid_mask = (gt_nuclei != 255).float()
                     gt_nuclei[gt_nuclei == 255] = 0 
                     gt_background = 1.0 - gt_nuclei
@@ -166,8 +176,9 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 loss_h_neg = point_guidance_loss(pred_heatmap[1:2].unsqueeze(0), gt_background.unsqueeze(0))
                 loss_h = loss_h_pos + loss_h_neg
                 
-                # loss_i = 2.0 * loss_m + 0.1 * loss_h
-                loss_i = 2.0*loss_m + 0.0*loss_h
+                # 🔥 [修改] 使用参数控制权重
+                loss_i = args.mask_weight * loss_m + args.heatmap_weight * loss_h
+                
                 loss_batch += loss_i
                 loss_m_val += loss_m.item()
                 loss_h_val += loss_h.item()
@@ -186,7 +197,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         mask_losses.append(loss_m_val / len(labels))
         heatmap_losses.append(loss_h_val / len(labels))
         
-        pbar.set_postfix(L=f"{final_loss.item():.3f}", Prompt=texts[0][:10])
+        pbar.set_postfix(L=f"{final_loss.item():.3f}", Prompt=texts[0][:15])
 
     return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses)
 
@@ -194,11 +205,11 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
 def validate_one_epoch(args, model, val_loader, epoch):
     model.eval()
     
-    # Record Positive Metrics (Generic)
+    # Positive Metrics (Generic Task)
     val_results = {k: [] for k in args.metrics}
     obj_dices = []
     
-    # Record Negative Metrics (Rejection)
+    # Negative Metrics (Rejection Task)
     neg_responses = [] 
     
     pbar = tqdm(val_loader, desc=f"Val Ep {epoch+1}")
@@ -208,9 +219,7 @@ def validate_one_epoch(args, model, val_loader, epoch):
         labels = batched_input['label'].cpu().numpy() 
         images = batched_input['image']
         
-        # ==========================================
-        # 🟢 Round 1: Positive Validation (Generic Prompt)
-        # ==========================================
+        # 🟢 Positive Validation
         model_input_pos = []
         texts_pos = ["Cell nuclei" for _ in range(len(images))]
         
@@ -230,17 +239,13 @@ def validate_one_epoch(args, model, val_loader, epoch):
             gt = labels[i]
             if gt.ndim == 3: gt = gt[0]
             
-            # Calculate Metrics
             res = SegMetrics(pred_mask, gt, args.metrics)
-            
             if gt.sum() > 0: obj_dices.append(res['dice'])
             
             for k, v in res.items():
                 if k in val_results: val_results[k].append(v)
 
-        # ==========================================
-        # 🔴 Round 2: Negative Validation (Negative Prompt)
-        # ==========================================
+        # 🔴 Negative Validation
         model_input_neg = []
         texts_neg = ["A photo of a cat" for _ in range(len(images))] 
         
@@ -257,15 +262,10 @@ def validate_one_epoch(args, model, val_loader, epoch):
             best_idx = torch.argmax(out['iou_predictions']).item()
             pred_prob = torch.sigmoid(out['masks'][0, best_idx])
             pred_mask_neg = (pred_prob > 0.5).float()
-            
-            # Response Ratio (should be close to 0)
-            response_ratio = pred_mask_neg.mean().item()
-            neg_responses.append(response_ratio)
+            neg_responses.append(pred_mask_neg.mean().item())
 
-    # === Summary ===
     avg_results = {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in val_results.items()}
     avg_results['obj_dice'] = np.mean(obj_dices) if len(obj_dices) > 0 else 0.0
-    
     avg_neg_response = np.mean(neg_responses) if len(neg_responses) > 0 else 0.0
         
     return avg_results, avg_neg_response
@@ -304,6 +304,7 @@ def main(args):
     if not os.path.exists(val_root): val_root = args.data_path
 
     # === Dataset ===
+    # 🔥 [修改] 传递参数 stats_path 和 prompts_path
     train_dataset = TrainingDataset(
         train_root, 
         image_size=args.image_size,
@@ -311,7 +312,8 @@ def main(args):
         mode='train', 
         mask_num=args.mask_num, 
         requires_name=True,
-        dynamic_attr_path=args.dynamic_path
+        stats_path=args.stats_path,
+        prompts_path=args.prompts_path
     )
     
     val_dataset = TrainingDataset(
@@ -321,17 +323,17 @@ def main(args):
         mode='test', 
         mask_num=args.mask_num, 
         requires_name=True,
-        dynamic_attr_path=args.dynamic_path 
+        stats_path=args.stats_path,
+        prompts_path=args.prompts_path
     )
     logger.info(f"Train Data: {len(train_dataset)} | Val Data: {len(val_dataset)}")
 
-    # === DataLoader ===
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=stack_dict_batched)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=2, pin_memory=True, collate_fn=stack_dict_batched)
 
     # === Model ===
     logger.info("Building TextSam...")
-    args.checkpoint = args.sam_checkpoint 
+    args.checkpoint = args.sam_checkpoint
     vanilla_sam = sam_model_registry[args.model_type](args)
     
     if args.sam_checkpoint and os.path.exists(args.sam_checkpoint):
@@ -349,7 +351,7 @@ def main(args):
         image_encoder=vanilla_sam.image_encoder,
         prompt_encoder=vanilla_sam.prompt_encoder,
         mask_decoder=vanilla_sam.mask_decoder,
-        clip_model_name="ViT-B/16",
+        clip_model_name=args.clip_model, # 🔥 [修改] 使用参数
         text_dim=512,
         embed_dim=256
     ).to(args.device)
@@ -362,16 +364,22 @@ def main(args):
             torch.nn.init.zeros_(param)
     print("✅ Adapters Reset.")
 
-    # --- Optimizer & Scheduler ---
+    # --- Optimizer ---
     params_to_optimize = [
         {'params': model.mask_decoder.parameters(), 'lr': args.lr},
         {'params': model.prompt_generator.parameters(), 'lr': args.lr * 5} 
     ]
+    
+    # 🔥 [修改] 自动检测 PromptLearner (CoOp) 是否存在并加入优化器
+    if hasattr(model, 'prompt_learner'):
+        print(f"✨ Adding CoOp PromptLearner to optimizer (lr={args.lr})")
+        params_to_optimize.append({'params': model.prompt_learner.parameters(), 'lr': args.lr})
+        
     if args.encoder_adapter:
         adapter_params = [p for n, p in model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
         params_to_optimize.append({'params': adapter_params, 'lr': args.lr})
 
-    optimizer = optim.AdamW(params_to_optimize, weight_decay=1e-4)
+    optimizer = optim.AdamW(params_to_optimize, weight_decay=args.weight_decay)
     criterion = FocalDiceloss_IoULoss(ignore_index=255)
     scaler = GradScaler() if args.use_amp else None
 
@@ -388,26 +396,14 @@ def main(args):
         
         val_metrics, val_neg_resp = validate_one_epoch(args, model, val_loader, epoch)
         
-        current_lr = optimizer.param_groups[0]["lr"]
-        
-        # 🔥 Extract Metrics for Logging
         dice_score = val_metrics.get('dice', 0.0)
-        iou_score = val_metrics.get('iou', 0.0)
-        aji_score = val_metrics.get('mAJI', 0.0)
-        pq_score  = val_metrics.get('mPQ', 0.0)
-        dq_score  = val_metrics.get('mDQ', 0.0)
-        sq_score  = val_metrics.get('mSQ', 0.0)
         
-        # 🔥 Beautiful Logging
         logger.info(
             f"Ep {epoch+1} | "
             f"Loss: {avg_loss:.4f} | "
             f"Dice: {dice_score:.4f} | "
-            f"IoU: {iou_score:.4f} | "
-            f"AJI: {aji_score:.4f} | "
-            f"PQ: {pq_score:.4f} | "
-            f"DQ: {dq_score:.4f} | "
-            f"SQ: {sq_score:.4f} | "
+            f"IoU: {val_metrics.get('iou', 0.0):.4f} | "
+            f"AJI: {val_metrics.get('mAJI', 0.0):.4f} | "
             f"NegResp: {val_neg_resp:.4f}"
         )
         
