@@ -12,7 +12,7 @@ import logging
 import os
 
 # ==========================================
-# 辅助函数部分 (保持原逻辑，微调健壮性)
+# 辅助函数部分
 # ==========================================
 
 def get_boxes_from_mask(mask, box_num=1, std=0.1, max_pixel=5):
@@ -23,14 +23,12 @@ def get_boxes_from_mask(mask, box_num=1, std=0.1, max_pixel=5):
         mask = mask.numpy()
 
     # 如果 mask 包含 255 (Ignore)，我们在生成 Box 时只看 1 (Target)
-    # 忽略 255 区域
     mask_for_box = np.zeros_like(mask)
     mask_for_box[mask == 1] = 1
     
     if mask_for_box.max() > 0:
         label_img = label(mask_for_box)
     else:
-        # 全是背景或忽略
         return torch.tensor([[0, 0, 1, 1]] * box_num, dtype=torch.float)
         
     regions = regionprops(label_img)
@@ -69,8 +67,6 @@ def get_boxes_from_mask(mask, box_num=1, std=0.1, max_pixel=5):
 
 
 def select_random_points(pr, gt, point_num = 9):
-    # 注意：如果 gt 含有 255，这里需要处理，但在生成点提示时
-    # 通常我们只关心 1 (前景) 和 0 (背景)，255 区域不应该采样点
     pred, gt = pr.data.cpu().numpy(), gt.data.cpu().numpy()
     error = np.zeros_like(pred)
     
@@ -89,7 +85,6 @@ def select_random_points(pr, gt, point_num = 9):
         if indices.shape[0] > 0:
             selected_indices = indices[np.random.choice(indices.shape[0], point_num, replace=True)]
         else:
-            # 如果没有错误，随机撒点 (注意这里范围改为了动态获取，防止写死 256)
             h, w = one_pred.shape
             indices = np.random.randint(0, min(h, w), size=(point_num, 2))
             selected_indices = indices
@@ -99,13 +94,11 @@ def select_random_points(pr, gt, point_num = 9):
         points, labels = [], []
         for i in selected_indices:
             x, y = i[0], i[1]
-            # 逻辑：只针对 0 和 1 产生提示
             if one_gt[x,y] == 1:
                 label = 1
             elif one_gt[x,y] == 0:
                 label = 0
             else:
-                # 如果采样到了 255 区域，虽然理论上前面 error 过滤了，但做个兜底
                 label = -1 
             points.append((y, x))
             labels.append(label)
@@ -138,7 +131,6 @@ def init_point_sampling(mask, get_point=1):
     else:
         num_fg = get_point // 2
         num_bg = get_point - num_fg
-        # 防止采样越界
         if fg_size > 0:
             fg_indices = np.random.choice(fg_size, size=num_fg, replace=True)
             fg_coords_sel = fg_coords[fg_indices]
@@ -146,7 +138,7 @@ def init_point_sampling(mask, get_point=1):
         else:
             fg_coords_sel = np.empty((0, 2))
             fg_labels = np.array([])
-            num_bg = get_point # 全采背景
+            num_bg = get_point
 
         if bg_size > 0:
             bg_indices = np.random.choice(bg_size, size=num_bg, replace=True)
@@ -159,7 +151,6 @@ def init_point_sampling(mask, get_point=1):
         coords = np.concatenate([fg_coords_sel, bg_coords_sel], axis=0)
         labels = np.concatenate([fg_labels, bg_labels]).astype(int)
         
-        # 如果凑不够点，补齐
         if len(coords) < get_point:
              padding = get_point - len(coords)
              coords = np.pad(coords, ((0, padding), (0, 0)), mode='edge')
@@ -325,7 +316,7 @@ def save_masks(preds, save_path, mask_name, image_size, original_size, pad=None,
 
 
 # ==========================================
-# 🔥 [关键修改] 支持 Ignore Index (255) 的 Loss
+# Loss Classes
 # ==========================================
 
 class FocalLoss(nn.Module):
@@ -336,25 +327,14 @@ class FocalLoss(nn.Module):
         self.ignore_index = ignore_index
 
     def forward(self, pred, mask):
-        """
-        pred: [B, 1, H, W] Logits
-        mask: [B, 1, H, W] 0, 1, 255
-        """
         assert pred.shape == mask.shape, "pred and mask should have the same shape."
-        
-        # 1. 筛选有效像素 (不等于 255)
         valid_mask = (mask != self.ignore_index)
-        
-        # 极端情况处理：全是 255
         if valid_mask.sum() == 0:
             return pred.sum() * 0.0
 
-        # 2. 展平并取有效值
         p = torch.sigmoid(pred)[valid_mask]   # [N]
-        targets = mask[valid_mask]            # [N] (只有 0 和 1)
+        targets = mask[valid_mask]            # [N]
         
-        # 3. 计算 Focal Logic
-        # Targets 此时应该是 0 或 1
         num_pos = torch.sum(targets)
         num_neg = targets.numel() - num_pos
         
@@ -365,7 +345,6 @@ class FocalLoss(nn.Module):
         loss_neg = -(1 - self.alpha) * (1 - targets) * w_neg * torch.log(1 - p + 1e-12)
 
         loss = (torch.sum(loss_pos) + torch.sum(loss_neg)) / (num_pos + num_neg + 1e-12)
-
         return loss
 
 
@@ -377,22 +356,16 @@ class DiceLoss(nn.Module):
 
     def forward(self, pred, mask):
         assert pred.shape == mask.shape, "pred and mask should have the same shape."
-        
-        # 1. 筛选有效像素
         valid_mask = (mask != self.ignore_index)
-        
         if valid_mask.sum() == 0:
             return pred.sum() * 0.0
 
-        # 2. 取有效值
         p = torch.sigmoid(pred)[valid_mask]
         targets = mask[valid_mask]
 
-        # 3. 计算 Dice
         intersection = torch.sum(p * targets)
         union = torch.sum(p) + torch.sum(targets)
         dice_loss = (2.0 * intersection + self.smooth) / (union + self.smooth)
-
         return 1 - dice_loss
 
 
@@ -402,37 +375,19 @@ class MaskIoULoss(nn.Module):
         self.ignore_index = ignore_index
 
     def forward(self, pred_mask, ground_truth_mask, pred_iou):
-        """
-        pred_mask: [B, 1, H, W]
-        ground_truth_mask: [B, 1, H, W] (含 255)
-        pred_iou: [B, 1] 网络的 IoU Head 输出
-        """
         assert pred_mask.shape == ground_truth_mask.shape
-        
-        # 计算真实 IoU (GT IoU)，必须忽略 255 区域
-        
-        # 创建 Valid Mask [B, 1, H, W]
         valid = (ground_truth_mask != self.ignore_index)
-        
-        # 为了按 Batch 计算，我们不能简单的 flatten 所有，需要保留 Batch 维度
-        # 方法：把 255 区域在 pred 和 gt 中都置为 0，不参与 Intersection 和 Union 的贡献
         
         p = torch.sigmoid(pred_mask)
         gt = ground_truth_mask.clone()
         
-        # 把 ignore 区域强制设为 0，防止影响 sum
-        # 注意：p 也要在 ignore 区域设为 0，否则 union 会算多
         p = p * valid.float()
         gt = gt * valid.float()
         
-        # 按 Batch 求和: [B, 1, H, W] -> [B, 1]
         intersection = torch.sum(p * gt, dim=(1, 2, 3))
         union = torch.sum(p, dim=(1, 2, 3)) + torch.sum(gt, dim=(1, 2, 3)) - intersection
         
-        # 真实 IoU
         gt_iou = (intersection + 1e-7) / (union + 1e-7)
-        
-        # MSE Loss
         iou_loss = torch.mean((gt_iou - pred_iou.squeeze()) ** 2)
         return iou_loss
 
@@ -444,17 +399,11 @@ class FocalDiceloss_IoULoss(nn.Module):
         self.iou_scale = iou_scale
         self.ignore_index = ignore_index
         
-        # 初始化子 Loss
         self.focal_loss = FocalLoss(ignore_index=ignore_index)
         self.dice_loss = DiceLoss(ignore_index=ignore_index)
         self.maskiou_loss = MaskIoULoss(ignore_index=ignore_index)
 
     def forward(self, pred, mask, pred_iou):
-        """
-        pred: Mask Logits
-        mask: GT Mask (0, 1, 255)
-        pred_iou: Predicted IoU Score
-        """
         assert pred.shape == mask.shape, "pred and mask should have the same shape."
 
         focal_loss = self.focal_loss(pred, mask)
@@ -462,7 +411,6 @@ class FocalDiceloss_IoULoss(nn.Module):
         
         loss1 = self.weight * focal_loss + dice_loss
         
-        # 如果模型有 IoU Head 输出，则计算 IoU Loss
         if pred_iou is not None:
             loss2 = self.maskiou_loss(pred, mask, pred_iou)
             loss = loss1 + loss2 * self.iou_scale
@@ -470,3 +418,34 @@ class FocalDiceloss_IoULoss(nn.Module):
             loss = loss1
             
         return loss, {'focal': focal_loss.item(), 'dice': dice_loss.item()}
+
+# ===  Point Guidance Loss ===
+def point_guidance_loss(pred_heatmap, gt_nuclei):
+    """
+    计算热力图生成的 MSE Loss (支持 2通道 输出)
+    pred_heatmap: [B, 2, H, W] (Ch0: Foreground, Ch1: Background)
+    gt_nuclei:    [B, 1, H, W] (0/1 Mask)
+    """
+    # 1. 确保 GT 维度是 [B, 1, H, W]
+    if gt_nuclei.ndim == 3:
+        gt_nuclei = gt_nuclei.unsqueeze(1)
+        
+    # 2. 获取预测的 sigmoid 概率
+    pred_prob = torch.sigmoid(pred_heatmap)
+
+    # 情况 A: 模型输出 2 个通道 (前景 + 背景)
+    if pred_heatmap.shape[1] == 2:
+        # Channel 0 监督前景
+        pred_fg = pred_prob[:, 0:1, :, :]
+        loss_fg = F.mse_loss(pred_fg, gt_nuclei)
+        
+        # Channel 1 监督背景 (1 - GT)
+        pred_bg = pred_prob[:, 1:2, :, :]
+        gt_bg = 1.0 - gt_nuclei
+        loss_bg = F.mse_loss(pred_bg, gt_bg)
+        
+        return loss_fg + loss_bg
+
+    # 情况 B: 模型只输出 1 个通道
+    else:
+        return F.mse_loss(pred_prob, gt_nuclei)
