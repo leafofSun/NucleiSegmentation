@@ -356,20 +356,21 @@ class PNuRL(nn.Module):
         
         for j in range(num_attributes):
             logits = attribute_logits[j]  # [B, num_classes_j]
-            labels = attribute_labels[j]  # [B, num_classes_j] (one-hot 或 binary)
+            labels = attribute_labels[j]  # [B] (类别索引) 或 [B, num_classes_j] (one-hot)
             
             # 确保标签在正确的设备上
             labels = labels.to(logits.device)
             
-            # 二元交叉熵损失
-            # 如果 labels 是 one-hot，需要转换为 binary
-            if labels.dim() == 2 and labels.sum(dim=1).max() > 1:
+            # 处理标签格式
+            if labels.dim() == 1:
+                # 类别索引格式 [B]，直接使用 cross_entropy
+                loss_j = F.cross_entropy(logits, labels.long())
+            elif labels.dim() == 2 and labels.sum(dim=1).max() > 1:
                 # one-hot 编码，取最大值的索引
                 labels = labels.argmax(dim=1)  # [B]
-                loss_j = F.cross_entropy(logits, labels)
+                loss_j = F.cross_entropy(logits, labels.long())
             else:
                 # binary 编码，使用二元交叉熵
-                # 确保标签是 Float 类型
                 labels = labels.float()
                 probs = torch.sigmoid(logits)
                 loss_j = F.binary_cross_entropy(probs, labels, reduction='mean')
