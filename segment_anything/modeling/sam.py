@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple, Optional
 from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
-from .pnurl import PNuRL  # 假设 pnurl.py 已创建
+from .pnurl import PNuRL
 import sys
 import os
 
@@ -16,7 +16,6 @@ import os
 try:
     import clip
 except ImportError:
-    # 尝试添加路径 (根据你的项目结构调整)
     sys.path.append(os.path.join(os.path.dirname(__file__), "../../../CLIP")) 
     try:
         import clip
@@ -58,7 +57,7 @@ class Sam(nn.Module):
 
     @torch.no_grad()
     def forward(self, batched_input: List[Dict[str, Any]], multimask_output: bool):
-        # 基础 SAM forward 逻辑保持不变，主要逻辑在 TextSam 中重写
+        # 基础 SAM forward 逻辑保持不变
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         image_embeddings = self.image_encoder(input_images)
         outputs = []
@@ -198,9 +197,7 @@ class TextSam(Sam):
             
         # 3. PNuRL (Trainable)
         self.pnurl = PNuRL(
-            feature_dim=embed_dim, # 注意参数名可能要对应 pnurl.py
-            # clip_model_path=None, 
-            # num_classes_per_attr=[2, 3, 2, 3, 3] 
+            embed_dim=embed_dim,
         )
         
         # 4. Auto-Prompt Generator (Trainable)
@@ -272,34 +269,31 @@ class TextSam(Sam):
         
         if len(attribute_labels_list) > 0:
             attr_labels_batch = torch.stack(attribute_labels_list).to(device)  # [B, 5]
+            # 拆分为 5 个 tensor list
+            attribute_labels = [attr_labels_batch[:, i] for i in range(5)]
         else:
-            attr_labels_batch = None
+            attribute_labels = None
             
         # PNuRL Forward
-        # 返回: [logits_list], loss (refined_embeddings 暂未实现，如果 PNuRL 只是分类头)
-        # 如果你希望 PNuRL 修正 Image Embedding，需要在 PNuRL forward 中实现 Attention
-        # 假设 PNuRL 只负责计算 Loss，不改变 Feature (宏观监督)
-        # 或者 PNuRL 返回 refined_features (如果实现了)
+        refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits = self.pnurl(
+            image_features=image_embeddings,
+            attribute_labels=attribute_labels,
+            attribute_prompts=attribute_texts,
+            return_loss=True
+        )
         
-        # 这里假设 PNuRL 只是简单的分类头集合，不修改 image_features
-        # 如果需要修改 image_features，请确保 PNuRL forward 返回修改后的特征
-        # 这里我们直接使用原始 image_embeddings 继续，PNuRL 仅作为辅助 Loss
-        attr_logits, pnurl_loss = self.pnurl(image_embeddings, attr_labels_batch)
-        
-        # 如果 PNuRL 返回 refined_features，则更新
-        # refined_image_embeddings = ...
-        refined_image_embeddings = image_embeddings # 目前保持不变
-
         # === Step 5: Auto-Prompt Generation (SAC - Adaptive) ===
         heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
         
-        # 🔥 [核心修改] 使用自适应采样 (Adaptive Sampling)
-        # 获取含有 正点+负邻居 的 Prompt 列表
+        # 智能决定是否限制点数: 训练时限制(50)，验证时不限制
+        limit_points = 50 if self.training else None
+
         prompts_list = self.prompt_generator.generate_adaptive_prompts(
             heatmap_logits, 
-            threshold=0.3,       # 热力图阈值
-            k_neighbors=3,       # 邻居数量
-            dense_dist_thresh=15.0 # 拥挤距离阈值
+            threshold=0.3,       
+            k_neighbors=3,       
+            dense_dist_thresh=15.0,
+            max_points=limit_points
         )
         
         # 坐标映射 (Feature Grid -> Original Image)
@@ -314,31 +308,25 @@ class TextSam(Sam):
             # 获取当前样本的 Prompt 数据
             prompt_data = prompts_list[i]
             
-            # 如果没有找到点 (全背景)，创建一个 Dummy Prompt 防止报错
-            # 或者直接预测空 Mask (更合理)
+            # 🔥 [修正] 如果没有找到点 (全背景)，返回全黑 Mask (Float 类型，极大负数代表 logits 0)
             if not prompt_data["has_points"]:
-                # 无点 -> 输出全黑 Mask
-                # 构造一个空的 output 结构
                 outputs.append({
-                    "masks": torch.zeros((1, 1, 1024, 1024), device=device, dtype=torch.bool),
+                    "masks": torch.zeros((1, 1, input_size, input_size), device=device, dtype=torch.float32) - 100.0,
                     "iou_predictions": torch.zeros((1, 1), device=device),
-                    "low_res_logits": torch.zeros((1, 1, 256, 256), device=device),
+                    "low_res_logits": torch.zeros((1, 1, 256, 256), device=device) - 100.0,
                     "heatmap_logits": heatmap_logits[i].unsqueeze(0),
                     "pnurl_loss": pnurl_loss
                 })
                 continue
 
             # 提取坐标和标签
-            # coords: [N_cells, K+1, 2]
-            # labels: [N_cells, K+1]
             point_coords = prompt_data["point_coords"]
             point_labels = prompt_data["point_labels"]
             
             # 缩放坐标到 1024
             point_coords = (point_coords * scale_factor) + (scale_factor * 0.5)
             
-            # 喂给 Prompt Encoder
-            # sparse_embeddings: [N_cells, tokens, channel]
+            # 喂给 Prompt Encoder (points=(N_cells, K+1, 2))
             sparse_embeddings, dense_embeddings = self.prompt_encoder(
                 points=(point_coords, point_labels),
                 boxes=None,
@@ -346,7 +334,7 @@ class TextSam(Sam):
             )
             
             # 扩展 Image Embedding 以匹配 N_cells
-            # curr_embedding: [256, 64, 64] -> [1, 256, 64, 64] -> [N_cells, 256, 64, 64]
+            # refined_image_embeddings[i]: [256, 64, 64] -> [1, 256, 64, 64] -> [N_cells, 256, 64, 64]
             num_cells = point_coords.shape[0]
             curr_img_embed = refined_image_embeddings[i].unsqueeze(0).expand(num_cells, -1, -1, -1)
             
@@ -360,17 +348,11 @@ class TextSam(Sam):
             )
             
             # === Step 7: 后处理 & 聚合 ===
-            # low_res_masks: [N_cells, 1, 256, 256]
-            # 我们需要把它合并成一张图 (Instance Segmentation -> Semantic Mask for Loss)
-            # 或者保留 Instance 形式计算 Loss (如果 Loss 支持)
-            # 这里为了适配原来的 pipeline，我们将 N 个 Mask 取 Max 合并
-            # (注意：这是简化处理，严格来说应该匹配 GT 的 Instance ID)
+            # low_res_masks: [N_cells, 1, 256, 256] -> 合并成单图 [1, 1, 256, 256]
+            merged_logits, _ = torch.max(low_res_masks, dim=0, keepdim=True) 
             
-            # 合并策略: Max Pool (只要有一个细胞预测是前景，就是前景)
-            merged_logits, _ = torch.max(low_res_masks, dim=0, keepdim=True) # [1, 1, 256, 256]
-            
-            # IoU 也可以取平均或最大
-            merged_iou, _ = torch.max(iou_predictions, dim=0, keepdim=True)
+            # IoU 聚合: 取平均
+            merged_iou = torch.mean(iou_predictions, dim=0, keepdim=True)
 
             mask_post = self.postprocess_masks(
                 merged_logits,
@@ -379,11 +361,11 @@ class TextSam(Sam):
             )
             
             outputs.append({
-                "masks": mask_post > self.mask_threshold, # Boolean Mask
+                "masks": mask_post, # ✅ 确认：返回 Float Logits
                 "iou_predictions": merged_iou,
                 "low_res_logits": merged_logits,
                 "heatmap_logits": heatmap_logits[i].unsqueeze(0),
-                "attr_logits": None, # 暂不返回详细 Logits 以省显存
+                "attr_logits": None, 
                 "pnurl_loss": pnurl_loss
             })
             

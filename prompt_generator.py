@@ -17,33 +17,22 @@ class TextGuidedPointGenerator(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # 3. Logit Scale (用于放大相似度，防止梯度消失)
-        # 初始化为 log(1/0.07) ≈ 2.65
+        # 3. Logit Scale
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
     def forward(self, image_embeddings, text_embeddings):
-        """
-        输入:
-            image_embeddings: [B, 256, 64, 64] (SAM Image Encoder 输出)
-            text_embeddings:  [B, N_Classes, 512] (CLIP Text Encoder 输出)
-        输出:
-            heatmap_logits:   [B, N_Classes, 64, 64]
-        """
         B, C, H, W = image_embeddings.shape
         _, N_Classes, _ = text_embeddings.shape 
         
-        # 特征提取与归一化
         img_feat = self.img_conv(image_embeddings) 
         txt_feat = self.text_proj(text_embeddings)
         
-        img_feat = F.normalize(img_feat, dim=1)      # [B, 256, 64, 64]
-        txt_feat = F.normalize(txt_feat, dim=-1)     # [B, N, 256]
+        img_feat = F.normalize(img_feat, dim=1)      
+        txt_feat = F.normalize(txt_feat, dim=-1)     
 
-        # 计算相似度矩阵 (Attention Map)
-        img_flat = img_feat.view(B, C, -1)           # [B, 256, 4096]
-        match_score = torch.bmm(txt_feat, img_flat)  # [B, N, 4096]
+        img_flat = img_feat.view(B, C, -1)           
+        match_score = torch.bmm(txt_feat, img_flat)  
         
-        # 缩放 Logits
         logit_scale = self.logit_scale.exp().clamp(max=100)
         match_score = match_score * logit_scale
         
@@ -51,45 +40,33 @@ class TextGuidedPointGenerator(nn.Module):
         return heatmap_logits
 
     @torch.no_grad()
-    def generate_adaptive_prompts(self, heatmap_logits, threshold=0.3, k_neighbors=3, dense_dist_thresh=15.0):
+    def generate_adaptive_prompts(self, heatmap_logits, threshold=0.3, k_neighbors=3, dense_dist_thresh=15.0, max_points=None):
         """
-        🔥 [核心功能] 密度自适应 + 邻域负提示采样 (Density-Adaptive Sampling)
+        🔥 [核心修正] 全局邻域构建 + 随机采样训练 (Global Neighborhood + Random Sampling)
         
-        策略：
-        1. 稀疏区: [1 正提示] (相信 SAM 的泛化能力)
-        2. 拥挤区: [1 正提示 + K 负提示] (利用邻居作为负样本，切断粘连)
-        
-        Args:
-            heatmap_logits: [B, C, H, W]
-            threshold: 热力图阈值
-            k_neighbors: 最多取多少个邻居作为负提示
-            dense_dist_thresh: 判定为“拥挤”的距离阈值 (像素)
-            
-        Returns:
-            prompts_list: List[Dict], 长度为 B。
-                          每个元素包含:
-                          - 'point_coords': [N_cells, K+1, 2]
-                          - 'point_labels': [N_cells, K+1]
+        逻辑流：
+        1. 提取全图所有潜在细胞点 (All Points)。
+        2. 基于 All Points 构建 KDTree，确保邻居关系的物理真实性 (Neighbor Integrity)。
+        3. 如果训练需要限制数量 (max_points)，则从 All Points 中【随机采样】N 个作为目标。
+           注意：这里使用 Random 而不是 Top-K，以保证模型见过"差生"(低置信度样本)。
+        4. 为这 N 个目标构建 Prompt，其负提示来源于 KDTree (即来源于全集)。
         """
         B, C, H, W = heatmap_logits.shape
         device = heatmap_logits.device
         
-        # 1. 归一化并进行 NMS (非极大值抑制)，提取峰值点
+        # 1. NMS 提取所有点
         scores = torch.sigmoid(heatmap_logits)
-        # MaxPool 做 NMS (窗口大小 5x5)
         local_max = F.max_pool2d(scores, kernel_size=5, stride=1, padding=2)
         is_local_max = (scores == local_max) & (scores > threshold)
         
         batch_prompts = []
 
         for b in range(B):
-            # 获取当前图的所有前景点 (假设 Channel 0 是 Nuclei 前景)
             fg_map = is_local_max[b, 0] 
             y_inds, x_inds = torch.where(fg_map)
             
             # === 情况 A: 图中无细胞 ===
             if len(y_inds) == 0:
-                # 返回空 tensor 防止报错
                 batch_prompts.append({
                     "point_coords": torch.empty((0, k_neighbors + 1, 2), device=device),
                     "point_labels": torch.empty((0, k_neighbors + 1), device=device),
@@ -97,94 +74,91 @@ class TextGuidedPointGenerator(nn.Module):
                 })
                 continue
                 
-            # 构建坐标数组 [N, 2] (x, y) - 注意 SAM 需要 (x, y) 格式
-            points_np = torch.stack([x_inds.float(), y_inds.float()], dim=1).cpu().numpy()
-            num_points = len(points_np)
+            # === 关键步骤 1: 获取全量点集 (Global Set) ===
+            # 这些点既是潜在的 Target，也是潜在的 Negative Neighbor
+            all_points_np = torch.stack([x_inds.float(), y_inds.float()], dim=1).cpu().numpy()
+            total_num_points = len(all_points_np)
             
-            # === 构建 KDTree 查找邻居 ===
-            dists, indices = None, None
-            if num_points > 1:
-                tree = KDTree(points_np)
-                # 查询最近的 k+1 个点 (第1个是自己，后k个是邻居)
-                k_query = min(num_points, k_neighbors + 1)
-                dists, indices = tree.query(points_np, k=k_query)
+            # === 关键步骤 2: 基于全量点集构建 KDTree (保证邻居完整性) ===
+            # 无论我们后面采样哪 50 个训练，找邻居必须在全集里找！
+            tree = None
+            dists_all, indices_all = None, None
+            
+            if total_num_points > 1:
+                tree = KDTree(all_points_np)
+                # 预先计算所有点的邻居信息 (查询 k+1 个，包含自己)
+                k_query = min(total_num_points, k_neighbors + 1)
+                dists_all, indices_all = tree.query(all_points_np, k=k_query)
 
-            # === 构造 Prompt (N 个细胞，每个细胞有一组 Points) ===
+            # === 关键步骤 3: 确定训练目标 (Target Selection) ===
+            # 默认使用所有点
+            target_indices = np.arange(total_num_points)
+            
+            # 如果点数超过限制，进行【随机采样】，而不是 Top-K
+            # max_points 通常在训练时设为 50，验证时设为 None
+            if max_points is not None and total_num_points > max_points:
+                # 🔥 [策略修正] 使用随机采样，保证泛化性
+                # replace=False 表示不重复采样
+                target_indices = np.random.choice(total_num_points, max_points, replace=False)
+                
+            # === 关键步骤 4: 构建 Prompt (只针对选中的 Target) ===
             image_point_coords = []
             image_point_labels = []
 
-            for i in range(num_points):
-                # 1. 正提示 (Self)
-                current_pt = points_np[i]
+            for i in target_indices:
+                # 1. 正提示 (Self) - 来源于全集
+                current_pt = all_points_np[i]
                 pts = [current_pt]
                 lbls = [1] # 1 = Positive
                 
-                # 2. 密度判断
+                # 2. 密度判断 & 负提示注入 (使用全集的 KDTree 结果)
                 is_crowded = False
-                if dists is not None:
-                    # dists[i, 1] 是离自己最近的邻居距离 (下标0是自己)
-                    # 如果最近的邻居距离小于阈值，说明是拥挤区域
-                    if len(dists[i]) > 1:
-                        nearest_dist = dists[i, 1] 
-                        if nearest_dist < dense_dist_thresh:
-                            is_crowded = True
+                if dists_all is not None:
+                    # 获取第 i 个点的邻居距离信息
+                    d_i = dists_all[i] # 距离数组
+                    idx_i = indices_all[i] # 邻居索引数组
+                    
+                    if np.size(d_i) > 1:
+                        # 兼容 shape
+                        if d_i.ndim == 0: d_i = [d_i] 
+                        
+                        # dists_all[i][1] 是最近邻居的距离 (index 0 是自己)
+                        if len(d_i) > 1:
+                            nearest_dist = d_i[1]
+                            if nearest_dist < dense_dist_thresh:
+                                is_crowded = True
                 
                 # 3. 负提示注入 (Neighboring Negatives)
                 if is_crowded:
                     # 遍历邻居 (跳过下标0，因为是自己)
-                    for j in range(1, len(indices[i])):
-                        neighbor_idx = indices[i][j]
-                        neighbor_pt = points_np[neighbor_idx]
-                        
-                        pts.append(neighbor_pt)
-                        lbls.append(0) # 0 = Negative (告诉 SAM 这里不是我)
+                    # 注意：idx_i 里面存的是在 all_points_np 中的下标
+                    # 即使某个邻居没有被选进 target_indices，它依然会被加进来做负提示！✅
+                    current_neighbors = idx_i if np.ndim(idx_i) > 0 else [idx_i]
+                    
+                    for j in range(1, len(current_neighbors)):
+                        neighbor_idx = current_neighbors[j]
+                        # 只有当 neighbor_idx 有效时
+                        if neighbor_idx < total_num_points:
+                            neighbor_pt = all_points_np[neighbor_idx]
+                            pts.append(neighbor_pt)
+                            lbls.append(0) # 0 = Negative
                 
-                # 4. Padding (补齐到固定长度 k+1)
-                # 必须 Pad 到固定长度才能 stack 成 Tensor
+                # 4. Padding
                 while len(pts) < k_neighbors + 1:
-                    pts.append([0.0, 0.0]) # Pad 坐标 (0,0)
-                    lbls.append(-1)        # -1 = Ignore Label (SAM 会忽略此点)
+                    pts.append([0.0, 0.0]) 
+                    lbls.append(-1)
                 
                 image_point_coords.append(pts)
                 image_point_labels.append(lbls)
 
             # 转为 Tensor
             batch_prompts.append({
-                # coords: [N_cells, K+1, 2]
                 "point_coords": torch.tensor(np.array(image_point_coords), device=device).float(),
-                # labels: [N_cells, K+1]
                 "point_labels": torch.tensor(np.array(image_point_labels), device=device).long(),
                 "has_points": True
             })
             
         return batch_prompts
-
-    def get_points_from_heatmap(self, heatmap_logits, topk=1):
-        """
-        [旧方法] 简单的 Top-K 采样 (保留作为 fallback 或 baseline)
-        仅用于简单验证，不具备密度自适应能力。
-        """
-        B, C, H, W = heatmap_logits.shape
-        device = heatmap_logits.device
-        all_points = []
-        all_labels = []
-
-        for b in range(B):
-            flat_fg = heatmap_logits[b, 0].view(-1)
-            val, idx = torch.topk(flat_fg, k=topk)
-            y = (idx // W).float()
-            x = (idx % W).float()
-            
-            batch_points = []
-            batch_labels = []
-            for i in range(topk):
-                batch_points.append([x[i], y[i]])
-                batch_labels.append(1) 
-            
-            all_points.append(torch.tensor(batch_points, device=device))
-            all_labels.append(torch.tensor(batch_labels, device=device))
-
-        return torch.stack(all_points), torch.stack(all_labels)
 
 # === Loss 函数 ===
 def point_guidance_loss(pred_heatmap_logits, target_heatmap):

@@ -39,7 +39,7 @@ def parse_args():
     
     # --- 基础环境 ---
     parser.add_argument("--work_dir", type=str, default="workdir", help="Directory to save logs and models")
-    parser.add_argument("--run_name", type=str, default="mp_sam_monuseg_final", help="Experiment name")
+    parser.add_argument("--run_name", type=str, default="mp_sam", help="Experiment name")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument('--device', type=str, default='cuda', help="Device to use (cuda/cpu)")
     
@@ -50,7 +50,7 @@ def parse_args():
     
     # --- 图像参数 ---
     parser.add_argument("--image_size", type=int, default=1024, help="SAM input resolution (Target Size)")
-    parser.add_argument("--crop_size", type=int, default=256, help="Physical Patch Size (Source Size)") # 🔥 256->1024
+    parser.add_argument("--crop_size", type=int, default=256, help="Physical Patch Size (Source Size)") 
     parser.add_argument("--mask_num", type=int, default=1, help="Number of masks per proposal")
 
     # --- 模型配置 ---
@@ -122,22 +122,13 @@ def resize_pos_embed(state_dict, model_state_dict):
             new_state_dict[k] = v
     return new_state_dict
 
-# 🔥 [新增] 滑动窗口推理 (解决验证集尺度不匹配问题)
+# 🔥 滑动窗口推理
 def sliding_window_inference(model, image, patch_size=256, target_size=1024, stride=256, device='cuda'):
-    """
-    1. 切割: image (H, W) -> patch_size (256)
-    2. 放大: 256 -> 1024 (适配训练时的 Scale)
-    3. 预测: SAM Inference
-    4. 缩小: 1024 -> 256
-    5. 拼接: 还原到 (H, W)
-    """
     C, H, W = image.shape
     
-    # 初始化全图概率图
     full_prob_map = torch.zeros((H, W), device=device)
     count_map = torch.zeros((H, W), device=device)
 
-    # 计算步长
     h_steps = math.ceil((H - patch_size) / stride) + 1
     w_steps = math.ceil((W - patch_size) / stride) + 1
 
@@ -148,15 +139,11 @@ def sliding_window_inference(model, image, patch_size=256, target_size=1024, str
             y2 = min(y1 + patch_size, H)
             x2 = min(x1 + patch_size, W)
             
-            # 修正边缘：如果最后一步超出边界，就往回退，保证 patch 大小固定为 256
             if y2 - y1 < patch_size: y1 = max(0, y2 - patch_size)
             if x2 - x1 < patch_size: x1 = max(0, x2 - patch_size)
             
-            # 1. Crop Patch [3, 256, 256]
             patch = image[:, y1:y1+patch_size, x1:x1+patch_size]
             
-            # 2. Resize to 1024 (Model Input)
-            # 必须使用 bilinear 插值，且 unsqueeze 增加 batch 维度
             patch_1024 = F.interpolate(
                 patch.unsqueeze(0), 
                 size=(target_size, target_size), 
@@ -164,8 +151,6 @@ def sliding_window_inference(model, image, patch_size=256, target_size=1024, str
                 align_corners=False
             )
             
-            # 3. Model Predict
-            # 构造验证时的 Prompt (使用通用 Prompt，因为验证时我们不知道具体属性)
             model_input = [{
                 'image': patch_1024.squeeze(0), 
                 'original_size': (target_size, target_size),
@@ -178,10 +163,8 @@ def sliding_window_inference(model, image, patch_size=256, target_size=1024, str
                 out = model(model_input, multimask_output=True)
                 iou_preds = out[0]['iou_predictions']
                 best_idx = torch.argmax(iou_preds).item()
-                # 获取 Logits [1024, 1024]
                 pred_logits_1024 = out[0]['masks'][0, best_idx]
             
-            # 4. Resize back to 256
             pred_logits_256 = F.interpolate(
                 pred_logits_1024.unsqueeze(0).unsqueeze(0), 
                 size=(patch_size, patch_size), 
@@ -189,14 +172,11 @@ def sliding_window_inference(model, image, patch_size=256, target_size=1024, str
                 align_corners=False
             ).squeeze()
             
-            # 转概率
             pred_prob_256 = torch.sigmoid(pred_logits_256)
 
-            # 5. Stitch (累加)
             full_prob_map[y1:y1+patch_size, x1:x1+patch_size] += pred_prob_256
             count_map[y1:y1+patch_size, x1:x1+patch_size] += 1
 
-    # 取平均处理重叠区域
     full_prob_map /= torch.clamp(count_map, min=1.0)
     return full_prob_map
 
@@ -255,7 +235,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 pred_iou = iou_preds[best_idx]
                 gt_mask = labels[i].squeeze(0).float()
                 
-                # 尺寸对齐 (防患未然)
                 if pred_mask.shape != gt_mask.shape:
                       gt_mask = F.interpolate(gt_mask.unsqueeze(0).unsqueeze(0), size=pred_mask.shape, mode='nearest').squeeze()
 
@@ -318,27 +297,24 @@ def validate_one_epoch(args, model, val_loader, epoch):
     
     for batch, batched_input in enumerate(pbar):
         batched_input = to_device(batched_input, args.device)
-        images = batched_input['image'] # [B, 3, H, W] 注意这里是原图尺寸(约1000x1000)
+        images = batched_input['image'] 
         labels = batched_input['label'].cpu().numpy()
         
         for i in range(len(images)):
-            # 🔥 [关键修复] 使用滑动窗口推理
-            # patch_size=256 (与训练时的 crop_size 一致)
-            # target_size=1024 (模型输入尺寸)
+            # 滑动窗口推理
             prob_map = sliding_window_inference(
                 model, images[i], 
                 patch_size=args.crop_size, 
                 target_size=args.image_size, 
-                stride=args.crop_size, # 不重叠步长，追求速度
+                stride=args.crop_size, 
                 device=args.device
             )
             
-            # 转为二值 Mask (Threshold 0.5)
+            # 转为二值 Mask
             pred_mask = (prob_map.cpu().numpy() > 0.5).astype(np.uint8)
             
             gt = labels[i]
             if gt.ndim == 3: gt = gt[0]
-            
             gt_valid = gt.copy()
             gt_valid[gt == 255] = 0
             
@@ -369,21 +345,19 @@ def main(args):
     logger.info(f"🚀 [Start] MP-SAM (Scale: {args.crop_size}->{args.image_size})")
 
     # --- 数据加载 ---
-    # 训练集: crop=256, prompt_mode=dynamic
     train_dataset = TrainingDataset(
         os.path.join(args.data_path, "train"),
         knowledge_path=args.knowledge_path,
         image_size=args.image_size, 
-        crop_size=args.crop_size, # 256
+        crop_size=args.crop_size, 
         mode='train',
         prompt_mode='dynamic'
     )
-    # 验证集: prompt_mode=generic (验证时不需要动态任务)
     val_dataset = TrainingDataset(
         os.path.join(args.data_path, "test"),
         knowledge_path=args.knowledge_path,
         image_size=args.image_size, 
-        crop_size=args.crop_size, # 256 (用于滑动窗口参数)
+        crop_size=args.crop_size, 
         mode='test',
         prompt_mode='generic'
     )
@@ -396,11 +370,12 @@ def main(args):
     logger.info(f"📊 Train Size: {len(train_dataset)} | Val Size: {len(val_dataset)}")
 
     # --- 模型构建 ---
+    args.checkpoint = args.sam_checkpoint
     vanilla_sam = sam_model_registry[args.model_type](args)
     if os.path.exists(args.sam_checkpoint):
         logger.info(f"📥 Loading checkpoint: {args.sam_checkpoint}")
         try:
-            ckpt = torch.load(args.sam_checkpoint, map_location='cpu')
+            ckpt = torch.load(args.sam_checkpoint, map_location='cpu',weights_only=False)
             state_dict = ckpt.get("model", ckpt)
             state_dict = resize_pos_embed(state_dict, vanilla_sam.state_dict())
             vanilla_sam.load_state_dict(state_dict, strict=False)
@@ -446,30 +421,60 @@ def main(args):
 
     # --- Loop ---
     best_aji = 0.0
+    best_dice = 0.0
     
     for epoch in range(args.epochs):
+        # 1. Train
         loss, m_loss, h_loss, a_loss = train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler)
-        val_res = validate_one_epoch(args, model, val_loader, epoch)
         
-        dice = val_res.get('dice', 0.0)
-        aji = val_res.get('mAJI', 0.0)
-        pq = val_res.get('mPQ', 0.0)
-        
-        logger.info(
-            f"Ep {epoch+1}/{args.epochs} | "
-            f"Loss: {loss:.4f} (M:{m_loss:.3f}, H:{h_loss:.3f}, A:{a_loss:.3f}) | "
-            f"Dice: {dice:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}"
-        )
-        
-        if aji > best_aji:
-            best_aji = aji
-            torch.save(model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, "best_model.pth"))
-            logger.info(f"⭐ Best Model Saved (AJI: {best_aji:.4f})")
-        
-        scheduler.step()
-        
-        if (epoch + 1) % 10 == 0:
+        # 🔥 2. Val (Frequency Control: 每10轮或最后一轮)
+        if (epoch + 1) % 10 == 0 or (epoch + 1) == args.epochs:
+            val_res = validate_one_epoch(args, model, val_loader, epoch)
+            
+            dice = val_res.get('dice', 0.0)
+            aji = val_res.get('mAJI', 0.0)
+            pq = val_res.get('mPQ', 0.0)
+            
+            logger.info(
+                f"Ep {epoch+1}/{args.epochs} | "
+                f"Loss: {loss:.4f} (M:{m_loss:.3f}, H:{h_loss:.3f}, A:{a_loss:.3f}) | "
+                f"Dice: {dice:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}"
+            )
+            
+            # 🔥 3. Smart Save Strategy (AJI 优先，Dice 辅助)
+            saved = False
+            
+            # 策略 A: AJI 创新高 (绝对优先)
+            if aji > best_aji:
+                best_aji = aji
+                best_dice = max(best_dice, dice) # 同步更新
+                torch.save(model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, "best_model.pth"))
+                logger.info(f"⭐ New Best AJI! ({best_aji:.4f}) -> Model Saved")
+                saved = True
+            
+            # 策略 B: AJI 差不多 (差距 < 0.002)，但 Dice 显著更高 (高出 0.005)
+            # 这能防止我们错过那些切分略差一点点，但整体覆盖率好得多的模型
+            elif (best_aji - aji) < 0.002 and dice > (best_dice + 0.005):
+                best_dice = dice
+                # 这种情况下，我们也更新 best_model，或者你可以另存为 best_dice_model.pth
+                torch.save(model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, "best_dice_model.pth"))
+                logger.info(f"✨ High Dice Model Found! (Dice: {dice:.4f}, AJI: {aji:.4f}) -> Saved as best_dice_model.pth")
+                saved = True
+            
+            # 定期保存 Checkpoint
             torch.save(model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, f"epoch_{epoch+1}.pth"))
+            
+        else:
+            # Skip Val Log
+            logger.info(
+                f"Ep {epoch+1}/{args.epochs} | "
+                f"Loss: {loss:.4f} (M:{m_loss:.3f}, H:{h_loss:.3f}, A:{a_loss:.3f}) | "
+                f"Skipping Val"
+            )
+
+        scheduler.step()
+
+    logger.info(f"🏁 Training Finished. Best AJI: {best_aji:.4f}")
 
 if __name__ == '__main__':
     args = parse_args()
