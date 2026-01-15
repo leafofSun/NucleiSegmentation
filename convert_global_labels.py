@@ -5,274 +5,207 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 from skimage import measure
+from typing import Dict, List
 
 # ==============================================================================
-# ⚙️ 配置区域 (Configuration)
+# 1. 扩展医学先验库 (保持不变)
 # ==============================================================================
-# 请确保这里指向您存放 .json 文件的目录 (例如 MoNuSeg 的 Training 或 Test 目录)
-DATA_ROOT = "data/MoNuSeg_SA1B/train" 
-OUTPUT_JSON = "data/MoNuSeg_SA1B/medical_knowledge.json"
-
-# ==============================================================================
-# 🧠 医学知识映射 (Medical Knowledge Mappings)
-# ==============================================================================
-
-# 1. MoNuSeg 精确器官映射 (TCGA Mapping)
-TCGA_MAP = {
-    # --- Training Set ---
-    "TCGA-B0": "Kidney", "TCGA-HE": "Kidney", "TCGA-2Z": "Kidney", 
-    "TCGA-A7": "Breast", "TCGA-AR": "Breast", "TCGA-E2": "Breast", "TCGA-AO": "Breast",
-    "TCGA-G9": "Prostate", "TCGA-CH": "Prostate", "TCGA-EJ": "Prostate",
-    "TCGA-18": "Lung", "TCGA-38": "Lung", "TCGA-49": "Lung", "TCGA-50": "Lung", "TCGA-21": "Lung",
-    "TCGA-A6": "Colon", "TCGA-CM": "Colon", "TCGA-NH": "Colon", 
-    # --- Test Set ---
-    "TCGA-AY": "Stomach", "TCGA-KB": "Stomach", "TCGA-RD": "Stomach",
-    "TCGA-IZ": "Liver", "TCGA-MH": "Liver",
-    "TCGA-DK": "Bladder", "TCGA-ZF": "Bladder",
-    "TCGA-HT": "Brain", "TCGA-CS": "Brain",
+DEFAULT_ORGAN_KNOWLEDGE = {
+    # --- PanNuke 19 类 ---
+    "Adrenal_gland": {"context": "Adrenal tissue", "desc": "Adrenocortical cells"},
+    "Bile-duct": {"context": "Biliary tissue", "desc": "Cholangiocytes"},
+    "Bladder": {"context": "Urothelial tissue", "desc": "Transitional epithelial cells"},
+    "Breast": {"context": "Mammary tissue", "desc": "Ductal epithelial cells"},
+    "Cervix": {"context": "Cervical tissue", "desc": "Squamous epithelial cells"},
+    "Colon": {"context": "Colonic mucosa", "desc": "Columnar epithelial cells"},
+    "Esophagus": {"context": "Esophageal tissue", "desc": "Squamous cells"},
+    "HeadNeck": {"context": "Head and Neck tissue", "desc": "Squamous epithelial cells"},
+    "Kidney": {"context": "Renal tissue", "desc": "Tubular epithelial cells"},
+    "Liver": {"context": "Hepatic tissue", "desc": "Hepatocytes"},
+    "Lung": {"context": "Pulmonary tissue", "desc": "Pneumocytes and macrophages"},
+    "Ovarian": {"context": "Ovarian tissue", "desc": "Stromal and epithelial cells"},
+    "Pancreatic": {"context": "Pancreatic tissue", "desc": "Acinar cells"},
+    "Prostate": {"context": "Prostatic tissue", "desc": "Glandular epithelial cells"},
+    "Skin": {"context": "Cutaneous tissue", "desc": "Keratinocytes"},
+    "Stomach": {"context": "Gastric mucosa", "desc": "Glandular cells"},
+    "Testis": {"context": "Testicular tissue", "desc": "Germ cells"},
+    "Thyroid": {"context": "Thyroid tissue", "desc": "Follicular cells"},
+    "Uterus": {"context": "Uterine tissue", "desc": "Endometrial cells"},
+    # --- MoNuSeg 补充 ---
+    "Brain": {"context": "Brain tissue", "desc": "Glial cells and neurons"},
+    # --- 通用兜底 ---
+    "Generic": {"context": "Histopathology tissue", "desc": "Nuclei"}
 }
 
-# 2. 显式病理先验库
-ORGAN_KNOWLEDGE = {
-    "Kidney": {"context": "Renal tissue", "cell_desc": "Epithelial cells of proximal tubules", "structure": "tubular structure"},
-    "Breast": {"context": "Mammary tissue", "cell_desc": "Ductal epithelial cells", "structure": "ductal lobular units"},
-    "Prostate": {"context": "Prostatic tissue", "cell_desc": "Glandular epithelial cells", "structure": "acinar glands"},
-    "Lung": {"context": "Pulmonary tissue", "cell_desc": "Pneumocytes and macrophages", "structure": "alveolar architecture"},
-    "Colon": {"context": "Colonic mucosa", "cell_desc": "Columnar epithelial cells", "structure": "glandular crypts"},
-    "Stomach": {"context": "Gastric mucosa", "cell_desc": "Glandular cells", "structure": "gastric pits"},
-    "Liver": {"context": "Hepatic tissue", "cell_desc": "Hepatocytes", "structure": "hepatic cords"},
-    "Bladder": {"context": "Urothelial tissue", "cell_desc": "Transitional epithelial cells", "structure": "urothelium layers"},
-    "Brain": {"context": "Brain tissue", "cell_desc": "Glial cells and neurons", "structure": "neuropil background"},
-    "Generic": {"context": "Histopathology tissue", "cell_desc": "Nuclei", "structure": "cellular region"}
-}
-
-def get_organ_from_filename(filename):
-    """根据文件名解析器官类型"""
-    for code, organ in TCGA_MAP.items():
-        if code in filename: return organ
-    for organ in ORGAN_KNOWLEDGE.keys():
-        if organ.lower() in filename.lower(): return organ
-    return "Generic"
-
 # ==============================================================================
-# 🛠️ 核心工具函数 (Core Utilities)
+# 2. 统计分析器 (保持不变)
 # ==============================================================================
+class DatasetAnalyzer:
+    def __init__(self):
+        self.areas = []
+        self.counts = []
+        self.stats = {}
 
-def decode_instance_mask_from_json(json_path, shape_hint=(1000, 1000)):
-    """
-    🔥 [核心修复] 生成 Instance Mask (int32)，每个细胞一个独立 ID。
-    解决旧版 'Binary Mask' 导致的细胞粘连、标准差爆炸问题。
-    """
-    try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        
-        h, w = shape_hint
-        if "image" in data:
-            h = data["image"].get("height", h)
-            w = data["image"].get("width", w)
-
-        # 使用 int32 存储 ID (支持 >255 个细胞)
-        instance_mask = np.zeros((h, w), dtype=np.int32)
-        anns = data.get('annotations', [])
-        
-        # 尝试使用 pycocotools 加速 RLE 解码
-        try:
-            import pycocotools.mask as coco_mask
-            has_coco = True
-        except ImportError:
-            has_coco = False
-
-        current_id = 1 
-        
-        for ann in anns:
-            if 'segmentation' not in ann: continue
-            seg = ann['segmentation']
-            
-            single_obj_mask = None
-            
-            if isinstance(seg, dict) and has_coco: # RLE 格式
-                single_obj_mask = coco_mask.decode(seg)
-            elif isinstance(seg, list): # Polygon 格式
-                temp_mask = np.zeros((h, w), dtype=np.uint8)
-                for poly in seg:
-                    # 注意：坐标可能需要取整
-                    pts = np.array(poly).reshape(-1, 2).astype(np.int32)
-                    cv2.fillPoly(temp_mask, [pts], 1)
-                single_obj_mask = temp_mask
-
-            # 将当前细胞以 Unique ID 填入主 Mask
-            if single_obj_mask is not None:
-                # 即使像素重叠，也会覆盖为新的 ID，从而在逻辑上分离它们
-                instance_mask[single_obj_mask > 0] = current_id
-                current_id += 1
-                
-        return instance_mask
-    except Exception as e:
-        # print(f"Error decoding {json_path}: {e}")
-        return np.zeros(shape_hint, dtype=np.int32)
-
-def get_dataset_statistics(json_files):
-    """
-    🔥 [Pass 1] 全局扫描：计算分位数统计 (Percentiles)。
-    相比 Mean/Std，分位数对长尾分布和剩余的粘连噪声更鲁棒。
-    """
-    print("📊 Phase 1: Analyzing dataset statistics (Global Pass - Instance Level)...")
-    
-    all_areas = []
-    nuclei_counts = []
-    
-    for json_path in tqdm(json_files):
-        # 使用实例掩码解码！
-        instance_mask = decode_instance_mask_from_json(json_path)
-        
-        # 如果 Mask 为空，跳过
-        if instance_mask.max() == 0: continue
-            
-        # measure.regionprops 可以正确区分不同的 ID
-        props = measure.regionprops(instance_mask)
-        
-        nuclei_counts.append(len(props))
+    def update(self, mask: np.ndarray):
+        props = measure.regionprops(mask)
+        count = len(props)
+        self.counts.append(count)
         for p in props:
-            # 安全过滤：忽略 >10000 像素的极端异常值（可能是标注错误）
-            if p.area < 10000:
-                all_areas.append(p.area)
-            
-    all_areas = np.array(all_areas)
-    nuclei_counts = np.array(nuclei_counts)
-    
-    if len(all_areas) == 0:
-        return None
+            if 10 < p.area < 10000:
+                self.areas.append(p.area)
 
-    # 使用分位数定义阈值
-    # Small: 最小的 33%
-    # Large: 最大的 33% (Top 33%)
-    stats = {
-        "size_th_small": np.percentile(all_areas, 33),
-        "size_th_large": np.percentile(all_areas, 67),
-        
-        "dense_th_sparse": np.percentile(nuclei_counts, 33),
-        "dense_th_dense": np.percentile(nuclei_counts, 67),
+    def compute_global_stats(self):
+        if not self.areas:
+            print("⚠️ Warning: No valid nuclei found for stats.")
+            return
 
-        # 仅供参考的均值
-        "size_mean": np.mean(all_areas)
-    }
-    
-    print(f"\n📈 Robust Statistics Report (Percentiles):")
-    print(f"   [Size] Mean: {stats['size_mean']:.1f} px (Instance-based)")
-    print(f"   [Size Thresholds] Small < {stats['size_th_small']:.1f} | Large > {stats['size_th_large']:.1f}")
-    print(f"   [Density Thresholds] Sparse < {stats['dense_th_sparse']:.1f} | Dense > {stats['dense_th_dense']:.1f}\n")
-    
-    return stats
+        areas_np = np.array(self.areas)
+        counts_np = np.array(self.counts)
 
-def analyze_visuals_dynamic(mask, stats):
-    """
-    🔥 [Pass 2] 动态判定：根据全局阈值判定当前图片的属性
-    """
-    # mask 必须是 Instance Mask
-    if mask.max() == 0 or stats is None:
-        return {"size": "medium-sized", "shape": "round", "density": "moderate"}
-        
-    props = measure.regionprops(mask)
-    if not props: 
-        return {"size": "medium-sized", "shape": "round", "density": "moderate"}
-    
-    # 1. Size (对比全局阈值)
-    current_mean_area = np.mean([p.area for p in props])
-    
-    if current_mean_area > stats['size_th_large']:
-        size_desc = "large, enlarged"
-    elif current_mean_area < stats['size_th_small']:
-        size_desc = "small"
-    else:
-        size_desc = "medium-sized"
-    
-    # 2. Density (对比全局阈值)
-    count = len(props)
-    if count > stats['dense_th_dense']:
-        density_desc = "densely packed"
-    elif count < stats['dense_th_sparse']:
-        density_desc = "sparsely distributed"
-    else:
-        density_desc = "moderately distributed"
-        
-    # 3. Shape (使用偏心率近似形状)
-    mean_ecc = np.mean([p.eccentricity for p in props])
-    if mean_ecc > 0.8: shape_desc = "elongated, spindle-shaped"
-    elif mean_ecc < 0.6: shape_desc = "round, spherical"
-    else: shape_desc = "oval"
-    
-    return {"size": size_desc, "shape": shape_desc, "density": density_desc}
+        mu_size, std_size = np.mean(areas_np), np.std(areas_np)
+        mu_dens, std_dens = np.mean(counts_np), np.std(counts_np)
 
-def construct_text_prompt(organ, visuals):
-    """构建最终的文本提示，融合语义与视觉特征"""
-    kb = ORGAN_KNOWLEDGE.get(organ, ORGAN_KNOWLEDGE["Generic"])
-    cell_desc = kb['cell_desc']
-    adj = ""
-    
-    # 规则 1: 恶性肿瘤特征
-    if organ in ["Breast", "Kidney", "Lung", "Colon"] and "enlarged" in visuals['size']:
-        cell_desc = "Pleomorphic Tumor Nuclei"
-        adj = "hyperchromatic"
-    # 规则 2: 淋巴细胞特征
-    elif "small" in visuals['size'] and "round" in visuals['shape']:
-        cell_desc = "Lymphocytes"
-        adj = "darkly stained"
-    # 规则 3: 腺体特征
-    elif organ in ["Prostate", "Colon"] and "dense" in visuals['density']:
-        cell_desc = "Glandular Epithelial Nuclei"
-        adj = "basally oriented"
-
-    text = (f"Microscopic view of {adj} {visuals['size']} {cell_desc} with {visuals['shape']} features, "
-            f"{visuals['density']} in {kb['context']} featuring {kb['structure']}.")
-    
-    return " ".join(text.split())
-
-# ==============================================================================
-# 🚀 主程序 (Main Execution)
-# ==============================================================================
-def main():
-    # 1. 扫描文件
-    json_files = glob.glob(os.path.join(DATA_ROOT, "*.json"))
-    # 排除非数据 json
-    json_files = [f for f in json_files if "knowledge" not in f and "attribute" not in f]
-    
-    if not json_files:
-        print(f"❌ No .json files found in {DATA_ROOT}")
-        return
-
-    # 2. 第一遍扫描: 获取全局统计信息 (Pass 1)
-    dataset_stats = get_dataset_statistics(json_files)
-    
-    print(f"🚀 Phase 2: Generating Knowledge Base...")
-    kb_database = {}
-    
-    # 3. 第二遍扫描: 生成具体描述 (Pass 2)
-    for json_path in tqdm(json_files):
-        filename = os.path.basename(json_path).replace(".json", ".tif")
-        organ = get_organ_from_filename(filename)
-        
-        # ⚠️ 必须使用 decode_instance_mask_from_json 以保持逻辑一致
-        instance_mask = decode_instance_mask_from_json(json_path)
-        
-        visuals = analyze_visuals_dynamic(instance_mask, dataset_stats)
-        prompt = construct_text_prompt(organ, visuals)
-        
-        kb_database[filename] = {
-            "organ_id": organ,
-            "text_prompt": prompt,
-            "visual_stats": visuals
+        # 严格遵循 Paper 逻辑
+        self.stats = {
+            "size_mean": float(mu_size),
+            "th_size_large": float(mu_size + 2 * std_size),
+            "th_size_small": float(max(0, mu_size - 0.5 * std_size)),
+            "th_dens_sparse": float(max(0, mu_dens - 1.0 * std_dens)),
+            "th_dens_dense": float(mu_dens + 1.0 * std_dens)
         }
         
-    # 4. 保存结果
-    # 确保输出目录存在
-    os.makedirs(os.path.dirname(OUTPUT_JSON), exist_ok=True)
-    
-    with open(OUTPUT_JSON, 'w') as f:
-        json.dump(kb_database, f, indent=4)
-        
-    print(f"✅ Knowledge Base saved to: {OUTPUT_JSON}")
-    print("   Ready for data-driven training!")
+        print("\n📊 [PromptNu Full-Dataset Statistics Report]")
+        print(f"   Nuclei Size (px): Mean={mu_size:.1f}, Std={std_size:.1f}")
+        print(f"   -> Small < {self.stats['th_size_small']:.1f} | Large > {self.stats['th_size_large']:.1f}")
+        print(f"   Nuclei Count/Img: Mean={mu_dens:.1f}, Std={std_dens:.1f}")
+        print(f"   -> Sparse < {self.stats['th_dens_sparse']:.1f} | Dense > {self.stats['th_dens_dense']:.1f}\n")
 
+    def analyze_single_image(self, mask: np.ndarray) -> Dict[str, str]:
+        if not self.stats or mask.max() == 0:
+            return {"size": "medium", "density": "moderate", "shape": "round"}
+
+        props = measure.regionprops(mask)
+        if not props:
+            return {"size": "medium", "density": "moderate", "shape": "round"}
+
+        local_mean_area = np.mean([p.area for p in props])
+        if local_mean_area < self.stats['th_size_small']: size_txt = "small"
+        elif local_mean_area > self.stats['th_size_large']: size_txt = "large, enlarged"
+        else: size_txt = "medium-sized"
+
+        count = len(props)
+        if count < self.stats['th_dens_sparse']: dens_txt = "sparsely distributed"
+        elif count > self.stats['th_dens_dense']: dens_txt = "densely packed"
+        else: dens_txt = "moderately distributed"
+
+        mean_ecc = np.mean([p.eccentricity for p in props])
+        if mean_ecc < 0.6: shape_txt = "round"
+        elif mean_ecc > 0.85: shape_txt = "elongated"
+        else: shape_txt = "oval"
+
+        return {"size": size_txt, "density": dens_txt, "shape": shape_txt}
+
+# ==============================================================================
+# 3. 知识生成器 (修正版)
+# ==============================================================================
+class KnowledgeGenerator:
+    def __init__(self, data_root, output_path):
+        self.data_root = data_root
+        self.output_path = output_path
+        self.analyzer = DatasetAnalyzer()
+        self.kb_database = {}
+
+    def _decode_mask(self, json_path):
+        try:
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            
+            h = data.get("height", 256)
+            w = data.get("width", 256)
+            mask = np.zeros((h, w), dtype=np.int32)
+            organ_type = data.get("organ_type", "Generic")
+            
+            for i, ann in enumerate(data.get("annotations", [])):
+                for poly in ann.get("segmentation", []):
+                    pts = np.array(poly).reshape(-1, 2).astype(np.int32)
+                    cv2.fillPoly(mask, [pts], i + 1)
+            
+            return mask, organ_type
+        except Exception as e:
+            # print(f"Error reading {json_path}: {e}")
+            return None, "Generic"
+
+    def run(self):
+        # 递归扫描 train 和 test
+        search_path = os.path.join(self.data_root, "**", "*.json")
+        all_files = glob.glob(search_path, recursive=True)
+        all_files = [f for f in all_files if "knowledge" not in f]
+        
+        if not all_files:
+            print(f"❌ No JSON files found in {self.data_root}")
+            return
+
+        print(f"🚀 Found {len(all_files)} samples. Starting FULL analysis...")
+
+        # === Phase 1: Global Statistics ===
+        for fpath in tqdm(all_files, desc="Stats Analysis"):
+            mask, _ = self._decode_mask(fpath)
+            if mask is not None:
+                self.analyzer.update(mask)
+        
+        self.analyzer.compute_global_stats()
+
+        # === Phase 2: Generate Prompts ===
+        for fpath in tqdm(all_files, desc="Prompt Gen"):
+            mask, organ_raw = self._decode_mask(fpath)
+            if mask is None: continue
+
+            organ_key = "Generic"
+            for known_organ in DEFAULT_ORGAN_KNOWLEDGE.keys():
+                if known_organ.lower() in organ_raw.lower():
+                    organ_key = known_organ
+                    break
+            
+            med_info = DEFAULT_ORGAN_KNOWLEDGE.get(organ_key, DEFAULT_ORGAN_KNOWLEDGE["Generic"])
+            visuals = self.analyzer.analyze_single_image(mask)
+            
+            prompt = (f"Microscopic view of {visuals['density']}, {visuals['size']} {med_info['desc']} "
+                      f"with {visuals['shape']} features, in {med_info['context']}.")
+            prompt = " ".join(prompt.split())
+            
+            # 🔥 [修正 1] 使用相对路径作为 Key
+            # 例如: "train/sa_00001.png"
+            # 这样 DataLoader 拼接 data_root + key 才能找到文件
+            rel_path = os.path.relpath(fpath, self.data_root) # e.g. train/sa_001.json
+            img_key = rel_path.replace(".json", ".png")       # e.g. train/sa_001.png
+            
+            self.kb_database[img_key] = {
+                "organ_id": organ_key,
+                "text_prompt": prompt,
+                "visual_stats": visuals,
+                "split": "train" if "train" in fpath else "test"
+            }
+
+        # 🔥 [修正 2] 写入元数据 __meta__
+        # 这对于 DataLoader 动态配置至关重要！
+        self.kb_database["__meta__"] = {
+            "stats": self.analyzer.stats
+        }
+
+        # === Save ===
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        with open(self.output_path, 'w') as f:
+            json.dump(self.kb_database, f, indent=4)
+        
+        print(f"✅ Success! Knowledge base saved to: {self.output_path}")
+
+# ==============================================================================
+# 4. 执行入口
+# ==============================================================================
 if __name__ == "__main__":
-    main()
+    # 配置你的数据集根目录 (SA-1B 格式的根目录，包含 train/ 和 test/ 文件夹)
+    ROOT_DIR = "data/PanNuke_SA1B" 
+    SAVE_PATH = os.path.join(ROOT_DIR, "medical_knowledge.json")
+    
+    generator = KnowledgeGenerator(ROOT_DIR, SAVE_PATH)
+    generator.run()
