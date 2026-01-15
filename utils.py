@@ -449,3 +449,69 @@ def point_guidance_loss(pred_heatmap, gt_nuclei):
     # 情况 B: 模型只输出 1 个通道
     else:
         return F.mse_loss(pred_prob, gt_nuclei)
+
+
+# === 物理-语义一致性 Loss ===
+def physical_semantic_consistency_loss(
+    peak_counts: torch.Tensor,
+    density_logits: torch.Tensor,
+    margin_low: float = 10.0,
+    margin_high: float = 30.0,
+    temperature: float = 1.0
+):
+    """
+    物理-语义一致性 Loss ($L_{consistency}$)
+    
+    比较热力图计数等级和分类头预测等级，使用 Margin 机制实现容差设计。
+    
+    Args:
+        peak_counts: [B] 从热力图中统计的峰值数量 $N_{pred}$
+        density_logits: [B, 3] 密度分类头的 logits（3类：低、中、高）
+        margin_low: float 低密度阈值（默认 10）
+        margin_high: float 高密度阈值（默认 30）
+        temperature: float 温度参数，用于软化预测
+    
+    Returns:
+        loss: scalar 一致性损失
+    """
+    device = peak_counts.device
+    B = peak_counts.shape[0]
+    
+    # 获取预测的密度类别（使用 softmax 获取概率分布）
+    density_probs = F.softmax(density_logits / temperature, dim=1)  # [B, 3]
+    # 0: 低密度, 1: 中密度, 2: 高密度
+    pred_class = torch.argmax(density_probs, dim=1)  # [B]
+    
+    # 定义每个类别对应的计数范围
+    # 低密度: < margin_low (10)
+    # 中密度: margin_low ~ margin_high (10-30)
+    # 高密度: > margin_high (30)
+    
+    # 使用向量化操作保持梯度流
+    # 将 peak_counts 转换为与 density_probs 兼容的形状
+    n_pred = peak_counts.unsqueeze(1)  # [B, 1]
+    
+    # 为每个类别创建掩码
+    is_low = (pred_class == 0).float().unsqueeze(1)  # [B, 1]
+    is_mid = (pred_class == 1).float().unsqueeze(1)  # [B, 1]
+    is_high = (pred_class == 2).float().unsqueeze(1)  # [B, 1]
+    
+    # 计算惩罚（向量化）
+    # 低密度类别：如果计数 >= margin_low，惩罚
+    penalty_low = torch.clamp((n_pred - margin_low) / margin_low, min=0.0) * is_low
+    loss_low = (penalty_low * density_probs[:, 0:1]).sum()
+    
+    # 中密度类别：如果计数 < margin_low 或 > margin_high，惩罚
+    penalty_mid_low = torch.clamp((margin_low - n_pred) / margin_low, min=0.0) * is_mid
+    penalty_mid_high = torch.clamp((n_pred - margin_high) / margin_high, min=0.0) * is_mid
+    loss_mid = ((penalty_mid_low + penalty_mid_high) * density_probs[:, 1:2]).sum()
+    
+    # 高密度类别：如果计数 < margin_high，惩罚
+    penalty_high = torch.clamp((margin_high - n_pred) / margin_high, min=0.0) * is_high
+    loss_high = (penalty_high * density_probs[:, 2:3]).sum()
+    
+    # 总损失
+    loss = loss_low + loss_mid + loss_high
+    
+    # 平均化
+    return loss / B if B > 0 else loss

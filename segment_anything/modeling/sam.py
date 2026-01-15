@@ -111,9 +111,66 @@ class Sam(nn.Module):
         x = F.pad(x, (0, padw, 0, padh))
         return x
 
+# === Density Adapter (适配器) ===
+class DensityAdapter(nn.Module):
+    """密度适配器：将密度特征转换为 FiLM 参数 (γ, β)"""
+    def __init__(self, feat_dim_low: int, feat_dim_high: int, ctx_dim: int):
+        """
+        Args:
+            feat_dim_low: 浅层特征维度 (in_dim // 4)
+            feat_dim_high: 深层特征维度 (in_dim // 2)
+            ctx_dim: Prompt 的维度 (CLIP ctx_dim)
+        """
+        super().__init__()
+        
+        # 浅层特征适配器（用于调制浅层 Prompt）
+        self.adapter_low = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(feat_dim_low, ctx_dim),
+            nn.ReLU(),
+            nn.Linear(ctx_dim, ctx_dim * 2)  # 输出 [γ, β]，每个维度为 ctx_dim
+        )
+        
+        # 深层特征适配器（用于调制深层 Prompt）
+        self.adapter_high = nn.Sequential(
+            nn.Linear(feat_dim_high, ctx_dim),
+            nn.ReLU(),
+            nn.Linear(ctx_dim, ctx_dim * 2)  # 输出 [γ, β]，每个维度为 ctx_dim
+        )
+        
+        # Zero-initialization: 将最后一层权重设为0
+        nn.init.zeros_(self.adapter_low[-1].weight)
+        nn.init.zeros_(self.adapter_low[-1].bias)
+        nn.init.zeros_(self.adapter_high[-1].weight)
+        nn.init.zeros_(self.adapter_high[-1].bias)
+    
+    def forward(self, feat_low: torch.Tensor, feat_high: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            feat_low: [B, feat_dim_low, H, W] 浅层特征
+            feat_high: [B, feat_dim_high] 深层特征
+        
+        Returns:
+            gamma_low: [B, ctx_dim] 浅层缩放参数
+            beta_low: [B, ctx_dim] 浅层偏置参数
+            gamma_high: [B, ctx_dim] 深层缩放参数
+            beta_high: [B, ctx_dim] 深层偏置参数
+        """
+        # 浅层适配器
+        low_params = self.adapter_low(feat_low)  # [B, ctx_dim * 2]
+        gamma_low, beta_low = torch.chunk(low_params, 2, dim=1)  # 各 [B, ctx_dim]
+        
+        # 深层适配器
+        high_params = self.adapter_high(feat_high)  # [B, ctx_dim * 2]
+        gamma_high, beta_high = torch.chunk(high_params, 2, dim=1)  # 各 [B, ctx_dim]
+        
+        return gamma_low, beta_low, gamma_high, beta_high
+
+
 # === 🔥 [模块 1] Dual-Prompt Learner (双层提示库) ===
 class DualPromptLearner(nn.Module):
-    def __init__(self, clip_model, num_organs=14, n_ctx_gen=8, n_ctx_spec=8):
+    def __init__(self, clip_model, num_organs=14, n_ctx_gen=8, n_ctx_spec=8, embed_dim=256):
         super().__init__()
         ctx_dim = clip_model.ln_final.weight.shape[0] # 512
         dtype = clip_model.dtype
@@ -137,14 +194,64 @@ class DualPromptLearner(nn.Module):
         self.n_ctx_gen = n_ctx_gen
         self.n_ctx_spec = n_ctx_spec
         self.total_ctx = n_ctx_gen + n_ctx_spec
+        self.ctx_dim = ctx_dim
+        
+        # Density Adapter
+        # 假设 embed_dim=256，则 feat_dim_low=64, feat_dim_high=128
+        feat_dim_low = embed_dim // 4
+        feat_dim_high = embed_dim // 2
+        self.density_adapter = DensityAdapter(feat_dim_low, feat_dim_high, ctx_dim)
+        print(f"✅ DensityAdapter initialized: low_dim={feat_dim_low}, high_dim={feat_dim_high}, ctx_dim={ctx_dim}")
 
-    def forward(self, organ_indices, tokenized_prompts):
+    def forward(self, organ_indices, tokenized_prompts, density_features: Optional[List[torch.Tensor]] = None):
+        """
+        Args:
+            organ_indices: [B] 器官索引
+            tokenized_prompts: [B, 77] tokenized prompts
+            density_features: Optional[List[torch.Tensor]] = [feat_low, feat_high]
+                - feat_low: [B, feat_dim_low, H, W] 浅层特征
+                - feat_high: [B, feat_dim_high] 深层特征
+        """
         batch_size = len(organ_indices)
         embedding = self.clip_token_embedding(tokenized_prompts).type(self.dtype)
         
         ctx_gen = self.ctx_general.unsqueeze(0).expand(batch_size, -1, -1)
         ctx_spec = self.ctx_specific[organ_indices]
         ctx = torch.cat([ctx_gen, ctx_spec], dim=1) # [B, total_ctx, dim]
+
+        # === FiLM 调制：使用密度特征调制 Prompt ===
+        if density_features is not None:
+            feat_low, feat_high = density_features
+            gamma_low, beta_low, gamma_high, beta_high = self.density_adapter(feat_low, feat_high)
+            
+            # 多尺度策略：
+            # - 浅层特征调制浅层 Prompt (ctx_gen 的前半部分)
+            # - 深层特征调制深层 Prompt (ctx_gen 的后半部分 + ctx_spec)
+            n_gen_low = self.n_ctx_gen // 2
+            n_gen_high = self.n_ctx_gen - n_gen_low
+            
+            # 调制浅层 Prompt (ctx_gen 的前半部分)
+            ctx_gen_low = ctx_gen[:, :n_gen_low, :]  # [B, n_gen_low, ctx_dim]
+            gamma_low_expanded = gamma_low.unsqueeze(1).expand(-1, n_gen_low, -1)  # [B, n_gen_low, ctx_dim]
+            beta_low_expanded = beta_low.unsqueeze(1).expand(-1, n_gen_low, -1)  # [B, n_gen_low, ctx_dim]
+            ctx_gen_low_modulated = (1 + gamma_low_expanded) * ctx_gen_low + beta_low_expanded
+            
+            # 调制深层 Prompt (ctx_gen 的后半部分 + ctx_spec)
+            ctx_gen_high = ctx_gen[:, n_gen_low:, :]  # [B, n_gen_high, ctx_dim]
+            ctx_spec_mod = ctx_spec  # [B, n_ctx_spec, ctx_dim]
+            
+            gamma_high_expanded_gen = gamma_high.unsqueeze(1).expand(-1, n_gen_high, -1)  # [B, n_gen_high, ctx_dim]
+            beta_high_expanded_gen = beta_high.unsqueeze(1).expand(-1, n_gen_high, -1)  # [B, n_gen_high, ctx_dim]
+            ctx_gen_high_modulated = (1 + gamma_high_expanded_gen) * ctx_gen_high + beta_high_expanded_gen
+            
+            gamma_high_expanded_spec = gamma_high.unsqueeze(1).expand(-1, self.n_ctx_spec, -1)  # [B, n_ctx_spec, ctx_dim]
+            beta_high_expanded_spec = beta_high.unsqueeze(1).expand(-1, self.n_ctx_spec, -1)  # [B, n_ctx_spec, ctx_dim]
+            ctx_spec_modulated = (1 + gamma_high_expanded_spec) * ctx_spec_mod + beta_high_expanded_spec
+            
+            # 重新组合
+            ctx_gen = torch.cat([ctx_gen_low_modulated, ctx_gen_high_modulated], dim=1)
+            ctx_spec = ctx_spec_modulated
+            ctx = torch.cat([ctx_gen, ctx_spec], dim=1)
 
         prefix = embedding[:, :1, :] 
         suffix = embedding[:, 1 : 77 - self.total_ctx, :] 
@@ -190,7 +297,8 @@ class TextSam(Sam):
             self.clip_model, 
             num_organs=num_organs, 
             n_ctx_gen=8, 
-            n_ctx_spec=8 
+            n_ctx_spec=8,
+            embed_dim=embed_dim  # 传递 embed_dim 用于初始化 DensityAdapter
         )
         for param in self.prompt_learner.parameters():
             param.requires_grad = True 
@@ -241,20 +349,7 @@ class TextSam(Sam):
 
         organ_indices = torch.tensor(organ_indices).to(device)
 
-        # === Step 3: Dual-Prompt Learner (Implicit Context) ===
-        # Positive
-        pos_tokens = clip.tokenize(base_texts, truncate=True).to(device)
-        pos_feats = self.prompt_learner(organ_indices, pos_tokens) # [B, 512]
-        
-        # Negative (Background)
-        neg_tokens = clip.tokenize(["Background"] * len(base_texts), truncate=True).to(device)
-        neg_feats = self.prompt_learner(organ_indices, neg_tokens) # [B, 512]
-
-        pos_feats = pos_feats / pos_feats.norm(dim=-1, keepdim=True)
-        neg_feats = neg_feats / neg_feats.norm(dim=-1, keepdim=True)
-        text_features = torch.stack([pos_feats, neg_feats], dim=1).float() # [B, 2, 512]
-
-        # === Step 4: PNuRL (Explicit Attribute Injection) ===
+        # === Step 3: PNuRL (先获取密度特征) ===
         if next(self.pnurl.parameters()).device != device:
             self.pnurl = self.pnurl.to(device)
         
@@ -273,15 +368,28 @@ class TextSam(Sam):
             attribute_labels = [attr_labels_batch[:, i] for i in range(5)]
         else:
             attribute_labels = None
-            
-        # PNuRL Forward
-        refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits = self.pnurl(
+        
+        # PNuRL Forward - 获取密度特征
+        refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits, density_features = self.pnurl(
             image_features=image_embeddings,
             attribute_labels=attribute_labels,
             attribute_prompts=attribute_texts,
             return_loss=True
         )
         
+        # === Step 4: Dual-Prompt Learner (Implicit Context with Density Modulation) ===
+        # Positive
+        pos_tokens = clip.tokenize(base_texts, truncate=True).to(device)
+        pos_feats = self.prompt_learner(organ_indices, pos_tokens, density_features=density_features) # [B, 512]
+        
+        # Negative (Background)
+        neg_tokens = clip.tokenize(["Background"] * len(base_texts), truncate=True).to(device)
+        neg_feats = self.prompt_learner(organ_indices, neg_tokens, density_features=density_features) # [B, 512]
+
+        pos_feats = pos_feats / pos_feats.norm(dim=-1, keepdim=True)
+        neg_feats = neg_feats / neg_feats.norm(dim=-1, keepdim=True)
+        text_features = torch.stack([pos_feats, neg_feats], dim=1).float() # [B, 2, 512]
+
         # === Step 5: Auto-Prompt Generation (SAC - Adaptive) ===
         heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
         
@@ -365,7 +473,7 @@ class TextSam(Sam):
                 "iou_predictions": merged_iou,
                 "low_res_logits": merged_logits,
                 "heatmap_logits": heatmap_logits[i].unsqueeze(0),
-                "attr_logits": None, 
+                "attr_logits": attr_logits,  # 传递属性 logits（包含 density）
                 "pnurl_loss": pnurl_loss
             })
             

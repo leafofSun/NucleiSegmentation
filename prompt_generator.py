@@ -40,6 +40,34 @@ class TextGuidedPointGenerator(nn.Module):
         return heatmap_logits
 
     @torch.no_grad()
+    def count_peaks_from_heatmap(self, heatmap_logits, threshold=0.3):
+        """
+        从预测的热力图中统计峰值数量 $N_{pred}$
+        
+        Args:
+            heatmap_logits: [B, C, H, W] 热力图 logits（未过 sigmoid）
+            threshold: float 峰值检测阈值
+        
+        Returns:
+            peak_counts: [B] 每个样本的峰值数量
+        """
+        B, C, H, W = heatmap_logits.shape
+        scores = torch.sigmoid(heatmap_logits)  # [B, C, H, W]
+        
+        # 使用局部最大值检测峰值
+        local_max = F.max_pool2d(scores, kernel_size=5, stride=1, padding=2)
+        is_local_max = (scores == local_max) & (scores > threshold)
+        
+        # 统计每个样本的峰值数量（只统计前景类别，即 C=0）
+        peak_counts = []
+        for b in range(B):
+            fg_map = is_local_max[b, 0]  # 前景热力图
+            count = fg_map.sum().item()
+            peak_counts.append(count)
+        
+        return torch.tensor(peak_counts, device=heatmap_logits.device, dtype=torch.float32)
+
+    @torch.no_grad()
     def generate_adaptive_prompts(self, heatmap_logits, threshold=0.3, k_neighbors=3, dense_dist_thresh=15.0, max_points=None):
         """
         🔥 [核心修正] 全局邻域构建 + 随机采样训练 (Global Neighborhood + Random Sampling)

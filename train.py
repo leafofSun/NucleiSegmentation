@@ -26,7 +26,7 @@ from segment_anything.modeling.sam import TextSam
 from DataLoader import TrainingDataset, stack_dict_batched
 
 # 🔥 核心工具导入
-from utils import FocalDiceloss_IoULoss, point_guidance_loss, get_logger
+from utils import FocalDiceloss_IoULoss, point_guidance_loss, get_logger, physical_semantic_consistency_loss
 
 # 🔥 高性能指标导入
 from metrics import SegMetrics
@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default="mp_sam", help="Experiment name")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument('--device', type=str, default='cuda', help="Device to use (cuda/cpu)")
+    parser.add_argument("--accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
     
     # --- 数据路径 ---
     parser.add_argument("--data_path", type=str, default="data/MoNuSeg_SA1B", help="Root directory of dataset")
@@ -61,9 +62,9 @@ def parse_args():
     parser.add_argument("--encoder_adapter", action='store_true', default=True, help="Use Adapters in Image Encoder")
 
     # --- 训练超参 ---
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Base learning rate")
     parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate for scheduler")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--use_amp", action='store_true', default=True, help="Use Automatic Mixed Precision")
@@ -72,6 +73,8 @@ def parse_args():
     parser.add_argument("--mask_weight", type=float, default=2.0, help="Weight for Segmentation Loss")
     parser.add_argument("--heatmap_weight", type=float, default=1.0, help="Weight for Auto-Prompt Heatmap Loss")
     parser.add_argument("--attr_weight", type=float, default=0.1, help="Weight for Attribute Classification Loss")
+    parser.add_argument("--consistency_weight", type=float, default=0.5, help="Weight for Physical-Semantic Consistency Loss")
+    parser.add_argument("--consistency_warmup_epochs", type=int, default=20, help="Warm-up epochs before applying consistency loss")
 
     # --- 验证指标 ---
     parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'], 
@@ -103,7 +106,6 @@ def to_device(batch_input, device):
     return device_input
 
 def resize_pos_embed(state_dict, model_state_dict):
-    """调整 SAM 位置编码尺寸 (以防 checkpoint 尺寸不匹配)"""
     new_state_dict = {}
     for k, v in state_dict.items():
         if k in model_state_dict:
@@ -122,8 +124,8 @@ def resize_pos_embed(state_dict, model_state_dict):
             new_state_dict[k] = v
     return new_state_dict
 
-# 🔥 滑动窗口推理
-def sliding_window_inference(model, image, patch_size=256, target_size=1024, stride=256, device='cuda'):
+# 滑动窗口推理
+def sliding_window_inference(model, image, organ_id, patch_size=256, target_size=1024, stride=256, device='cuda'):
     C, H, W = image.shape
     
     full_prob_map = torch.zeros((H, W), device=device)
@@ -155,7 +157,7 @@ def sliding_window_inference(model, image, patch_size=256, target_size=1024, str
                 'image': patch_1024.squeeze(0), 
                 'original_size': (target_size, target_size),
                 'text_prompt': "Cell nuclei",
-                'organ_id': 9, # Generic
+                'organ_id': organ_id, # 使用传入的真实 organ_id
                 'attribute_text': "Cell nuclei" 
             }]
             
@@ -181,7 +183,7 @@ def sliding_window_inference(model, image, patch_size=256, target_size=1024, str
     return full_prob_map
 
 # ==================================================================================================
-# 3. 训练逻辑 (Train Loop)
+# 3. 训练逻辑
 # ==================================================================================================
 def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler):
     model.train()
@@ -192,13 +194,13 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
     heatmap_losses = []
     attr_losses = []
     
-    for batch, batched_input in enumerate(pbar):
+    optimizer.zero_grad() # 初始化
+    
+    for batch_idx, batched_input in enumerate(pbar):
         batched_input = to_device(batched_input, args.device)
         images = batched_input['image']
         labels = batched_input['label']
         
-        optimizer.zero_grad()
-
         # === 构建 MP-SAM 数据流 ===
         model_input = []
         organ_ids = batched_input.get('organ_id', None)
@@ -207,10 +209,16 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         attr_labels = batched_input.get('attr_labels', None)
 
         for i in range(len(images)):
+            # 兼容处理 organ_id (如果是 Tensor 则转 int)
+            curr_id = 9
+            if organ_ids is not None:
+                val = organ_ids[i]
+                curr_id = val.item() if isinstance(val, torch.Tensor) else val
+
             model_input.append({
                 'image': images[i],
                 'original_size': (args.image_size, args.image_size),
-                'organ_id': organ_ids[i] if organ_ids is not None else 9,
+                'organ_id': curr_id,
                 'attribute_text': attr_texts[i],
                 'text_prompt': base_texts[i],
                 'attr_labels': attr_labels[i] if attr_labels is not None else None
@@ -224,6 +232,11 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             loss_m_accum = 0
             loss_h_accum = 0
             loss_attr_accum = 0
+            loss_consistency_accum = 0
+            
+            # 收集所有样本的峰值计数和密度 logits（用于批量计算一致性 loss）
+            peak_counts_list = []
+            density_logits_list = []
             
             for i, out in enumerate(outputs):
                 # A. Mask Loss
@@ -241,7 +254,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 loss_m, _ = criterion(pred_mask.unsqueeze(0).unsqueeze(0), gt_mask.unsqueeze(0).unsqueeze(0), pred_iou.unsqueeze(0))
                 
                 # B. Heatmap Loss
-                pred_heatmap = out['heatmap_logits']
+                pred_heatmap = out['heatmap_logits']  # [1, C, H, W]
                 with torch.no_grad():
                     target_mask = labels[i].float().unsqueeze(0)
                     gt_nuclei = F.interpolate(target_mask, size=pred_heatmap.shape[-2:], mode='nearest').squeeze(0)
@@ -256,7 +269,23 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 elif loss_attr.dim() > 0:
                     loss_attr = loss_attr.mean()
                 
-                # D. Sum
+                # D. 收集一致性 Loss 所需的数据
+                # 从热力图中统计峰值数量
+                with torch.no_grad():
+                    peak_count = model.prompt_generator.count_peaks_from_heatmap(pred_heatmap, threshold=0.3)  # [1]
+                    peak_counts_list.append(peak_count)
+                
+                # 从属性 logits 中提取密度 logits
+                attr_logits = out.get('attr_logits', None)
+                if attr_logits is not None and 'density' in attr_logits:
+                    density_logits = attr_logits['density']  # [1, 3]
+                    density_logits_list.append(density_logits)
+                else:
+                    # 如果没有，创建一个零 logits（不会产生梯度）
+                    density_logits = torch.zeros((1, 3), device=loss_m.device, requires_grad=False)
+                    density_logits_list.append(density_logits)
+                
+                # E. Sum (暂时不包含一致性 loss，稍后批量计算)
                 loss_i = args.mask_weight * loss_m + args.heatmap_weight * loss_h + args.attr_weight * loss_attr
                 
                 loss_batch += loss_i
@@ -264,29 +293,66 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 loss_h_accum += loss_h.item()
                 loss_attr_accum += loss_attr.item()
             
+            # F. 计算一致性 Loss (批量计算，仅在 warm-up 后)
+            loss_consistency = torch.tensor(0.0, device=loss_m.device, requires_grad=True)
+            loss_consistency_accum = 0.0
+            if epoch >= args.consistency_warmup_epochs and len(peak_counts_list) > 0:
+                # 合并所有样本
+                peak_counts_batch = torch.cat(peak_counts_list, dim=0)  # [B]
+                density_logits_batch = torch.cat(density_logits_list, dim=0)  # [B, 3]
+                
+                # 计算一致性 loss
+                loss_consistency = physical_semantic_consistency_loss(
+                    peak_counts=peak_counts_batch,
+                    density_logits=density_logits_batch,
+                    margin_low=10.0,
+                    margin_high=30.0,
+                    temperature=1.0
+                )
+                
+                # 添加到总 loss
+                loss_batch += args.consistency_weight * loss_consistency * len(images)
+                loss_consistency_accum = loss_consistency.item()
+            
             final_loss = loss_batch / len(images)
+            
+            # Loss 归一化 (梯度累积)
+            final_loss = final_loss / args.accumulation_steps
 
         # === Backward ===
         if scaler:
             scaler.scale(final_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
         else:
             final_loss.backward()
-            optimizer.step()
+            
+        # Step (每 accumulation_steps 次更新一次)
+        if (batch_idx + 1) % args.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+            if scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
 
-        losses.append(final_loss.item())
+        # 记录
+        current_loss_val = final_loss.item() * args.accumulation_steps
+        losses.append(current_loss_val)
         mask_losses.append(loss_m_accum / len(images))
         heatmap_losses.append(loss_h_accum / len(images))
         attr_losses.append(loss_attr_accum / len(images))
         
+        # 显示一致性 loss（仅在 warm-up 后）
+        consistency_info = ""
+        if epoch >= args.consistency_warmup_epochs:
+            consistency_info = f" | Consist: {loss_consistency_accum:.3f}"
+        
         prompt_preview = attr_texts[0][:15] + ".." if len(attr_texts[0]) > 15 else attr_texts[0]
-        pbar.set_postfix(Loss=f"{final_loss.item():.3f}", Prompt=prompt_preview)
+        pbar.set_postfix(Loss=f"{current_loss_val:.3f}", Prompt=prompt_preview, Consist=consistency_info)
 
     return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses), np.mean(attr_losses)
 
 # ==================================================================================================
-# 4. 验证逻辑 (Val Loop - 修复版)
+# 4. 验证逻辑
 # ==================================================================================================
 @torch.no_grad()
 def validate_one_epoch(args, model, val_loader, epoch):
@@ -299,18 +365,26 @@ def validate_one_epoch(args, model, val_loader, epoch):
         batched_input = to_device(batched_input, args.device)
         images = batched_input['image'] 
         labels = batched_input['label'].cpu().numpy()
+        organ_ids = batched_input.get('organ_id', None)
         
         for i in range(len(images)):
-            # 滑动窗口推理
+            # 🔥 [修复点] 安全获取 organ_id
+            curr_organ_id = 9
+            if organ_ids is not None:
+                val = organ_ids[i]
+                # 如果是 tensor, 取 .item(), 如果是 int, 直接用
+                curr_organ_id = val.item() if isinstance(val, torch.Tensor) else val
+            
+            # 传入 organ_id
             prob_map = sliding_window_inference(
                 model, images[i], 
+                organ_id=curr_organ_id, 
                 patch_size=args.crop_size, 
                 target_size=args.image_size, 
                 stride=args.crop_size, 
                 device=args.device
             )
             
-            # 转为二值 Mask
             pred_mask = (prob_map.cpu().numpy() > 0.5).astype(np.uint8)
             
             gt = labels[i]
@@ -318,7 +392,6 @@ def validate_one_epoch(args, model, val_loader, epoch):
             gt_valid = gt.copy()
             gt_valid[gt == 255] = 0
             
-            # 计算指标
             res = SegMetrics(pred_mask, gt_valid, args.metrics)
             
             for k in args.metrics:
@@ -336,7 +409,6 @@ def validate_one_epoch(args, model, val_loader, epoch):
 def main(args):
     setup_seed(args.seed)
     
-    # --- 日志 ---
     os.makedirs(os.path.join(args.work_dir, "models", args.run_name), exist_ok=True)
     os.makedirs(os.path.join(args.work_dir, "logs"), exist_ok=True)
     timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M')
@@ -344,7 +416,7 @@ def main(args):
     
     logger.info(f"🚀 [Start] MP-SAM (Scale: {args.crop_size}->{args.image_size})")
 
-    # --- 数据加载 ---
+    # 数据加载
     train_dataset = TrainingDataset(
         os.path.join(args.data_path, "train"),
         knowledge_path=args.knowledge_path,
@@ -369,7 +441,7 @@ def main(args):
     
     logger.info(f"📊 Train Size: {len(train_dataset)} | Val Size: {len(val_dataset)}")
 
-    # --- 模型构建 ---
+    # 模型构建
     args.checkpoint = args.sam_checkpoint
     vanilla_sam = sam_model_registry[args.model_type](args)
     if os.path.exists(args.sam_checkpoint):
@@ -392,13 +464,11 @@ def main(args):
     
     del vanilla_sam
 
-    # --- Adapter Reset ---
     if args.encoder_adapter:
         for n, p in model.image_encoder.named_parameters():
             if "Adapter" in n and "weight" in n:
                 torch.nn.init.zeros_(p)
 
-    # --- 优化器 ---
     params = [
         {'params': model.mask_decoder.parameters(), 'lr': args.lr},
         {'params': model.prompt_generator.parameters(), 'lr': args.lr * 5}
@@ -419,7 +489,6 @@ def main(args):
     scaler = GradScaler() if args.use_amp else None
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
 
-    # --- Loop ---
     best_aji = 0.0
     best_dice = 0.0
     
@@ -427,7 +496,7 @@ def main(args):
         # 1. Train
         loss, m_loss, h_loss, a_loss = train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler)
         
-        # 🔥 2. Val (Frequency Control: 每10轮或最后一轮)
+        # 2. Val (每10轮或最后)
         if (epoch + 1) % 10 == 0 or (epoch + 1) == args.epochs:
             val_res = validate_one_epoch(args, model, val_loader, epoch)
             
@@ -441,31 +510,25 @@ def main(args):
                 f"Dice: {dice:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}"
             )
             
-            # 🔥 3. Smart Save Strategy (AJI 优先，Dice 辅助)
+            # 3. Smart Save
             saved = False
             
-            # 策略 A: AJI 创新高 (绝对优先)
             if aji > best_aji:
                 best_aji = aji
-                best_dice = max(best_dice, dice) # 同步更新
+                best_dice = max(best_dice, dice)
                 torch.save(model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, "best_model.pth"))
                 logger.info(f"⭐ New Best AJI! ({best_aji:.4f}) -> Model Saved")
                 saved = True
             
-            # 策略 B: AJI 差不多 (差距 < 0.002)，但 Dice 显著更高 (高出 0.005)
-            # 这能防止我们错过那些切分略差一点点，但整体覆盖率好得多的模型
             elif (best_aji - aji) < 0.002 and dice > (best_dice + 0.005):
                 best_dice = dice
-                # 这种情况下，我们也更新 best_model，或者你可以另存为 best_dice_model.pth
                 torch.save(model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, "best_dice_model.pth"))
                 logger.info(f"✨ High Dice Model Found! (Dice: {dice:.4f}, AJI: {aji:.4f}) -> Saved as best_dice_model.pth")
                 saved = True
             
-            # 定期保存 Checkpoint
             torch.save(model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, f"epoch_{epoch+1}.pth"))
             
         else:
-            # Skip Val Log
             logger.info(
                 f"Ep {epoch+1}/{args.epochs} | "
                 f"Loss: {loss:.4f} (M:{m_loss:.3f}, H:{h_loss:.3f}, A:{a_loss:.3f}) | "
