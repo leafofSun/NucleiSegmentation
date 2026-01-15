@@ -111,17 +111,21 @@ class Sam(nn.Module):
         x = F.pad(x, (0, padw, 0, padh))
         return x
 
-# === Density Adapter (适配器) ===
-class DensityAdapter(nn.Module):
-    """密度适配器：将密度特征转换为 FiLM 参数 (γ, β)"""
+# === Physical Adapter (适配器) ===
+class PhysicalAdapter(nn.Module):
+    """
+    物理特征适配器：将融合后的 Shape+Size+Density 特征转换为 FiLM 参数
+    """
     def __init__(self, feat_dim_low: int, feat_dim_high: int, ctx_dim: int):
         """
         Args:
-            feat_dim_low: 浅层特征维度 (in_dim // 4)
-            feat_dim_high: 深层特征维度 (in_dim // 2)
+            feat_dim_low: 浅层特征维度 (3 * in_dim // 4) - 拼接后的维度
+            feat_dim_high: 深层特征维度 (3 * in_dim // 2) - 拼接后的维度
             ctx_dim: Prompt 的维度 (CLIP ctx_dim)
         """
         super().__init__()
+        
+        # 注意：这里的 feat_dim_low 和 high 已经是拼接后的维度 (x3)
         
         # 浅层特征适配器（用于调制浅层 Prompt）
         self.adapter_low = nn.Sequential(
@@ -148,8 +152,8 @@ class DensityAdapter(nn.Module):
     def forward(self, feat_low: torch.Tensor, feat_high: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            feat_low: [B, feat_dim_low, H, W] 浅层特征
-            feat_high: [B, feat_dim_high] 深层特征
+            feat_low: [B, feat_dim_low, H, W] 浅层特征（拼接后的）
+            feat_high: [B, feat_dim_high] 深层特征（拼接后的）
         
         Returns:
             gamma_low: [B, ctx_dim] 浅层缩放参数
@@ -170,7 +174,7 @@ class DensityAdapter(nn.Module):
 
 # === 🔥 [模块 1] Dual-Prompt Learner (双层提示库) ===
 class DualPromptLearner(nn.Module):
-    def __init__(self, clip_model, num_organs=14, n_ctx_gen=8, n_ctx_spec=8, embed_dim=256):
+    def __init__(self, clip_model, num_organs=21, n_ctx_gen=8, n_ctx_spec=8, embed_dim=256):
         super().__init__()
         ctx_dim = clip_model.ln_final.weight.shape[0] # 512
         dtype = clip_model.dtype
@@ -196,21 +200,26 @@ class DualPromptLearner(nn.Module):
         self.total_ctx = n_ctx_gen + n_ctx_spec
         self.ctx_dim = ctx_dim
         
-        # Density Adapter
-        # 假设 embed_dim=256，则 feat_dim_low=64, feat_dim_high=128
-        feat_dim_low = embed_dim // 4
-        feat_dim_high = embed_dim // 2
-        self.density_adapter = DensityAdapter(feat_dim_low, feat_dim_high, ctx_dim)
-        print(f"✅ DensityAdapter initialized: low_dim={feat_dim_low}, high_dim={feat_dim_high}, ctx_dim={ctx_dim}")
+        # 🔥 [关键修改] 计算输入维度
+        # PNuRL 拼接了 3 个头 (Shape, Size, Density)
+        # 每个头的 shallow_branch 输出 C/4 -> 拼接后 3 * C/4
+        # 每个头的 deep_branch 输出 C/2    -> 拼接后 3 * C/2
+        num_fused_heads = 3 
+        
+        feat_dim_low = (embed_dim // 4) * num_fused_heads
+        feat_dim_high = (embed_dim // 2) * num_fused_heads
+        
+        self.physical_adapter = PhysicalAdapter(feat_dim_low, feat_dim_high, ctx_dim)
+        print(f"✅ PhysicalAdapter initialized: in_low={feat_dim_low}, in_high={feat_dim_high} (Fused {num_fused_heads} heads)")
 
     def forward(self, organ_indices, tokenized_prompts, density_features: Optional[List[torch.Tensor]] = None):
         """
         Args:
             organ_indices: [B] 器官索引
             tokenized_prompts: [B, 77] tokenized prompts
-            density_features: Optional[List[torch.Tensor]] = [feat_low, feat_high]
-                - feat_low: [B, feat_dim_low, H, W] 浅层特征
-                - feat_high: [B, feat_dim_high] 深层特征
+            density_features: Optional[List[torch.Tensor]] = [fused_low, fused_high]
+                - fused_low: [B, 3*C/4, H, W] 拼接后的浅层特征 (Shape+Size+Density)
+                - fused_high: [B, 3*C/2] 拼接后的深层特征 (Shape+Size+Density)
         """
         batch_size = len(organ_indices)
         embedding = self.clip_token_embedding(tokenized_prompts).type(self.dtype)
@@ -219,10 +228,11 @@ class DualPromptLearner(nn.Module):
         ctx_spec = self.ctx_specific[organ_indices]
         ctx = torch.cat([ctx_gen, ctx_spec], dim=1) # [B, total_ctx, dim]
 
-        # === FiLM 调制：使用密度特征调制 Prompt ===
+        # === FiLM 调制：使用物理特征调制 Prompt ===
         if density_features is not None:
+            # 这里 density_features 实际上是 [fused_low, fused_high]
             feat_low, feat_high = density_features
-            gamma_low, beta_low, gamma_high, beta_high = self.density_adapter(feat_low, feat_high)
+            gamma_low, beta_low, gamma_high, beta_high = self.physical_adapter(feat_low, feat_high)
             
             # 多尺度策略：
             # - 浅层特征调制浅层 Prompt (ctx_gen 的前半部分)
@@ -281,7 +291,7 @@ class TextSam(Sam):
         clip_model_name="ViT-B/16",
         text_dim=512,
         embed_dim=256,
-        num_organs=14 
+        num_organs=21 
     ):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
         

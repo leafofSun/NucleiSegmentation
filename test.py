@@ -269,7 +269,7 @@ def main(args):
         clip_model_name="ViT-B/16",
         text_dim=512,
         embed_dim=256,
-        num_organs=10 # 确保和你训练时一致
+        num_organs=21 # 确保和你训练时一致
     ).to(args.device)
     
     if os.path.exists(args.checkpoint):

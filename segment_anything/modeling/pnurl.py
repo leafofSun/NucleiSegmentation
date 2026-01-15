@@ -37,25 +37,25 @@ class AttributeClassifier(nn.Module):
         return self.classifier(x)
 
 
-class DensityClassifier(nn.Module):
+class MultiScaleAttributeHead(nn.Module):
     """
-    密度分类器 (用于 Density)
-    特殊设计：返回 logits 的同时，保留多尺度特征供后续模块(如 Point Generator)使用
+    多尺度属性分类头
+    适用于需要同时关注局部纹理 (Texture) 和全局语义 (Semantics) 的属性
+    例如: Shape (局部边缘), Size (全局面积), Density (局部密集度)
     """
     def __init__(self, in_dim: int, num_classes: int):
         super().__init__()
-        # 浅层分支：提取纹理特征 (Texture)
-        # in_dim -> in_dim/2 -> in_dim/4
+        # 浅层分支：提取纹理/边缘特征 -> [B, C/4, H, W]
         self.shallow_branch = nn.Sequential(
             nn.Conv2d(in_dim, in_dim // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(in_dim // 2), # 加个 BN 更稳
+            nn.BatchNorm2d(in_dim // 2),
             nn.ReLU(),
             nn.Conv2d(in_dim // 2, in_dim // 4, kernel_size=3, padding=1),
             nn.BatchNorm2d(in_dim // 4),
             nn.ReLU()
         )
         
-        # 深层分支：提取语义特征 (Semantics)
+        # 深层分支：提取全局语义 -> [B, C/2]
         self.deep_branch = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -75,20 +75,18 @@ class DensityClassifier(nn.Module):
                 - feat_low: [B, C//4, H, W] (保留空间信息)
                 - feat_high: [B, C//2] (全局向量)
         """
-        # 浅层特征（保持空间维度）
         feat_low = self.shallow_branch(x) 
-        
-        # 深层特征（全局池化）
         feat_high = self.deep_branch(x)
-        
-        # 分类 logits
         logits = self.classifier(feat_high)
-        
         return logits, [feat_low, feat_high]
 
 
 class AttributeClassifiers(nn.Module):
-    """组合分类器管理器"""
+    """
+    组合分类器管理器 (升级版)
+    属性顺序: 0:Color, 1:Shape, 2:Arrange, 3:Size, 4:Density
+    策略: 对 Shape(1), Size(3), Density(4) 使用多尺度头
+    """
     def __init__(
         self,
         in_dim: int,
@@ -97,27 +95,48 @@ class AttributeClassifiers(nn.Module):
         super().__init__()
         # 确保属性数量正确 (默认为5个)
         assert len(num_classes_per_attr) == 5, "Must provide class counts for 5 attributes"
-
-        # 前4个使用普通分类器
-        self.classifiers = nn.ModuleList([
-            AttributeClassifier(in_dim, num_classes) 
-            for num_classes in num_classes_per_attr[:-1]
-        ])
         
-        # 最后一个（Density）使用特殊的多尺度分类器
-        self.density_classifier = DensityClassifier(
-            in_dim, 
-            num_classes_per_attr[-1]
-        )
+        self.heads = nn.ModuleList()
+        # 定义哪些属性需要多尺度特征 (Indices)
+        self.multiscale_indices = {1, 3, 4}  # Shape, Size, Density
+        
+        for i, num_classes in enumerate(num_classes_per_attr):
+            if i in self.multiscale_indices:
+                self.heads.append(MultiScaleAttributeHead(in_dim, num_classes))
+            else:
+                self.heads.append(AttributeClassifier(in_dim, num_classes))
     
-    def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        # 前4个属性
-        logits_list = [classifier(x) for classifier in self.classifiers]
+    def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Returns:
+            logits_list: List of 5 logits tensors
+            fused_features: [fused_low, fused_high] - 拼接后的多尺度特征
+        """
+        logits_list = []
+        visual_feats_low = []
+        visual_feats_high = []
         
-        # Density 属性
-        density_out = self.density_classifier(x)
+        for i, head in enumerate(self.heads):
+            if i in self.multiscale_indices:
+                # 多尺度头返回: logits, [low, high]
+                logits, feats = head(x)
+                logits_list.append(logits)
+                visual_feats_low.append(feats[0])
+                visual_feats_high.append(feats[1])
+            else:
+                # 普通头返回: logits
+                logits = head(x)
+                logits_list.append(logits)
         
-        return logits_list, density_out
+        # 🔥 [核心融合] 将 Shape, Size, Density 的特征拼接
+        # low: 3 * [B, C/4, H, W] -> [B, 3*C/4, H, W]
+        # high: 3 * [B, C/2]      -> [B, 3*C/2]
+        if len(visual_feats_low) != 3 or len(visual_feats_high) != 3:
+            raise ValueError(f"Expected 3 multiscale features, got {len(visual_feats_low)} low and {len(visual_feats_high)} high")
+        fused_low = torch.cat(visual_feats_low, dim=1)
+        fused_high = torch.cat(visual_feats_high, dim=1)
+        
+        return logits_list, [fused_low, fused_high]
 
 
 class AttributeAttention(nn.Module):
@@ -228,12 +247,10 @@ class PNuRL(nn.Module):
         B, C, H, W = image_features.shape
         device = image_features.device
         
-        # === 1. 属性分类 ===
-        attribute_logits_list, density_output = self.attribute_classifiers(image_features)
-        density_logits, density_features = density_output
-        
-        # 组合所有 logits
-        attribute_logits = attribute_logits_list + [density_logits]
+        # === 1. 属性分类 & 特征提取 ===
+        # logits_list 包含 5 个属性的 logit
+        # fused_features 包含 [Concat_Low, Concat_High]
+        attribute_logits, fused_features = self.attribute_classifiers(image_features)
         
         # Soft Attribute Representation
         probs_list = [F.softmax(l, dim=1) for l in attribute_logits]
@@ -271,8 +288,8 @@ class PNuRL(nn.Module):
             'density': attribute_logits[4],
         }
         
-        # 返回 5 个值
-        return refined_features, learnable_context, loss, logits_dict, density_features
+        # 返回 fused_features (包含 Shape+Size+Density 的物理信息)
+        return refined_features, learnable_context, loss, logits_dict, fused_features
 
     def compute_attribute_loss(self, logits_list, labels_list):
         total_loss = 0.0

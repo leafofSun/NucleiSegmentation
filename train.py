@@ -58,7 +58,7 @@ def parse_args():
     parser.add_argument("--model_type", type=str, default="vit_b", choices=["vit_b", "vit_l", "vit_h"], help="SAM backbone type")
     parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d_b.pth", help="Path to original/medsam checkpoint")
     parser.add_argument("--clip_model", type=str, default="ViT-B/16", help="CLIP model version for Text Encoder")
-    parser.add_argument("--num_organs", type=int, default=10, help="Number of organ categories for DualPromptLearner")
+    parser.add_argument("--num_organs", type=int, default=21, help="Number of organ categories for DualPromptLearner (including Generic)")
     parser.add_argument("--encoder_adapter", action='store_true', default=True, help="Use Adapters in Image Encoder")
 
     # --- 训练超参 ---
