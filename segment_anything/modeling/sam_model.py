@@ -127,8 +127,8 @@ class Sam(nn.Module):
             attribute_labels = batched_input.get("attribute_labels", None)
             return_loss = self.training and attribute_labels is not None
             
-            # PNuRL返回：加权后的ViT特征、可学习上下文、损失、logits、密度特征
-            weighted_image_embeddings, pnurl_context, pnurl_loss, _, _ = self.pnurl(
+            # PNuRL返回：加权后的ViT特征、可学习上下文、损失、logits、密度特征、密度图
+            weighted_image_embeddings, pnurl_context, pnurl_loss, _, _, _ = self.pnurl(
                 image_features=image_embeddings,
                 attribute_prompts=attribute_prompts,
                 attribute_labels=attribute_labels,

@@ -379,13 +379,14 @@ class TextSam(Sam):
         else:
             attribute_labels = None
         
-        # PNuRL Forward - 获取密度特征
-        refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits, density_features = self.pnurl(
+        # PNuRL Forward - 获取密度特征（多任务：分类 + 回归）
+        refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits, density_features, density_map = self.pnurl(
             image_features=image_embeddings,
             attribute_labels=attribute_labels,
             attribute_prompts=attribute_texts,
             return_loss=True
         )
+        # density_map: [B, 1, H', W'] - 像素级密度图（用于 DeNSe 式强对齐）
         
         # === Step 4: Dual-Prompt Learner (Implicit Context with Density Modulation) ===
         # Positive
@@ -478,12 +479,25 @@ class TextSam(Sam):
                 original_size=batched_input[i]["original_size"],
             )
             
+            # 🔥 [新增] 将 density_map 调整到与 mask 相同的大小
+            # mask_post 的大小是 original_size，density_map 需要匹配
+            target_h, target_w = mask_post.shape[-2:]
+            density_map_i = density_map[i]  # [1, H', W']
+            if density_map_i.shape[-2:] != (target_h, target_w):
+                density_map_i = F.interpolate(
+                    density_map_i.unsqueeze(0), 
+                    size=(target_h, target_w), 
+                    mode='bilinear', 
+                    align_corners=False
+                ).squeeze(0)  # [1, target_h, target_w]
+            
             outputs.append({
                 "masks": mask_post, # ✅ 确认：返回 Float Logits
                 "iou_predictions": merged_iou,
                 "low_res_logits": merged_logits,
                 "heatmap_logits": heatmap_logits[i].unsqueeze(0),
-                "attr_logits": attr_logits,  # 传递属性 logits（包含 density）
+                "attr_logits": attr_logits,  # 传递属性 logits（包含 density 分类）
+                "density_map": density_map_i,  # 🔥 [新增] 像素级密度图（用于 DeNSe 式强对齐）
                 "pnurl_loss": pnurl_loss
             })
             

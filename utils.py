@@ -515,3 +515,137 @@ def physical_semantic_consistency_loss(
     
     # 平均化
     return loss / B if B > 0 else loss
+
+
+def generate_density_map_from_mask(gt_mask: torch.Tensor, sigma: float = 2.0) -> torch.Tensor:
+    """
+    从 GT mask 生成密度图（基于点的高斯热力图）
+    参考 DeNSe 论文：将每个细胞核中心点转换为高斯分布
+    使用纯 PyTorch 实现，避免外部依赖
+    
+    Args:
+        gt_mask: [H, W] 或 [1, H, W] 的 GT mask（值为 0 和 1，或 0 和 255）
+        sigma: float 高斯核的标准差（控制密度扩散范围）
+    
+    Returns:
+        density_map: [1, H, W] 的密度图（值域 [0, 1]）
+    """
+    if gt_mask.dim() == 3:
+        gt_mask = gt_mask.squeeze(0)
+    H, W = gt_mask.shape
+    device = gt_mask.device
+    dtype = gt_mask.dtype
+    
+    # 将 mask 归一化到 [0, 1]
+    if gt_mask.max() > 1:
+        gt_mask = (gt_mask > 127).float()
+    else:
+        gt_mask = gt_mask.float()
+    
+    # 简化版本：使用最大池化找到局部最大值作为细胞核中心
+    # 这比连通域分析更快，且是纯 PyTorch 实现
+    kernel_size = 5
+    padding = kernel_size // 2
+    
+    # 使用最大池化找到局部最大值
+    gt_mask_padded = F.pad(gt_mask.unsqueeze(0).unsqueeze(0), (padding, padding, padding, padding), mode='constant', value=0)
+    local_max = F.max_pool2d(gt_mask_padded, kernel_size=kernel_size, stride=1)
+    local_max = local_max.squeeze(0).squeeze(0)[padding:H+padding, padding:W+padding]
+    
+    # 找到局部最大值的位置（作为细胞核中心）
+    is_center = (gt_mask > 0.5) & (gt_mask == local_max)
+    center_points = torch.nonzero(is_center, as_tuple=False)  # [N, 2] (y, x)
+    
+    # 生成高斯热力图
+    y_coords = torch.arange(H, device=device, dtype=dtype).float().view(-1, 1)  # [H, 1]
+    x_coords = torch.arange(W, device=device, dtype=dtype).float().view(1, -1)  # [1, W]
+    
+    density_map = torch.zeros((H, W), device=device, dtype=dtype)
+    
+    if len(center_points) > 0:
+        # 为每个中心点生成高斯分布
+        for center in center_points:
+            cy, cx = center[0].float(), center[1].float()
+            # 高斯分布: exp(-((y-cy)^2 + (x-cx)^2) / (2*sigma^2))
+            gaussian = torch.exp(-((y_coords - cy) ** 2 + (x_coords - cx) ** 2) / (2 * sigma ** 2))
+            density_map += gaussian
+        
+        # 归一化到 [0, 1]
+        if density_map.max() > 0:
+            density_map = density_map / density_map.max()
+    
+    return density_map.unsqueeze(0)  # [1, H, W]
+
+
+def density_map_loss(
+    pred_density_map: torch.Tensor,
+    gt_mask: torch.Tensor,
+    pred_mask: torch.Tensor,
+    mse_weight: float = 1.0,
+    iou_weight: float = 0.5
+) -> torch.Tensor:
+    """
+    密度图损失函数（参考 DeNSe 论文）
+    包含两部分：
+    1. MSE Loss: 预测密度图 vs GT 密度图
+    2. IoU Loss: 预测 mask 与密度图高响应区域的重叠
+    
+    Args:
+        pred_density_map: [B, 1, H, W] 预测的密度图
+        gt_mask: [B, 1, H, W] 或 [B, H, W] GT mask
+        pred_mask: [B, 1, H, W] 或 [B, H, W] 预测的 mask（logits，未 sigmoid）
+        mse_weight: float MSE 损失的权重
+        iou_weight: float IoU 损失的权重
+    
+    Returns:
+        loss: scalar 总损失
+    """
+    device = pred_density_map.device
+    
+    # 确保维度一致
+    if pred_density_map.dim() == 3:
+        pred_density_map = pred_density_map.unsqueeze(1)
+    if gt_mask.dim() == 3:
+        gt_mask = gt_mask.unsqueeze(1)
+    if pred_mask.dim() == 3:
+        pred_mask = pred_mask.unsqueeze(1)
+    
+    B, _, H, W = pred_density_map.shape
+    
+    # 调整大小以匹配
+    if gt_mask.shape[-2:] != (H, W):
+        gt_mask = F.interpolate(gt_mask.float(), size=(H, W), mode='nearest')
+    if pred_mask.shape[-2:] != (H, W):
+        pred_mask = F.interpolate(pred_mask.unsqueeze(0) if pred_mask.dim() == 2 else pred_mask, 
+                                  size=(H, W), mode='bilinear', align_corners=False)
+    
+    # 生成 GT 密度图
+    gt_density_list = []
+    for b in range(B):
+        gt_density = generate_density_map_from_mask(gt_mask[b, 0], sigma=2.0)
+        gt_density_list.append(gt_density)
+    gt_density_map = torch.cat(gt_density_list, dim=0).unsqueeze(1)  # [B, 1, H, W]
+    
+    # 1. MSE Loss: 预测密度图 vs GT 密度图
+    mse_loss = F.mse_loss(pred_density_map, gt_density_map)
+    
+    # 2. IoU Loss: 预测 mask 与密度图高响应区域的重叠
+    # 将预测 mask 转换为二值化
+    pred_mask_binary = torch.sigmoid(pred_mask) > 0.5  # [B, 1, H, W]
+    
+    # 密度图的高响应区域（阈值可调）
+    density_threshold = 0.3
+    density_high_response = (pred_density_map > density_threshold).float()  # [B, 1, H, W]
+    
+    # 计算 IoU
+    intersection = (pred_mask_binary.float() * density_high_response).sum(dim=[2, 3])  # [B, 1]
+    union = (pred_mask_binary.float() + density_high_response - 
+             pred_mask_binary.float() * density_high_response).sum(dim=[2, 3])  # [B, 1]
+    
+    iou = (intersection + 1e-6) / (union + 1e-6)  # [B, 1]
+    iou_loss = 1.0 - iou.mean()  # 转换为损失（越小越好）
+    
+    # 总损失
+    total_loss = mse_weight * mse_loss + iou_weight * iou_loss
+    
+    return total_loss

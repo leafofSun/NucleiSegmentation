@@ -216,7 +216,29 @@ class PNuRL(nn.Module):
         # 🔥 [修正] 6. 预定义概率投影层 (Prob Projection)
         # 必须在 __init__ 中定义，否则优化器无法更新参数
         total_classes = sum(num_classes_per_attr) # e.g. 2+3+2+3+3 = 13
-        self.prob_proj = nn.Linear(total_classes, text_dim) 
+        self.prob_proj = nn.Linear(total_classes, text_dim)
+        
+        # 🔥 [新增] 7. 密度回归头 (Multi-Task: 保留分类 + 新增回归)
+        # 用于生成像素级密度图，参考 DeNSe 论文的强对齐策略
+        # 输入: image_features [B, embed_dim, H, W]
+        # 输出: density_map [B, 1, target_H, target_W] (与 mask 大小匹配)
+        self.density_decoder = nn.Sequential(
+            # 第一层上采样: H/4 -> H/2 (假设输入是 H/4 大小)
+            nn.ConvTranspose2d(embed_dim, embed_dim // 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(embed_dim // 2),
+            nn.ReLU(),
+            # 第二层上采样: H/2 -> H
+            nn.ConvTranspose2d(embed_dim // 2, embed_dim // 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(embed_dim // 4),
+            nn.ReLU(),
+            # 第三层上采样: H -> 2H (如果需要更大尺寸)
+            nn.ConvTranspose2d(embed_dim // 4, embed_dim // 8, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(embed_dim // 8),
+            nn.ReLU(),
+            # 最终输出层: 单通道密度图
+            nn.Conv2d(embed_dim // 8, 1, kernel_size=1),
+            nn.ReLU()  # 密度必须 >= 0
+        ) 
 
     def encode_attribute_text(self, attribute_prompts: List[str], device) -> torch.Tensor:
         if self.clip_model is None:
@@ -275,7 +297,13 @@ class PNuRL(nn.Module):
         context_in = torch.cat([image_pooled, E], dim=1)
         learnable_context = self.context_fusion(context_in)
         
-        # === 6. Loss ===
+        # === 6. 🔥 [新增] 密度回归头：生成像素级密度图 ===
+        # 使用 refined_features 作为输入（已经经过属性注意力调制）
+        density_map = self.density_decoder(refined_features)  # [B, 1, H', W']
+        # 注意：密度图的大小取决于 decoder 的上采样层数
+        # 如果需要特定大小（如与 mask 匹配），可以在外部进行插值
+        
+        # === 7. Loss ===
         loss = torch.tensor(0.0, device=device)
         if return_loss and attribute_labels is not None:
             loss = self.compute_attribute_loss(attribute_logits, attribute_labels)
@@ -285,11 +313,17 @@ class PNuRL(nn.Module):
             'shape': attribute_logits[1],
             'arrange': attribute_logits[2],
             'size': attribute_logits[3],
-            'density': attribute_logits[4],
+            'density': attribute_logits[4],  # 保留分类 logits（用于 Adapter 指导）
         }
         
-        # 返回 fused_features (包含 Shape+Size+Density 的物理信息)
-        return refined_features, learnable_context, loss, logits_dict, fused_features
+        # 🔥 [升级] 返回：保留原有输出 + 新增密度图
+        # - refined_features: 用于 SAM 的特征
+        # - learnable_context: 用于 Prompt 的上下文
+        # - loss: 分类损失
+        # - logits_dict: 包含 density 分类 logits（用于 PhysicalAdapter）
+        # - fused_features: 多尺度特征（用于 PhysicalAdapter）
+        # - density_map: 新增的像素级密度图（用于 DeNSe 式强对齐）
+        return refined_features, learnable_context, loss, logits_dict, fused_features, density_map
 
     def compute_attribute_loss(self, logits_list, labels_list):
         total_loss = 0.0
