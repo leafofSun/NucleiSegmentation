@@ -387,6 +387,10 @@ class TextSam(Sam):
             return_loss=True
         )
         # density_map: [B, 1, H', W'] - 像素级密度图（用于 DeNSe 式强对齐）
+        # density_features: [fused_low, fused_high] - 多尺度特征
+        # 🔥 [核心改进] 提取高频特征用于 ASR-Guided Decoder
+        high_freq_guide = density_features[0] if isinstance(density_features, (list, tuple)) and len(density_features) > 0 else None
+        # high_freq_guide: [B, 192, 64, 64] - PNuRL 浅层特征（用于边界细化）
         
         # === Step 4: Dual-Prompt Learner (Implicit Context with Density Modulation) ===
         # Positive
@@ -404,6 +408,22 @@ class TextSam(Sam):
         # === Step 5: Auto-Prompt Generation (SAC - Adaptive) ===
         heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
         
+        # 🔥 [核心改进] 动态阈值计算：基于 PNuRL 的 Size 预测
+        # 1. 获取 Size 预测类别
+        size_logits = attr_logits.get('size', None)  # [B, num_classes] 或 None
+        if size_logits is not None and size_logits.numel() > 0:
+            # 获取预测的 Size 类别 (0=Small, 1=Medium, 2=Large)
+            pred_size_class = torch.argmax(size_logits, dim=1)  # [B] -> 0, 1, 2
+            
+            # 2. 定义映射规则：小细胞允许靠得更近，大细胞需要更严格
+            # Small(0) -> 10.0, Medium(1) -> 15.0, Large(2) -> 20.0
+            size_threshold_map = torch.tensor([10.0, 15.0, 20.0], device=device)
+            adaptive_thresh = size_threshold_map[pred_size_class]  # [B]
+        else:
+            # 如果 PNuRL 未输出 Size 或处于训练初期，使用固定阈值
+            batch_size = image_embeddings.shape[0]
+            adaptive_thresh = torch.tensor(15.0, device=device).expand(batch_size)
+        
         # 智能决定是否限制点数: 训练时限制(50)，验证时不限制
         limit_points = 50 if self.training else None
 
@@ -411,7 +431,7 @@ class TextSam(Sam):
             heatmap_logits, 
             threshold=0.3,       
             k_neighbors=3,       
-            dense_dist_thresh=15.0,
+            dense_dist_thresh=adaptive_thresh,  # 🔥 传入动态阈值 Tensor
             max_points=limit_points
         )
         
@@ -457,13 +477,20 @@ class TextSam(Sam):
             num_cells = point_coords.shape[0]
             curr_img_embed = refined_image_embeddings[i].unsqueeze(0).expand(num_cells, -1, -1, -1)
             
-            # 解码
+            # 🔥 [核心改进] 扩展高频特征以匹配 N_cells（用于 ASR-Guided Decoder）
+            curr_high_freq = None
+            if high_freq_guide is not None:
+                # high_freq_guide[i]: [192, 64, 64] -> [1, 192, 64, 64] -> [N_cells, 192, 64, 64]
+                curr_high_freq = high_freq_guide[i].unsqueeze(0).expand(num_cells, -1, -1, -1)
+            
+            # 解码（注入高频特征用于边界细化）
             low_res_masks, iou_predictions = self.mask_decoder(
                 image_embeddings=curr_img_embed,
                 image_pe=self.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_embeddings,
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=multimask_output,
+                high_freq_features=curr_high_freq,  # 🔥 注入高频特征
             )
             
             # === Step 7: 后处理 & 聚合 ===

@@ -78,9 +78,25 @@ class TextGuidedPointGenerator(nn.Module):
         3. 如果训练需要限制数量 (max_points)，则从 All Points 中【随机采样】N 个作为目标。
            注意：这里使用 Random 而不是 Top-K，以保证模型见过"差生"(低置信度样本)。
         4. 为这 N 个目标构建 Prompt，其负提示来源于 KDTree (即来源于全集)。
+        
+        Args:
+            dense_dist_thresh: float 或 torch.Tensor [B] - 每个样本的动态阈值
         """
         B, C, H, W = heatmap_logits.shape
         device = heatmap_logits.device
+        
+        # 🔥 [新增] 处理动态阈值：支持 float 或 Tensor
+        if isinstance(dense_dist_thresh, torch.Tensor):
+            # 确保是 1D tensor，长度为 B
+            if dense_dist_thresh.dim() == 0:
+                dense_dist_thresh = dense_dist_thresh.unsqueeze(0).expand(B)
+            elif dense_dist_thresh.shape[0] != B:
+                raise ValueError(f"dense_dist_thresh tensor length ({dense_dist_thresh.shape[0]}) must match batch size ({B})")
+            # 转换为 numpy 数组以便后续使用
+            dense_dist_thresh_np = dense_dist_thresh.cpu().numpy()
+        else:
+            # float 类型：为所有样本使用相同阈值
+            dense_dist_thresh_np = np.full(B, float(dense_dist_thresh))
         
         # 1. NMS 提取所有点
         scores = torch.sigmoid(heatmap_logits)
@@ -153,7 +169,9 @@ class TextGuidedPointGenerator(nn.Module):
                         # dists_all[i][1] 是最近邻居的距离 (index 0 是自己)
                         if len(d_i) > 1:
                             nearest_dist = d_i[1]
-                            if nearest_dist < dense_dist_thresh:
+                            # 🔥 [核心修改] 使用当前样本的动态阈值
+                            current_thresh = dense_dist_thresh_np[b]
+                            if nearest_dist < current_thresh:
                                 is_crowded = True
                 
                 # 3. 负提示注入 (Neighboring Negatives)
