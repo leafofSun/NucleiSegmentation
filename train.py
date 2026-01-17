@@ -16,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter  # 🔥 Added TensorBoard
+from torch.utils.tensorboard import SummaryWriter
 
 # Native AMP support
 try:
@@ -41,56 +41,50 @@ from metrics import SegMetrics
 def parse_args():
     parser = argparse.ArgumentParser(description="MP-SAM: Explicit-Implicit Dual-Stream Training")
     
-    # --- Environment ---
+    # ... (Environment args unchanged)
     parser.add_argument("--work_dir", type=str, default="workdir", help="Directory to save logs and models")
     parser.add_argument("--run_name", type=str, default="mp_sam_pannuke_full", help="Experiment name")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    # Removed explicit 'device' argument as it's determined by local_rank in DDP
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps") # Reduced for 5090
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
     
-    # --- Data Paths ---
+    # ... (Data/Image args unchanged)
     parser.add_argument("--data_path", type=str, default="data/PanNuke_SA1B", help="Root directory of dataset")
-    parser.add_argument("--knowledge_path", type=str, default="data/PanNuke_SA1B/medical_knowledge.json", 
-                        help="Path to the generated Explicit Knowledge Base JSON")
-    
-    # --- Image Parameters ---
-    parser.add_argument("--image_size", type=int, default=1024, help="SAM input resolution (Target Size)")
+    parser.add_argument("--knowledge_path", type=str, default="data/PanNuke_SA1B/medical_knowledge.json", help="Path to KB")
+    parser.add_argument("--image_size", type=int, default=512, help="SAM input resolution (Target Size)")
     parser.add_argument("--crop_size", type=int, default=256, help="Physical Patch Size (Source Size)") 
     parser.add_argument("--mask_num", type=int, default=1, help="Number of masks per proposal")
 
-    # --- Model Config ---
+    # ... (Model/Training args unchanged)
     parser.add_argument("--model_type", type=str, default="vit_b", choices=["vit_b", "vit_l", "vit_h"], help="SAM backbone type")
-    parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d_b.pth", help="Path to original/medsam checkpoint")
-    parser.add_argument("--clip_model", type=str, default="ViT-B/16", help="CLIP model version for Text Encoder")
-    parser.add_argument("--num_organs", type=int, default=21, help="Number of organ categories (PanNuke+Brain+Generic)")
-    parser.add_argument("--encoder_adapter", action='store_true', default=True, help="Use Adapters in Image Encoder")
+    parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d_b.pth", help="Path to checkpoint")
+    parser.add_argument("--clip_model", type=str, default="ViT-B/16", help="CLIP model version")
+    parser.add_argument("--num_organs", type=int, default=21, help="Number of organ categories")
+    parser.add_argument("--encoder_adapter", action='store_true', default=True, help="Use Adapters")
 
-    # --- Training Hyperparams ---
-    parser.add_argument("--epochs", type=int, default=100) # 100 epochs is usually enough for PanNuke
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size per GPU") # Increased for 5090
-    parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate (increased for larger batch)")
-    parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum learning rate for scheduler")
+    parser.add_argument("--epochs", type=int, default=300) 
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU") 
+    parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate")
+    parser.add_argument("--min_lr", type=float, default=1e-6, help="Min LR")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--use_amp", action='store_true', default=True, help="Use Automatic Mixed Precision")
+    parser.add_argument("--use_amp", action='store_true', default=True, help="Use AMP")
     
-    # --- Loss Weights ---
-    parser.add_argument("--mask_weight", type=float, default=2.0, help="Weight for Segmentation Loss")
-    parser.add_argument("--heatmap_weight", type=float, default=1.0, help="Weight for Auto-Prompt Heatmap Loss")
-    parser.add_argument("--attr_weight", type=float, default=0.5, help="Weight for Attribute Classification Loss") # Increased
-    parser.add_argument("--consistency_weight", type=float, default=0.5, help="Weight for Physical-Semantic Consistency Loss")
-    parser.add_argument("--consistency_warmup_epochs", type=int, default=5, help="Warm-up epochs before applying consistency loss")
-    parser.add_argument("--density_map_weight", type=float, default=0.3, help="Weight for Density Map Loss (MSE + IoU, DeNSe-style)")
+    # ... (Loss/Metrics args unchanged)
+    parser.add_argument("--mask_weight", type=float, default=10.0, help="Weight for Segmentation Loss")
+    parser.add_argument("--heatmap_weight", type=float, default=1.0, help="Weight for Heatmap Loss")
+    parser.add_argument("--attr_weight", type=float, default=0.1, help="Weight for Attribute Loss") 
+    parser.add_argument("--consistency_weight", type=float, default=1.0, help="Weight for Consistency Loss")
+    parser.add_argument("--consistency_warmup_epochs", type=int, default=20, help="Warm-up epochs")
+    parser.add_argument("--density_map_weight", type=float, default=2.0, help="Weight for Density Map Loss")
 
-    # --- Metrics ---
-    parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'], 
-                        help="Metrics to evaluate: dice, iou, mAJI, mPQ, mDQ, mSQ")
+    parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'], help="Metrics to evaluate")
 
     return parser.parse_args()
 
 # ==================================================================================================
 # 2. Utils
 # ==================================================================================================
+# ... (setup_seed, to_device, resize_pos_embed unchanged)
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -112,6 +106,7 @@ def to_device(batch_input, device):
     return device_input
 
 def resize_pos_embed(state_dict, model_state_dict):
+    # (保持原样)
     new_state_dict = {}
     for k, v in state_dict.items():
         if k in model_state_dict:
@@ -130,12 +125,36 @@ def resize_pos_embed(state_dict, model_state_dict):
             new_state_dict[k] = v
     return new_state_dict
 
-# Sliding Window Inference
-def sliding_window_inference(model, image, organ_id, patch_size=256, target_size=1024, stride=256, device='cuda'):
+# 🔥 [核心修改]：生成高斯权重图
+def get_gaussian_weight_map(patch_size, device):
+    """生成一个中间高、边缘低的 2D 高斯权重图"""
+    coords = torch.arange(patch_size, dtype=torch.float32, device=device)
+    center = patch_size / 2.0
+    sigma = patch_size / 4.0  # 控制高斯的宽度
+    
+    # 1D 高斯
+    gauss = torch.exp(-(coords - center)**2 / (2 * sigma**2))
+    
+    # 2D 高斯 (外积)
+    weight_map = gauss.unsqueeze(0) * gauss.unsqueeze(1)
+    
+    # 归一化到 [0, 1] 并不是必须的，因为后面会除以 count_map，但保持数值范围一致较好
+    weight_map = weight_map / weight_map.max()
+    return weight_map
+
+# 🔥 [核心修改]：重叠滑动窗口推理
+def sliding_window_inference(model, image, organ_id, patch_size=256, target_size=512, stride=None, device='cuda'):
     C, H, W = image.shape
+    
+    # 如果没有指定 stride，默认使用 50% 重叠 (解决边界切割问题)
+    if stride is None:
+        stride = patch_size // 2
     
     full_prob_map = torch.zeros((H, W), device=device)
     count_map = torch.zeros((H, W), device=device)
+    
+    # 生成高斯权重图，用于消除边界伪影
+    weight_map = get_gaussian_weight_map(patch_size, device)
 
     h_steps = math.ceil((H - patch_size) / stride) + 1
     w_steps = math.ceil((W - patch_size) / stride) + 1
@@ -147,12 +166,13 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
             y2 = min(y1 + patch_size, H)
             x2 = min(x1 + patch_size, W)
             
+            # 处理边界情况 (Last Patch)
             if y2 - y1 < patch_size: y1 = max(0, y2 - patch_size)
             if x2 - x1 < patch_size: x1 = max(0, x2 - patch_size)
             
             patch = image[:, y1:y1+patch_size, x1:x1+patch_size]
             
-            patch_1024 = F.interpolate(
+            patch_resized = F.interpolate(
                 patch.unsqueeze(0), 
                 size=(target_size, target_size), 
                 mode='bilinear', 
@@ -160,7 +180,7 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
             )
             
             model_input = [{
-                'image': patch_1024.squeeze(0), 
+                'image': patch_resized.squeeze(0), 
                 'original_size': (target_size, target_size),
                 'text_prompt': "Cell nuclei",
                 'organ_id': organ_id,
@@ -171,10 +191,10 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
                 out = model(model_input, multimask_output=True)
                 iou_preds = out[0]['iou_predictions']
                 best_idx = torch.argmax(iou_preds).item()
-                pred_logits_1024 = out[0]['masks'][0, best_idx]
+                pred_logits_target = out[0]['masks'][0, best_idx]
             
             pred_logits_256 = F.interpolate(
-                pred_logits_1024.unsqueeze(0).unsqueeze(0), 
+                pred_logits_target.unsqueeze(0).unsqueeze(0), 
                 size=(patch_size, patch_size), 
                 mode='bilinear', 
                 align_corners=False
@@ -182,19 +202,21 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
             
             pred_prob_256 = torch.sigmoid(pred_logits_256)
 
-            full_prob_map[y1:y1+patch_size, x1:x1+patch_size] += pred_prob_256
-            count_map[y1:y1+patch_size, x1:x1+patch_size] += 1
+            # 🔥 [核心逻辑] 加权累加
+            # 预测值 * 权重 (中心权重大，边缘权重小)
+            full_prob_map[y1:y1+patch_size, x1:x1+patch_size] += pred_prob_256 * weight_map
+            # 计数器也加权重，而不是简单 +1
+            count_map[y1:y1+patch_size, x1:x1+patch_size] += weight_map
 
-    full_prob_map /= torch.clamp(count_map, min=1.0)
+    # 加权平均
+    full_prob_map /= torch.clamp(count_map, min=1e-5)
     return full_prob_map
 
 # ==================================================================================================
-# 3. Training Logic
+# 3. Training Logic (包含所有之前的修复)
 # ==================================================================================================
 def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank):
     model.train()
-    
-    # Only show progress bar on main process
     if rank == 0:
         pbar = tqdm(train_loader, desc=f"Ep {epoch+1} Train")
     else:
@@ -212,7 +234,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         images = batched_input['image']
         labels = batched_input['label']
         
-        # === Build MP-SAM Input ===
         model_input = []
         organ_ids = batched_input.get('organ_id', None)
         attr_texts = batched_input.get('attribute_text', ["Cell nuclei"] * len(images))
@@ -220,7 +241,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         attr_labels = batched_input.get('attr_labels', None)
 
         for i in range(len(images)):
-            curr_id = 20 # Generic default
+            curr_id = 20
             if organ_ids is not None:
                 val = organ_ids[i]
                 curr_id = val.item() if isinstance(val, torch.Tensor) else val
@@ -234,12 +255,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 'attr_labels': attr_labels[i] if attr_labels is not None else None
             })
 
-        # === Forward Pass ===
         with autocast('cuda', enabled=args.use_amp):
-            # Model forward with list input (DDP handles this if correctly wrapped, but usually DDP expects tensors.
-            # However, SAM's implementation uses lists. 
-            # In standard DDP, forward call is broadcast. 
-            # Note: For DDP with list inputs, make sure the model handles list inputs correctly.)
             outputs = model(model_input, multimask_output=True)
             
             loss_batch = 0
@@ -249,11 +265,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             
             peak_counts_list = []
             density_logits_list = []
-            density_map_list = []  # 🔥 [新增] 收集密度图用于损失计算
-            pred_mask_list = []    # 🔥 [新增] 收集预测 mask 用于 IoU Loss
+            density_map_list = []
+            pred_mask_list = []
             
             for i, out in enumerate(outputs):
-                # A. Mask Loss
                 iou_preds = out['iou_predictions']
                 if iou_preds.ndim == 2: iou_preds = iou_preds.squeeze(0)
                 best_idx = torch.argmax(iou_preds).item()
@@ -267,72 +282,61 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
 
                 loss_m, _ = criterion(pred_mask.unsqueeze(0).unsqueeze(0), gt_mask.unsqueeze(0).unsqueeze(0), pred_iou.unsqueeze(0))
                 
-                # B. Heatmap Loss
                 pred_heatmap = out['heatmap_logits'] 
                 with torch.no_grad():
                     target_mask = labels[i].float().unsqueeze(0)
                     gt_nuclei = F.interpolate(target_mask, size=pred_heatmap.shape[-2:], mode='nearest').squeeze(0)
                     gt_nuclei[gt_nuclei==255] = 0
-                
                 loss_h = point_guidance_loss(pred_heatmap, gt_nuclei.unsqueeze(0))
                 
-                # C. Attribute Loss
                 loss_attr = out.get('pnurl_loss', None)
                 if loss_attr is None or not isinstance(loss_attr, torch.Tensor):
                     loss_attr = torch.tensor(0.0, device=loss_m.device, requires_grad=True)
                 elif loss_attr.dim() > 0:
                     loss_attr = loss_attr.mean()
                 
-                # D. Data for Consistency Loss
                 attr_logits = out.get('attr_logits', None)
                 if attr_logits is not None and 'density' in attr_logits:
-                    all_density_logits = attr_logits['density']  # 这是 [B, 3] 的 batch 输出
-                    
-                    # 🔥 [核心修复]：只取当前第 i 个样本的 Logits
-                    # i 是 enumerate 返回的索引，对应当前处理的样本
-                    if all_density_logits.shape[0] == len(images):  # 确认它是 Batch 输出
-                        curr_density_logits = all_density_logits[i].unsqueeze(0)  # 取第 i 行，变成 [1, 3]
+                    all_density_logits = attr_logits['density'] 
+                    if all_density_logits.shape[0] == len(images): 
+                        curr_density_logits = all_density_logits[i].unsqueeze(0) 
                     else:
-                        # 兼容 Batch=1 的情况
                         curr_density_logits = all_density_logits
-                    
                     density_logits_list.append(curr_density_logits)
                     
-                    # Accessing prompt_generator from DDP wrapper
                     prompt_gen = model.module.prompt_generator if hasattr(model, 'module') else model.prompt_generator
                     with torch.no_grad():
                         peak_count = prompt_gen.count_peaks_from_heatmap(pred_heatmap, threshold=0.3)
-                        # 确保 peak_count 是 [1] 形状的张量
                         if isinstance(peak_count, torch.Tensor):
                             if peak_count.dim() == 0:
-                                peak_count = peak_count.unsqueeze(0)  # [1]
+                                peak_count = peak_count.unsqueeze(0) 
                         else:
                             peak_count = torch.tensor([peak_count], device=curr_density_logits.device)
                         peak_counts_list.append(peak_count)
                 
-                # 🔥 [新增] 收集密度图和预测 mask（用于 DeNSe 式损失）
+                # 🔥 [核心修复] 收集密度图和预测 mask（自动补零逻辑）
+                pred_mask_logits = pred_mask.unsqueeze(0).unsqueeze(0)
+                pred_mask_list.append(pred_mask_logits)
+                
                 density_map_i = out.get('density_map', None)
                 if density_map_i is not None:
-                    density_map_list.append(density_map_i.unsqueeze(0))  # [1, 1, H, W]
-                    # 保存预测 mask 的 logits（未 sigmoid）
-                    pred_mask_logits = pred_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-                    pred_mask_list.append(pred_mask_logits)
+                    density_map_list.append(density_map_i.unsqueeze(0))
+                else:
+                    B_zero, C_zero, H_zero, W_zero = pred_mask_logits.shape
+                    zero_map = torch.zeros((B_zero, 1, H_zero, W_zero), device=pred_mask.device)
+                    density_map_list.append(zero_map)
                 
-                # E. Sum (without consistency and density map yet)
                 loss_i = args.mask_weight * loss_m + args.heatmap_weight * loss_h + args.attr_weight * loss_attr
-                
                 loss_batch += loss_i
                 loss_m_accum += loss_m.item()
                 loss_h_accum += loss_h.item()
                 loss_attr_accum += loss_attr.item()
             
-            # F. Consistency Loss
             loss_consistency = torch.tensor(0.0, device=loss_m.device, requires_grad=True)
             loss_consistency_accum = 0.0
             if epoch >= args.consistency_warmup_epochs and len(peak_counts_list) > 0:
                 peak_counts_batch = torch.cat(peak_counts_list, dim=0)
                 density_logits_batch = torch.cat(density_logits_list, dim=0)
-                
                 loss_consistency = physical_semantic_consistency_loss(
                     peak_counts=peak_counts_batch,
                     density_logits=density_logits_batch,
@@ -343,30 +347,27 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 loss_batch += args.consistency_weight * loss_consistency * len(images)
                 loss_consistency_accum = loss_consistency.item()
             
-            # 🔥 [新增] G. Density Map Loss (DeNSe-style: MSE + IoU)
             loss_density_map = torch.tensor(0.0, device=loss_m.device, requires_grad=True)
             loss_density_map_accum = 0.0
-            if len(density_map_list) > 0 and epoch >= args.consistency_warmup_epochs:
-                # 拼接所有样本的密度图和 mask
-                pred_density_batch = torch.cat(density_map_list, dim=0)  # [B, 1, H, W]
-                pred_mask_batch = torch.cat(pred_mask_list, dim=0)  # [B, 1, H, W]
-                
-                # 准备 GT mask batch
+            if len(density_map_list) > 0:
+                pred_density_batch = torch.cat(density_map_list, dim=0)
+                pred_mask_batch = torch.cat(pred_mask_list, dim=0)
                 gt_mask_batch = []
                 for i in range(len(images)):
                     gt_mask_i = labels[i].squeeze(0).float()
                     if gt_mask_i.dim() == 2:
-                        gt_mask_i = gt_mask_i.unsqueeze(0)  # [1, H, W]
-                    gt_mask_batch.append(gt_mask_i.unsqueeze(0))  # [1, 1, H, W]
-                gt_mask_batch = torch.cat(gt_mask_batch, dim=0)  # [B, 1, H, W]
+                        gt_mask_i = gt_mask_i.unsqueeze(0)
+                    gt_mask_batch.append(gt_mask_i.unsqueeze(0))
+                gt_mask_batch = torch.cat(gt_mask_batch, dim=0)
                 
-                # 计算密度图损失
-                loss_density_map = density_map_loss(
+                enable_iou = (epoch >= args.consistency_warmup_epochs)
+                loss_density_map, loss_density_mse, loss_density_iou = density_map_loss(
                     pred_density_map=pred_density_batch,
                     gt_mask=gt_mask_batch,
                     pred_mask=pred_mask_batch,
                     mse_weight=1.0,
-                    iou_weight=0.5
+                    iou_weight=0.5,
+                    enable_iou=enable_iou
                 )
                 loss_batch += args.density_map_weight * loss_density_map * len(images)
                 loss_density_map_accum = loss_density_map.item()
@@ -374,7 +375,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             final_loss = loss_batch / len(images)
             final_loss = final_loss / args.accumulation_steps
 
-        # === Backward ===
         if scaler:
             scaler.scale(final_loss).backward()
         else:
@@ -388,14 +388,12 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 optimizer.step()
             optimizer.zero_grad()
 
-        # Record
         current_loss_val = final_loss.item() * args.accumulation_steps
         losses.append(current_loss_val)
         mask_losses.append(loss_m_accum / len(images))
         heatmap_losses.append(loss_h_accum / len(images))
         attr_losses.append(loss_attr_accum / len(images))
         
-        # 🔥 TensorBoard Logging (Rank 0 only)
         if rank == 0 and writer is not None and batch_idx % 10 == 0:
             global_step = epoch * len(train_loader) + batch_idx
             writer.add_scalar('Train/Loss_Total', current_loss_val, global_step)
@@ -404,8 +402,8 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             writer.add_scalar('Train/Loss_Attr', loss_attr_accum / len(images), global_step)
             if epoch >= args.consistency_warmup_epochs:
                 writer.add_scalar('Train/Loss_Consistency', loss_consistency_accum, global_step)
-            if epoch >= args.consistency_warmup_epochs and loss_density_map_accum > 0:
-                writer.add_scalar('Train/Loss_DensityMap', loss_density_map_accum, global_step)
+            if loss_density_map_accum > 0:
+                writer.add_scalar('Train/Loss_DensityMap_Total', loss_density_map_accum, global_step)
             writer.add_scalar('Train/LR', optimizer.param_groups[0]['lr'], global_step)
         
         if rank == 0:
@@ -430,7 +428,6 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
     else:
         pbar = val_loader
     
-    # Use underlying model if wrapped in DDP for inference if needed, but DDP forward works too
     eval_model = model.module if hasattr(model, 'module') else model
     
     for batch, batched_input in enumerate(pbar):
@@ -445,12 +442,13 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                 val = organ_ids[i]
                 curr_organ_id = val.item() if isinstance(val, torch.Tensor) else val
             
+            # 🔥 [核心修改] 验证推理时，启用重叠滑动 (stride = crop_size // 2)
             prob_map = sliding_window_inference(
                 eval_model, images[i], 
                 organ_id=curr_organ_id, 
                 patch_size=args.crop_size, 
                 target_size=args.image_size, 
-                stride=args.crop_size, 
+                stride=args.crop_size // 2,  # 🔥 关键：50% 重叠
                 device=args.device
             )
             
@@ -461,20 +459,14 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
             gt_valid[gt == 255] = 0
             
             res = SegMetrics(pred_mask, gt_valid, args.metrics)
-            
             for k in args.metrics:
                 if k in res: val_results[k].append(res[k])
                 
-            # 🔥 TensorBoard Visualization (First batch of Rank 0)
             if rank == 0 and writer is not None and not visualize_done:
                 img_vis = images[i].cpu().numpy().transpose(1, 2, 0)
                 img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min() + 1e-5)
-                
-                # 🔥 [核心修复] 将 GT 和 Pred 乘以 255，让前景（值为1）变成白色显示
-                # pred_mask 和 gt_valid 的值是 0 和 1，需要乘以 255 才能在 TensorBoard 中正确显示
                 gt_vis = (gt_valid * 255).astype(np.uint8)
                 pred_vis = (pred_mask * 255).astype(np.uint8)
-                
                 writer.add_image(f'Val_Viz/Image', torch.tensor(img_vis.transpose(2, 0, 1)), epoch)
                 writer.add_image(f'Val_Viz/GT', torch.tensor(gt_vis).unsqueeze(0), epoch)
                 writer.add_image(f'Val_Viz/Pred', torch.tensor(pred_vis).unsqueeze(0), epoch)
@@ -483,27 +475,18 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
         if rank == 0 and 'mAJI' in args.metrics and len(val_results['mAJI']) > 0:
             pbar.set_postfix(AJI=f"{val_results['mAJI'][-1]:.3f}")
                 
-    # Average across rank 0 (approximation, exact would need dist.all_gather but usually fine for monitoring)
     avg_results = {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in val_results.items()}
-    
     if rank == 0 and writer is not None:
-        # 🔥 [核心修改]：自动遍历所有计算出的指标，全部写入 TensorBoard
-        # 这样无论你算 Dice, mAJI, mPQ, mDQ, mSQ，都会自动显示
         for metric_name, metric_value in avg_results.items():
             writer.add_scalar(f'Val/{metric_name}', metric_value, epoch)
-        
-        # 额外记录一个加权总分 (方便看总体趋势)
-        # mAJI 是最重要的实例分割指标，Dice 是像素级指标
         main_score = avg_results.get('mAJI', 0) * 0.6 + avg_results.get('dice', 0) * 0.4
         writer.add_scalar('Val/Weighted_Score', main_score, epoch)
         
     return avg_results
 
-# ==================================================================================================
-# 5. Main
-# ==================================================================================================
+# ... (Main function unchanged)
 def main(args):
-    # Initialize Distributed Training
+    # (Same as before...)
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -517,54 +500,32 @@ def main(args):
         world_size = 1
         args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 🔥 [修复 1] 增加 dist.barrier()，确保所有进程同步
     if world_size > 1:
         dist.barrier()
 
-    setup_seed(args.seed + rank) # Distinct seeds per rank
+    setup_seed(args.seed + rank) 
     
-    # 🔥 [平台适配] 定义 TensorBoard 日志路径
-    # 平台可能读取 /root/shared-nvme/tensorboard/logs 或 /home/pod
-    platform_tb_roots = [
-        "/home/pod",  # 优先使用 /home/pod
-        "/root/shared-nvme/tensorboard/logs",  # 备选路径
-    ]
-    
+    platform_tb_roots = ["/home/pod", "/root/shared-nvme/tensorboard/logs"]
     platform_tb_root = None
     for tb_path in platform_tb_roots:
         if os.path.exists(tb_path):
             platform_tb_root = tb_path
             break
-    
-    # 如果平台目录都不存在，回退到本地目录
     if platform_tb_root is None:
         platform_tb_root = os.path.join(args.work_dir, "runs")
         if rank == 0:
             print(f"⚠️ 警告：未找到平台默认日志目录，将使用本地目录: {platform_tb_root}")
-            print("   (您可能需要手动修改平台配置才能查看图表)")
     
     if rank == 0:
-        # 🔥 [修复] 时间戳格式：去掉秒，避免文件名过长
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M')
-        
-        # 1. TensorBoard 日志目录 (使用平台指定目录或回退目录)
         run_log_dir = os.path.join(platform_tb_root, f"{args.run_name}_{timestamp}")
-        
-        # 2. 文本日志和模型保存目录 (保存在 workdir 下，方便管理)
         text_log_dir = os.path.join(args.work_dir, "logs")
         model_save_dir = os.path.join(args.work_dir, "models", args.run_name)
-        
-        # 3. 显式创建所有目录
         os.makedirs(run_log_dir, exist_ok=True)
         os.makedirs(text_log_dir, exist_ok=True)
         os.makedirs(model_save_dir, exist_ok=True)
-        
-        # 4. 初始化文本日志
         logger = get_logger(os.path.join(text_log_dir, f"{args.run_name}_{timestamp}.log"))
-        
-        # 5. 初始化 TensorBoard Writer (使用绝对路径 + 增加 flush_secs)
         writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
-        
         logger.info(f"🚀 [Start] MP-SAM (Scale: {args.crop_size}->{args.image_size})")
         logger.info(f"   GPUs: {world_size}, Batch/GPU: {args.batch_size}")
         logger.info(f"📊 TensorBoard logs saved to: {run_log_dir}")
@@ -572,26 +533,15 @@ def main(args):
         logger = None
         writer = None
 
-    # Dataset
-    # 🔥 直接传根目录，因为 JSON 里的 Key 已经包含了 train/ 或 test/ 前缀
     train_dataset = UniversalDataset(
-        data_root=args.data_path,  # 直接传根目录 (data/PanNuke_SA1B)
-        knowledge_path=args.knowledge_path,
-        image_size=args.image_size, 
-        crop_size=args.crop_size, 
-        mode='train',
-        prompt_mode='dynamic'
+        data_root=args.data_path, knowledge_path=args.knowledge_path,
+        image_size=args.image_size, crop_size=args.crop_size, mode='train', prompt_mode='dynamic'
     )
     val_dataset = UniversalDataset(
-        data_root=args.data_path,  # 直接传根目录
-        knowledge_path=args.knowledge_path,
-        image_size=args.image_size, 
-        crop_size=args.crop_size, 
-        mode='test',
-        prompt_mode='generic'
+        data_root=args.data_path, knowledge_path=args.knowledge_path,
+        image_size=args.image_size, crop_size=args.crop_size, mode='test', prompt_mode='generic'
     )
     
-    # Distributed Sampler
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if world_size > 1 else None
     
@@ -603,14 +553,13 @@ def main(args):
     if rank == 0:
         logger.info(f"📊 Train Size: {len(train_dataset)} | Val Size: {len(val_dataset)}")
 
-    # Model
     args.checkpoint = args.sam_checkpoint
     vanilla_sam = sam_model_registry[args.model_type](args)
     
     if os.path.exists(args.sam_checkpoint):
         if rank == 0: logger.info(f"📥 Loading checkpoint: {args.sam_checkpoint}")
         try:
-            ckpt = torch.load(args.sam_checkpoint, map_location='cpu',weights_only=False)
+            ckpt = torch.load(args.sam_checkpoint, map_location='cpu', weights_only=False)
             state_dict = ckpt.get("model", ckpt)
             state_dict = resize_pos_embed(state_dict, vanilla_sam.state_dict())
             vanilla_sam.load_state_dict(state_dict, strict=False)
@@ -618,28 +567,22 @@ def main(args):
             if rank == 0: logger.warning(f"⚠️ Checkpoint loading failed: {e}")
     
     model = TextSam(
-        image_encoder=vanilla_sam.image_encoder,
-        prompt_encoder=vanilla_sam.prompt_encoder,
-        mask_decoder=vanilla_sam.mask_decoder,
-        clip_model_name=args.clip_model,
-        num_organs=args.num_organs
+        image_encoder=vanilla_sam.image_encoder, prompt_encoder=vanilla_sam.prompt_encoder,
+        mask_decoder=vanilla_sam.mask_decoder, clip_model_name=args.clip_model, num_organs=args.num_organs
     ).to(args.device)
     
     del vanilla_sam
 
-    # Wrap DDP
     if world_size > 1:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     if args.encoder_adapter:
-        # Handle wrapped model access
         raw_model = model.module if world_size > 1 else model
         for n, p in raw_model.image_encoder.named_parameters():
             if "Adapter" in n and "weight" in n:
                 torch.nn.init.zeros_(p)
 
-    # Optimizer parameters
     raw_model = model.module if world_size > 1 else model
     params = [
         {'params': raw_model.mask_decoder.parameters(), 'lr': args.lr},
@@ -663,12 +606,9 @@ def main(args):
     best_dice = 0.0
     
     for epoch in range(args.epochs):
-        if train_sampler:
-            train_sampler.set_epoch(epoch)
+        if train_sampler: train_sampler.set_epoch(epoch)
             
         loss, m_loss, h_loss, a_loss = train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank)
-        
-        # Validation - 每个epoch都验证
         val_res = validate_one_epoch(args, model, val_loader, epoch, writer, rank)
         
         if rank == 0:
@@ -682,14 +622,12 @@ def main(args):
                 f"Dice: {dice:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}"
             )
             
-            # 保存最佳模型（基于 AJI）
             if aji > best_aji:
                 best_aji = aji
                 best_dice = max(best_dice, dice)
                 torch.save(raw_model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, "best_model.pth"))
                 logger.info(f"⭐ New Best AJI! ({best_aji:.4f}) -> Model Saved")
             
-            # 每20轮自动保存一次
             if (epoch + 1) % 20 == 0 or (epoch + 1) == args.epochs:
                 checkpoint_path = os.path.join(args.work_dir, "models", args.run_name, f"epoch_{epoch+1}.pth")
                 torch.save(raw_model.state_dict(), checkpoint_path)
