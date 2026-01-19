@@ -622,16 +622,16 @@ def main(args):
                 f"Dice: {dice:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}"
             )
             
+            # 保存 latest_model.pth (覆盖式，每个 epoch 都更新)
+            latest_model_path = os.path.join(args.work_dir, "models", args.run_name, "latest_model.pth")
+            torch.save(raw_model.state_dict(), latest_model_path)
+            
             if aji > best_aji:
                 best_aji = aji
                 best_dice = max(best_dice, dice)
-                torch.save(raw_model.state_dict(), os.path.join(args.work_dir, "models", args.run_name, "best_model.pth"))
+                best_model_path = os.path.join(args.work_dir, "models", args.run_name, "best_model.pth")
+                torch.save(raw_model.state_dict(), best_model_path)
                 logger.info(f"⭐ New Best AJI! ({best_aji:.4f}) -> Model Saved")
-            
-            if (epoch + 1) % 20 == 0 or (epoch + 1) == args.epochs:
-                checkpoint_path = os.path.join(args.work_dir, "models", args.run_name, f"epoch_{epoch+1}.pth")
-                torch.save(raw_model.state_dict(), checkpoint_path)
-                logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
 
         scheduler.step()
 

@@ -447,13 +447,42 @@ class TextSam(Sam):
             # 获取当前样本的 Prompt 数据
             prompt_data = prompts_list[i]
             
-            # 🔥 [修正] 如果没有找到点 (全背景)，返回全黑 Mask (Float 类型，极大负数代表 logits 0)
+            # 🔥 [修复] 处理无点情况，防止 DDP 死锁
             if not prompt_data["has_points"]:
+                # ✅ 正确写法：利用 image_embeddings 构造 dummy，保持计算图连接
+                # 0 * sum() 既保留了连接，又不会产生实际梯度影响
+                dummy_connection = refined_image_embeddings[i].sum() * 0.0
+                
+                # 获取正确的目标尺寸 (Original Size, e.g., 512x512)
+                target_h, target_w = batched_input[i]["original_size"]
+                
+                # 🔥 处理 density_map
+                density_map_i = None
+                if density_map is not None:
+                    density_map_raw = density_map[i]  # [1, H', W']
+                    # 如果尺寸不对，插值到 original_size
+                    if density_map_raw.shape[-2:] != (target_h, target_w):
+                        density_map_i = F.interpolate(
+                            density_map_raw.unsqueeze(0), 
+                            size=(target_h, target_w), 
+                            mode='bilinear', 
+                            align_corners=False
+                        ).squeeze(0)  # [1, target_h, target_w]
+                    else:
+                        density_map_i = density_map_raw
+                    
+                    # 加上 dummy_connection (虽然 density_map 本身就在图里，加这个双保险)
+                    density_map_i = density_map_i + dummy_connection
+                
                 outputs.append({
-                    "masks": torch.zeros((1, 1, input_size, input_size), device=device, dtype=torch.float32) - 100.0,
-                    "iou_predictions": torch.zeros((1, 1), device=device),
-                    "low_res_logits": torch.zeros((1, 1, 256, 256), device=device) - 100.0,
+                    # 🔥 [修正] 使用 (target_h, target_w) 而不是 input_size (1024)
+                    "masks": (torch.zeros((1, 1, target_h, target_w), device=device, dtype=torch.float32) - 100.0) + dummy_connection,
+                    "iou_predictions": torch.zeros((1, 1), device=device) + dummy_connection,
+                    # low_res_logits 保持 256x256 是对的，这是 Decoder 的原始输出尺寸
+                    "low_res_logits": (torch.zeros((1, 1, 256, 256), device=device) - 100.0) + dummy_connection,
                     "heatmap_logits": heatmap_logits[i].unsqueeze(0),
+                    "attr_logits": attr_logits,
+                    "density_map": density_map_i,
                     "pnurl_loss": pnurl_loss
                 })
                 continue
