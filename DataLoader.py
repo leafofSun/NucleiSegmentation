@@ -17,6 +17,12 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+try:
+    from scipy.spatial import KDTree as scipy_KDTree
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 # 🔥 [21类器官映射表]
 ORGAN_TO_ID = {
     # --- PanNuke 19 类 ---
@@ -26,7 +32,7 @@ ORGAN_TO_ID = {
     "Pancreatic": 12, "Prostate": 13, "Skin": 14, "Stomach": 15, 
     "Testis": 16, "Thyroid": 17, "Uterus": 18,
     # --- 补充 ---
-    "Brain": 19, "Generic": 20, "MoNuSeg": 20
+    "Brain": 19, "Generic": 20
 }
 
 # ==============================================================================
@@ -115,8 +121,75 @@ def analyze_physical_attributes(image, mask, config: AttributeConfig, area_scale
         "labels": [col_lbl, shape_lbl, arr_lbl, size_lbl, den_lbl]
     }
 
+def generate_adaptive_density(mask, image_size=(1024, 1024)):
+    """
+    🔥 [New] 基于 KDTree 的自适应密度图生成 (DeNSe Style)
+    逻辑：拥挤处 Sigma 小（尖锐），稀疏处 Sigma 大（平滑）。
+    """
+    heatmap = np.zeros(image_size, dtype=np.float32)
+    labeled_mask = label(mask)
+    regions = regionprops(labeled_mask)
+    
+    if not regions:
+        return heatmap
+        
+    points = np.array([r.centroid for r in regions]) # (y, x)
+    
+    # 1. 构建 KDTree 找邻居
+    if len(points) > 1:
+        if SCIPY_AVAILABLE:
+            tree = scipy_KDTree(points)
+        elif SKLEARN_AVAILABLE:
+            tree = KDTree(points)
+        else:
+            # 如果没有 KDTree，使用固定 sigma
+            for region in regions:
+                y0, x0 = region.centroid
+                sigma = 15.0
+                roi_size = int(sigma * 3)
+                y_min, y_max = max(0, int(y0)-roi_size), min(image_size[0], int(y0)+roi_size)
+                x_min, x_max = max(0, int(x0)-roi_size), min(image_size[1], int(x0)+roi_size)
+                if x_max <= x_min or y_max <= y_min: continue
+                y_grid, x_grid = np.ogrid[y_min:y_max, x_min:x_max]
+                gauss = np.exp(-((x_grid - x0)**2 + (y_grid - y0)**2) / (2 * sigma**2))
+                heatmap[y_min:y_max, x_min:x_max] = np.maximum(heatmap[y_min:y_max, x_min:x_max], gauss)
+            return heatmap
+        
+        # k=4: 找最近的3个邻居 (第1个是自己)
+        dists, _ = tree.query(points, k=min(4, len(points)))
+    else:
+        dists = None
+
+    for i, region in enumerate(regions):
+        y0, x0 = region.centroid
+        
+        # 2. 动态计算 Sigma
+        if dists is not None and len(dists[i]) > 1:
+            mean_dist = np.mean(dists[i][1:]) 
+            sigma = 0.3 * mean_dist # DeNSe 经验系数
+        else:
+            sigma = 15.0 # 默认值
+            
+        # 截断保护
+        sigma = max(3.0, min(sigma, 60.0))
+        
+        # 3. 绘制高斯 (局部加速版)
+        roi_size = int(sigma * 3)
+        y_min, y_max = max(0, int(y0)-roi_size), min(image_size[0], int(y0)+roi_size)
+        x_min, x_max = max(0, int(x0)-roi_size), min(image_size[1], int(x0)+roi_size)
+        
+        if x_max <= x_min or y_max <= y_min: continue
+        
+        y_grid, x_grid = np.ogrid[y_min:y_max, x_min:x_max]
+        gauss = np.exp(-((x_grid - x0)**2 + (y_grid - y0)**2) / (2 * sigma**2))
+        
+        # Max 融合 (处理重叠)
+        heatmap[y_min:y_max, x_min:x_max] = np.maximum(heatmap[y_min:y_max, x_min:x_max], gauss)
+        
+    return heatmap
+
 def generate_elliptical_heatmap(mask, image_size=(1024, 1024), sigma_scale=0.25):
-    """生成椭圆高斯热力图"""
+    """生成椭圆高斯热力图（保留作为备用）"""
     heatmap = np.zeros(image_size, dtype=np.float32)
     labeled_mask = label(mask)
     regions = regionprops(labeled_mask)
@@ -308,7 +381,8 @@ class UniversalDataset(data.Dataset):
 
         # 5. Returns
         label_tensor = torch.from_numpy(aug_mask).long().unsqueeze(0)
-        gt_heatmap = generate_elliptical_heatmap(aug_mask, image_size=(self.image_size, self.image_size))
+        # 🔥 [New] 使用自适应密度图生成 (DeNSe Style)
+        gt_heatmap = generate_adaptive_density(aug_mask, image_size=(self.image_size, self.image_size))
         
         if self.mode == 'train' and random.random() < 0.2:
             organ_id = 20

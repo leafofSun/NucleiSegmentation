@@ -408,6 +408,10 @@ class TextSam(Sam):
         # === Step 5: Auto-Prompt Generation (SAC - Adaptive) ===
         heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
         
+        # 🔥 [New] 准备传给 ASR 的密度图
+        # Sigmoid 归一化到 0~1，作为空间门控
+        density_map_proxy = torch.sigmoid(heatmap_logits[:, 0:1, :, :])  # [B, 1, 64, 64]
+        
         # 🔥 [核心改进] 动态阈值计算：基于 PNuRL 的 Size 预测
         # 1. 获取 Size 预测类别
         size_logits = attr_logits.get('size', None)  # [B, num_classes] 或 None
@@ -512,7 +516,13 @@ class TextSam(Sam):
                 # high_freq_guide[i]: [192, 64, 64] -> [1, 192, 64, 64] -> [N_cells, 192, 64, 64]
                 curr_high_freq = high_freq_guide[i].unsqueeze(0).expand(num_cells, -1, -1, -1)
             
-            # 解码（注入高频特征用于边界细化）
+            # 🔥 [New] 准备当前样本的密度图
+            # density_map_proxy: [B, 1, 64, 64] -> 取第 i 个样本
+            curr_density_map = density_map_proxy[i].unsqueeze(0)  # [1, 1, 64, 64]
+            # 需要扩展到 N_cells 维度
+            curr_density_map = curr_density_map.expand(num_cells, -1, -1, -1)  # [N_cells, 1, 64, 64]
+            
+            # 解码（注入高频特征用于边界细化，同时传入密度图）
             low_res_masks, iou_predictions = self.mask_decoder(
                 image_embeddings=curr_img_embed,
                 image_pe=self.prompt_encoder.get_dense_pe(),
@@ -520,6 +530,7 @@ class TextSam(Sam):
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=multimask_output,
                 high_freq_features=curr_high_freq,  # 🔥 注入高频特征
+                density_map=curr_density_map,  # 🔥 [New] 传入密度图
             )
             
             # === Step 7: 后处理 & 聚合 ===

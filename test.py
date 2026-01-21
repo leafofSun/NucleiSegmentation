@@ -10,54 +10,58 @@ from segment_anything import sam_model_registry
 from segment_anything.modeling.sam import TextSam 
 from metrics import SegMetrics
 import torch.nn.functional as F
-from PIL import Image # 新增：用于 CLIP 处理
-import clip           # 新增：CLIP 库
+from PIL import Image
+import clip
 
 # 后处理
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
 from skimage.morphology import remove_small_objects, opening, disk
 from scipy import ndimage
-# 形态学
 from skimage.measure import label, regionprops
 
+# 确保在文件开头导入了 mask
 try:
     from pycocotools import mask as coco_mask
 except ImportError:
     pass
 
-# 🔥 全局定义：确保顺序与训练时一致
+# 🔥 [配置] 字典必须是 ID -> Name (Int -> Str)
 ID_TO_ORGAN = {
-    0: "Kidney", 1: "Breast", 2: "Prostate", 3: "Lung", 
-    4: "Colon", 5: "Stomach", 6: "Liver", 7: "Bladder", 
-    8: "Brain", 9: "Generic"
+    # --- PanNuke 19 类 ---
+    0: "Adrenal_gland", 1: "Bile-duct", 2: "Bladder", 3: "Breast", 
+    4: "Cervix", 5: "Colon", 6: "Esophagus", 7: "HeadNeck", 
+    8: "Kidney", 9: "Liver", 10: "Lung", 11: "Ovarian", 
+    12: "Pancreatic", 13: "Prostate", 14: "Skin", 15: "Stomach", 
+    16: "Testis", 17: "Thyroid", 18: "Uterus",
+    # --- 补充 ---
+    19: "Brain", 20: "Generic"
 }
 
-# 🌟 新增：基于 CLIP 的器官诊断器
+# 🔥 [配置] 反向字典：Name -> ID (忽略大小写)
+ORGAN_TO_ID = {v.lower().replace("-", "_"): k for k, v in ID_TO_ORGAN.items()}
+# 补充一些常见的变体映射
+ORGAN_TO_ID.update({
+    "bile_duct": 1, "head_neck": 7, "adrenal gland": 0
+})
+
 class OrganPredictor:
     def __init__(self, device):
         self.device = device
         print("🧠 Loading CLIP for Organ Diagnosis...")
-        # 加载 CLIP 模型 (需确保显存足够，ViT-B/16 约需几百MB)
         self.model, self.preprocess = clip.load("ViT-B/16", device=device)
         self.model.eval()
         
         # 准备文本特征
         self.organs = [ID_TO_ORGAN[i] for i in range(len(ID_TO_ORGAN))]
-        # 构造 prompt 模板，Generic 作为兜底
-        templates = [f"A histology image of {org} tissue." for org in self.organs]
+        self.templates = [f"A histology image of {org} tissue." for org in self.organs]
         
         with torch.no_grad():
-            text_inputs = clip.tokenize(templates).to(device)
+            text_inputs = clip.tokenize(self.templates).to(device)
             self.text_features = self.model.encode_text(text_inputs)
             self.text_features /= self.text_features.norm(dim=-1, keepdim=True)
 
     def predict(self, image_cv2):
-        """
-        输入: BGR 格式的 OpenCV 图片
-        输出: (预测器官名, 器官ID, 置信度)
-        """
-        # 转为 PIL 并进行预处理
         img_rgb = cv2.cvtColor(image_cv2, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
         image_input = self.preprocess(img_pil).unsqueeze(0).to(self.device)
@@ -66,22 +70,19 @@ class OrganPredictor:
             image_features = self.model.encode_image(image_input)
             image_features /= image_features.norm(dim=-1, keepdim=True)
             
-            # 计算相似度
             similarity = (100.0 * image_features @ self.text_features.T).softmax(dim=-1)
             values, indices = similarity[0].topk(1)
             
         best_idx = indices.item()
         confidence = values.item()
+        # 注意：这里 best_idx 对应 self.organs 的索引，恰好也是 ORGAN_ID
         return self.organs[best_idx], best_idx, confidence
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work_dir", type=str, default="workdir")
     parser.add_argument("--run_name", type=str, default="text-guided-sam-dynamic-final") 
-    
-    parser.add_argument("--text_prompt", type=str, default=None, help="Custom prompt override")
-    parser.add_argument("--test_attr_path", type=str, default="data/MoNuSeg_SA1B/test_attributes.json")
-    
+    parser.add_argument("--text_prompt", type=str, default=None, help="Custom Class prompt override (e.g. 'Liver')")
     parser.add_argument("--patch_size", type=int, default=256)
     parser.add_argument("--image_size", type=int, default=1024)
     parser.add_argument("--stride", type=int, default=128)
@@ -93,44 +94,23 @@ def parse_args():
     parser.add_argument("--save_pred", action='store_true')
     parser.add_argument("--use_watershed", action='store_true', default=True)
     parser.add_argument("--encoder_adapter", action='store_true', default=True)
-    
     return parser.parse_args()
 
 def analyze_predictions(pred_mask):
     labeled = label(pred_mask)
     regions = regionprops(labeled)
-    
-    if not regions:
-        return 0.0, 0.0, 0
-    
-    areas = []
-    roundnesses = []
-    
-    for r in regions:
-        area = r.area
-        perimeter = r.perimeter
-        if perimeter == 0: roundness = 0
-        else: roundness = (4 * np.pi * area) / (perimeter ** 2)
-        
-        areas.append(area)
-        roundnesses.append(roundness)
-        
+    if not regions: return 0.0, 0.0, 0
+    areas = [r.area for r in regions]
+    roundnesses = [(4 * np.pi * r.area) / (r.perimeter ** 2) if r.perimeter > 0 else 0 for r in regions]
     return np.mean(areas), np.mean(roundnesses), len(regions)
 
-def postprocess_watershed(prob_map, thresh=0.4, min_distance=3):
-    binary_mask = prob_map > thresh
-    binary_mask = opening(binary_mask, disk(1))
-    distance = ndimage.distance_transform_edt(binary_mask)
-    coords = peak_local_max(distance, min_distance=min_distance, labels=binary_mask)
-    mask = np.zeros(distance.shape, dtype=bool)
-    mask[tuple(coords.T)] = True
-    markers, _ = ndimage.label(mask)
-    labels = watershed(-distance, markers, mask=binary_mask)
-    final_mask = remove_small_objects(labels, min_size=15)
-    return (final_mask > 0).astype(np.uint8)
-
-# 🔥 [修改] 增加了 organ_id 参数
-def sliding_window_inference(model, image, device, patch_size, image_size, stride, text_prompt, organ_id, filename=None):
+# 🔥 [修正] 推理函数：明确区分 Class Prompt 和 Attribute Text
+def sliding_window_inference(model, image, device, patch_size, image_size, stride, 
+                             text_prompt, organ_id, attribute_text=None, filename=None):
+    """
+    text_prompt: 类别提示 (Class), 用于 DualPromptLearner (e.g., "Liver cell nuclei")
+    attribute_text: 属性提示 (Attribute), 用于 PNuRL. 推理时应为空，触发自动预测。
+    """
     h, w = image.shape[:2]
     pad_h = (patch_size - h % patch_size) % patch_size
     pad_w = (patch_size - w % patch_size) % patch_size
@@ -145,6 +125,10 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
     x_steps = list(range(0, w_pad - patch_size + 1, stride))
     if (w_pad - patch_size) % stride != 0: x_steps.append(w_pad - patch_size)
     
+    # 🔥 [核心逻辑] 推理时属性提示默认为空，让模型自己看图
+    if attribute_text is None:
+        attribute_text = ""
+
     model.eval()
     with torch.no_grad():
         for y in y_steps:
@@ -156,15 +140,13 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
                 input_sample = [{
                     'image': img_tensor,
                     'original_size': (image_size, image_size), 
-                    'text_prompt': text_prompt,
-                    # 🔥 [关键] 注入 organ_id 以激活隐式知识库 (DualPromptLearner)
-                    'organ_id': organ_id,
-                    'attribute_text': text_prompt # KIM 模块同时也需要显式文本
+                    'text_prompt': text_prompt,       # ✅ 这是一个类别提示 (Class)
+                    'organ_id': organ_id,             # ✅ 这是一个类别ID (Class)
+                    'attribute_text': attribute_text  # ✅ 这是一个属性提示 (Attribute) -> 为空!
                 }]
                 
                 outputs = model(input_sample, multimask_output=True)
                 out = outputs[0]
-                
                 scores = out['iou_predictions'].squeeze()
                 best_idx = torch.argmax(scores).item()
                 logits_large = out['masks'][0, best_idx, :, :] 
@@ -180,50 +162,76 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
     avg_prob = prob_map_full / count_map_full
     return avg_prob[:h, :w]
 
-# 🔥 [修复版] test.py 中的 load_filtered_gt
+def get_organ_from_json(img_path):
+    """
+    尝试读取同名 JSON 获取 organ_type (Ground Truth Class)
+    """
+    # 优先找同名json，其次找上级目录
+    json_path = os.path.splitext(img_path)[0] + ".json"
+    if not os.path.exists(json_path):
+         json_path = img_path.rsplit('.', 1)[0] + ".json"
+    
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            
+            # 兼容多种JSON结构
+            organ = data.get('organ_type', None)
+            if not organ: 
+                meta = data.get('metadata', {})
+                organ = meta.get('organ_type', None)
+                
+            if organ:
+                key = organ.lower().replace("-", "_")
+                if key in ORGAN_TO_ID:
+                    return ID_TO_ORGAN[ORGAN_TO_ID[key]], ORGAN_TO_ID[key]
+                else:
+                    # 尝试模糊匹配
+                    for k_id, v_name in ID_TO_ORGAN.items():
+                        if key in v_name.lower():
+                            return v_name, k_id
+                    print(f"⚠️ Unknown organ in JSON: {organ}")
+        except Exception as e:
+            print(f"❌ Error reading JSON {json_path}: {e}")
+            
+    return None, None
+
 def load_filtered_gt(img_path, attr_data, target_tag=None):
-    # 1. 尝试从属性文件中匹配文件名
+    # (此函数保持不变，用于加载 GT Mask 计算指标)
     base_name = os.path.basename(img_path)
     filename_key = None
-    
-    # 模糊匹配逻辑
     if base_name in attr_data:
         filename_key = base_name
     else:
-        # 尝试找包含关系的 key
         for k in attr_data.keys():
             if base_name in k or k in base_name:
                 filename_key = k
                 break
     
-    # 2. 确定要保留的 ID
-    valid_ids = None # None 表示保留所有
+    valid_ids = None 
     if filename_key and filename_key in attr_data:
         instances = attr_data[filename_key]
-        # 如果指定了特定 Tag (如 "Tumor")，则筛选
         if target_tag and target_tag not in ["Generic", "Cell nuclei", "Auto_Organ", None]:
             valid_ids = set()
             for inst in instances:
                 tags = [t.lower() for t in inst.get('tags', [])]
-                search_key = target_tag.split()[0].lower() # 取第一个词匹配
+                search_key = target_tag.split()[0].lower()
                 if search_key in tags:
                     valid_ids.add(inst['id'])
     
-    # 3. 读取原始 JSON (兜底逻辑)
     json_path = os.path.splitext(img_path)[0] + ".json"
     if not os.path.exists(json_path):
-        # 尝试替换后缀查找
         possible_json = img_path.rsplit('.', 1)[0] + ".json"
         if os.path.exists(possible_json):
             json_path = possible_json
         else:
-            return None # 真的没有 GT 文件
+            return None
 
     try:
         with open(json_path, 'r') as f:
             data = json.load(f)
         
-        # 兼容不同格式
         if isinstance(data, dict):
             anns = data.get('annotations', [])
         else:
@@ -231,14 +239,12 @@ def load_filtered_gt(img_path, attr_data, target_tag=None):
             
         if not anns: return None
         
-        # 初始化 Mask
         temp_img = cv2.imread(img_path)
+        if temp_img is None: return None
         h, w = temp_img.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
         
-        # 4. 绘制 Mask
         for idx, ann in enumerate(anns):
-            # 🔥 [核心修复] 如果 valid_ids 是 None，说明不过滤，全部绘制
             if valid_ids is not None and idx not in valid_ids:
                 continue
                 
@@ -246,8 +252,18 @@ def load_filtered_gt(img_path, attr_data, target_tag=None):
             seg = ann['segmentation']
             
             if isinstance(seg, dict) and 'counts' in seg: 
-                rle_mask = coco_mask.decode(seg)
+                if isinstance(seg['counts'], list):
+                    rle = coco_mask.frPyObjects(seg, h, w)
+                    rle_mask = coco_mask.decode(rle)
+                else:
+                    if isinstance(seg['counts'], str):
+                        seg['counts'] = seg['counts'].encode('utf-8')
+                    rle_mask = coco_mask.decode(seg)
+                
+                if len(rle_mask.shape) == 3: 
+                     rle_mask = np.max(rle_mask, axis=2)
                 mask[rle_mask > 0] = 1
+
             elif isinstance(seg, list):
                 for poly in seg:
                     pts = np.array(poly, dtype=np.int32).reshape((-1, 2))
@@ -269,7 +285,7 @@ def main(args):
         clip_model_name="ViT-B/16",
         text_dim=512,
         embed_dim=256,
-        num_organs=21 # 确保和你训练时一致
+        num_organs=21 
     ).to(args.device)
     
     if os.path.exists(args.checkpoint):
@@ -280,14 +296,8 @@ def main(args):
         print(f"❌ Checkpoint not found at {args.checkpoint}")
         return
 
-    # 🔥 初始化器官预测器
     organ_predictor = OrganPredictor(args.device)
-
-    attr_data = {}
-    if os.path.exists(args.test_attr_path):
-        with open(args.test_attr_path, 'r') as f:
-            content = json.load(f)
-            attr_data = content.get("images", {})
+    attr_data = {} # 占位，GT Mask加载用
 
     image_files = []
     for root, dirs, files in os.walk(args.data_path):
@@ -296,14 +306,11 @@ def main(args):
                 image_files.append(os.path.join(root, f))
     
     all_metrics = defaultdict(list)
-    prompt_stats = {"avg_area": [], "avg_roundness": [], "count": []}
-    
     save_dir = os.path.join(args.work_dir, args.run_name, "inference_viz")
     if args.save_pred: os.makedirs(save_dir, exist_ok=True)
 
     print('*'*60)
     print(f"🚀 Running Inference: {args.run_name}")
-    print(f"🧠 AI-Diagnosis Mode Active")
     print('*'*60)
 
     pbar = tqdm(image_files)
@@ -314,100 +321,79 @@ def main(args):
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         # ==========================================
-        # 🌟 核心步骤：AI 自动诊断
+        # 🌟 Step 1: 确定器官类别 (Class Info) -> 解决 "Who am I?"
+        # 优先级: JSON真值 > AI预测 > 用户覆盖
         # ==========================================
-        pred_organ, pred_id, conf = organ_predictor.predict(image)
         
-        # 逻辑分支
-        if args.text_prompt:
-            # 用户强制指定 (Expert Mode)
-            prompt_text = args.text_prompt
-            current_organ_id = 9 # Generic
-            log_msg = f"👤 Override: '{prompt_text}' (Ignored AI: {pred_organ})"
+        # A. 查 JSON
+        gt_organ, gt_id = get_organ_from_json(img_path)
+        
+        if gt_organ:
+            pred_organ = gt_organ
+            current_organ_id = gt_id
+            log_msg = f"📂 JSON: {pred_organ} (ID={gt_id})"
         else:
-            # AI 自适应 (Auto Mode)
-            prompt_text = f"{pred_organ} cell nuclei"
+            # B. 用 CLIP 预测
+            pred_organ, pred_id, conf = organ_predictor.predict(image)
             current_organ_id = pred_id
-            log_msg = f"🧠 AI: {pred_organ} ({conf:.1%}) -> '{prompt_text}'"
+            log_msg = f"🧠 AI: {pred_organ} ({conf:.1%})"
 
-        pbar.write(f"🖼️  {filename} | {log_msg}")
+        # C. 用户强制覆盖
+        if args.text_prompt:
+             # 注意：这里的 text_prompt 也是指类别，不是属性
+             class_prompt_text = args.text_prompt
+             current_organ_id = 20 # Generic
+             log_msg = f"👤 Override: '{class_prompt_text}'"
+        else:
+             # 构造类别提示词
+             class_prompt_text = f"{pred_organ} cell nuclei"
+
+        # ==========================================
+        # 🌟 Step 2: 确定属性提示 (Attribute Info) -> 解决 "What do I look like?"
+        # 推理时必须为空，触发 PNuRL 内部自动预测
+        # ==========================================
+        attribute_prompt_text = ""
+
+        pbar.write(f"🖼️  {filename} | {log_msg} -> Class: '{class_prompt_text}' | Attr: [AUTO]")
         
-        # ==========================================
-        # 🚀 带着器官信息去分割
-        # ==========================================
+        # 推理
         pred_prob = sliding_window_inference(
             model, image_rgb, args.device, 
-            patch_size=args.patch_size,
-            image_size=args.image_size,
-            stride=args.stride,
-            text_prompt=prompt_text, 
-            organ_id=current_organ_id, # 🔥 传入 ID
+            patch_size=args.patch_size, image_size=args.image_size, stride=args.stride,
+            
+            # ✅ 明确区分两个通道
+            text_prompt=class_prompt_text,        # Class 通道 (给 DualPromptLearner)
+            organ_id=current_organ_id,            # Class 通道 (给 DualPromptLearner)
+            attribute_text=attribute_prompt_text, # Attribute 通道 (给 PNuRL, 必须为空)
+            
             filename=filename
         )
-        
         pred_mask = (pred_prob > 0.5).astype(np.uint8)
         
-        # 统计信息
-        p_area, p_round, p_count = analyze_predictions(pred_mask)
-        if p_count > 0:
-            prompt_stats["avg_area"].append(p_area)
-            prompt_stats["avg_roundness"].append(p_round)
-            prompt_stats["count"].append(p_count)
-
-        # 指标计算 (如果有关联的GT)
-        # 注意：这里 load_filtered_gt 仍然使用 text_prompt 来过滤
-        # 如果是 Auto Mode，我们暂且认为就是评估"所有细胞"
-        target_tag_for_eval = args.text_prompt if args.text_prompt else "Auto_Organ"
-        gt_mask = load_filtered_gt(img_path, attr_data, target_tag=target_tag_for_eval)
-        
+        # 计算指标
+        gt_mask = load_filtered_gt(img_path, attr_data, target_tag="Auto_Organ")
         if gt_mask is not None:
             if gt_mask.shape != pred_mask.shape:
                 gt_mask = cv2.resize(gt_mask, (pred_mask.shape[1], pred_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
-            
             res = SegMetrics(pred_mask, gt_mask, args.metrics)
-            for k, v in res.items():
-                all_metrics[k].append(v)
+            for k, v in res.items(): all_metrics[k].append(v)
         
-        # 可视化
+        # 保存图片
         if args.save_pred:
-            # 1. 复制原图
             vis = image.copy()
-            
-            # 2. 绘制 GT (红色) - BGR: (0, 0, 255)
-            # 注意：gt_mask 可能为 None (如果没有对应的 JSON)
             if gt_mask is not None:
-                # 确保尺寸一致
-                if gt_mask.shape != pred_mask.shape:
-                    gt_mask = cv2.resize(gt_mask, (pred_mask.shape[1], pred_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
-                
                 cnts_gt, _ = cv2.findContours(gt_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                # 使用线宽 2
                 cv2.drawContours(vis, cnts_gt, -1, (0, 0, 255), 2)
-
-            # 3. 绘制预测 (绿色) - BGR: (0, 255, 0)
             cnts_pred, _ = cv2.findContours(pred_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(vis, cnts_pred, -1, (0, 255, 0), 2)
-            
-            # 4. 添加图例和信息
-            # 顶部信息：Prompt 和 AI 诊断
-            cv2.putText(vis, f"AI: {pred_organ} ({conf:.2f})", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2) # 青色文字
-            
-            # 底部信息：图例 (红=GT, 绿=Pred)
-            h_img, w_img = vis.shape[:2]
-            legend_text = f"Red: GT | Green: Pred | Area: {int(p_area)}"
-            cv2.putText(vis, legend_text, (10, h_img - 20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2) # 白色文字
-
-            # 5. 保存
+            cv2.putText(vis, f"Org: {pred_organ}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             save_path = os.path.join(save_dir, filename.replace('.tif','.jpg').replace('.png', '.jpg'))
             cv2.imwrite(save_path, vis)
 
     print("\n" + "="*40)
     print(f"📊 Final Results:")
     for k, v in all_metrics.items():
-        if len(v) > 0:
-            print(f"  {k:>10}: {np.mean(v):.4f}")
+        if len(v) > 0: print(f"  {k:>10}: {np.mean(v):.4f}")
     print("="*40)
 
 if __name__ == '__main__':

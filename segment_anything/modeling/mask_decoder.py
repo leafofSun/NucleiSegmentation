@@ -54,11 +54,12 @@ class ASRBlock(nn.Module):
                 nn.Sigmoid()
             )
 
-    def forward(self, x, guide=None):
+    def forward(self, x, guide=None, density_map=None):
         """
         Args:
-            x: [B, C, H, W] (SAM Transformer 特征)
-            guide: [B, C_g, H, W] (PNuRL 浅层特征，可选)
+            x: [B, C, H, W] (SAM Transformer 特征 - 模糊)
+            guide: [B, C_g, H, W] (PNuRL 融合特征 - Size+Shape+Density -> 形状稳定剂 🦴)
+            density_map: [B, 1, H, W] (AutoPoint 热力图 -> 空间门控 🔦)
         
         Returns:
             [B, out_dim, H*2, W*2] 上采样后的特征
@@ -72,7 +73,20 @@ class ASRBlock(nn.Module):
             if guide.shape[-2:] != x.shape[-2:]:
                 guide = F.interpolate(guide, size=x.shape[-2:], mode='bilinear', align_corners=False)
             
-            g = self.guide_proj(guide)
+            g = self.guide_proj(guide)  # [B, C, H, W]
+            
+            # 🔥 [核心创新: 空间-语义双重控制]
+            if density_map is not None:
+                # 对齐尺寸
+                if density_map.shape[-2:] != g.shape[-2:]:
+                    d_map = F.interpolate(density_map, size=g.shape[-2:], mode='bilinear', align_corners=False)
+                else:
+                    d_map = density_map
+                
+                # ⚠️ 关键操作：Spatial Gating
+                # 只有在密度高的地方，才注入"形状特征"。
+                # 这保证了背景处不会因为注入了 Shape 特征而产生幻觉。
+                g = g * d_map  # [B, C, H, W] * [B, 1, H, W] -> [B, C, H, W]
             
             # 3. 计算门控权重 (关注 x 和 g 的差异区，即边界)
             combined = torch.cat([x, g], dim=1)
@@ -178,6 +192,7 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,  #[B, 256, 64, 64]
         multimask_output: bool,
         high_freq_features: torch.Tensor = None,  # 🔥 新增：PNuRL 的 fused_low 特征 [B, 192, 64, 64]
+        density_map: torch.Tensor = None,  # 🔥 [New] AutoPoint 生成的密度图 [B, 1, 64, 64]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -201,6 +216,7 @@ class MaskDecoder(nn.Module):
             sparse_prompt_embeddings=sparse_prompt_embeddings,
             dense_prompt_embeddings=dense_prompt_embeddings,
             high_freq_features=high_freq_features,  # 🔥 传递高频特征
+            density_map=density_map,  # 🔥 [New] 传递密度图
         )
 
         # Select the correct mask or masks for output
@@ -221,6 +237,7 @@ class MaskDecoder(nn.Module):
         sparse_prompt_embeddings: torch.Tensor,
         dense_prompt_embeddings: torch.Tensor,
         high_freq_features: torch.Tensor = None,  # 🔥 新增参数
+        density_map: torch.Tensor = None,  # 🔥 [New] 密度图参数
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
         # Concatenate output tokens
@@ -246,9 +263,9 @@ class MaskDecoder(nn.Module):
         
         # 🔥 [核心修改] 使用 ASR 或原版上采样
         if self.use_asr:
-            # 第一层：注入高频细节（如果有 guide）
-            upscaled_embedding = self.asr_upscale_1(src, guide=high_freq_features)
-            # 第二层：常规上采样
+            # 第一层：注入高频细节（如果有 guide）和密度图
+            upscaled_embedding = self.asr_upscale_1(src, guide=high_freq_features, density_map=density_map)
+            # 第二层：常规上采样（不需要密度图）
             upscaled_embedding = self.asr_upscale_2(upscaled_embedding)
         else:
             upscaled_embedding = self.output_upscaling(src)
