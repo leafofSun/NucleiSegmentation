@@ -52,7 +52,6 @@ class AttributeConfig:
     @classmethod
     def from_metadata(cls, stats):
         if not stats: return cls()
-        print(f"📊 [Config] Initializing thresholds from Dataset Statistics...")
         return cls(
             AREA_SMALL=stats.get('th_size_small', 250.0),
             AREA_LARGE=stats.get('th_size_large', 600.0),
@@ -61,7 +60,7 @@ class AttributeConfig:
         )
 
 # ==============================================================================
-# 2. 物理属性分析器
+# 2. 物理属性分析器 (🔥 极速优化版)
 # ==============================================================================
 def analyze_physical_attributes(image, mask, config: AttributeConfig, area_scale=1.0):
     results = {
@@ -70,38 +69,54 @@ def analyze_physical_attributes(image, mask, config: AttributeConfig, area_scale
     }
     if mask.sum() == 0: return results
 
-    labeled_mask = label(mask)
-    regions = regionprops(labeled_mask)
-    if not regions: return results
+    # 🔥 [SPEEDUP] 降采样分析！
+    analysis_scale = 256.0 / max(mask.shape)
+    if analysis_scale < 1.0:
+        h, w = mask.shape[:2]
+        new_h, new_w = int(h * analysis_scale), int(w * analysis_scale)
+        small_mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        area_scale_factor = (1.0 / analysis_scale) ** 2
+    else:
+        small_mask = mask
+        area_scale_factor = 1.0
+
+    # 使用 OpenCV 加速连通域分析
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(small_mask, connectivity=8)
+    
+    if num_labels <= 1: return results 
 
     # 1. Size
+    areas = stats[1:, cv2.CC_STAT_AREA] * area_scale_factor
+    mean_area = np.mean(areas)
+    
     th_small = config.AREA_SMALL * area_scale
     th_large = config.AREA_LARGE * area_scale
-    areas = np.array([r.area for r in regions])
-    mean_area = np.mean(areas)
+    
     if mean_area < th_small: size_lbl, size_txt = 0, "small"
     elif mean_area > th_large: size_lbl, size_txt = 2, "large, enlarged"
     else: size_lbl, size_txt = 1, "medium-sized"
 
     # 2. Shape
-    eccs = np.array([r.eccentricity for r in regions])
-    mean_ecc = np.mean(eccs)
-    if mean_ecc < config.SHAPE_ROUND: shape_lbl, shape_txt = 0, "round"
-    elif mean_ecc < config.SHAPE_OVAL: shape_lbl, shape_txt = 1, "oval"
+    w = stats[1:, cv2.CC_STAT_WIDTH]
+    h = stats[1:, cv2.CC_STAT_HEIGHT]
+    aspect_ratios = w.astype(float) / (h.astype(float) + 1e-5)
+    mean_ar = np.mean(np.abs(1.0 - aspect_ratios))
+    if mean_ar < 0.3: shape_lbl, shape_txt = 0, "round"
+    elif mean_ar < 0.6: shape_lbl, shape_txt = 1, "oval"
     else: shape_lbl, shape_txt = 2, "elongated"
 
     # 3. Density
-    count = len(regions)
-    if count < config.DENSITY_SPARSE: den_lbl, den_txt = 0, "sparsely distributed"
-    elif count > config.DENSITY_DENSE: den_lbl, den_txt = 2, "densely packed"
+    count = num_labels - 1
+    if count < config.DENSITY_SPARSE * 100: den_lbl, den_txt = 0, "sparsely distributed"
+    elif count > config.DENSITY_DENSE * 100: den_lbl, den_txt = 2, "densely packed"
     else: den_lbl, den_txt = 1, "moderately distributed"
 
     # 4. Arrangement
-    centroids = np.array([r.centroid for r in regions])
-    if len(centroids) > 5 and SKLEARN_AVAILABLE:
+    if count > 5 and SKLEARN_AVAILABLE:
         try:
-            tree = KDTree(centroids)
-            dists, _ = tree.query(centroids, k=2)
+            pts = centroids[1:]
+            tree = KDTree(pts)
+            dists, _ = tree.query(pts, k=2)
             nn_dists = dists[:, 1]
             dist_cv = np.std(nn_dists) / (np.mean(nn_dists) + 1e-6)
             if dist_cv > config.ARRANGE_CLUMPED: arr_lbl, arr_txt = 1, "disordered/clustered"
@@ -109,12 +124,7 @@ def analyze_physical_attributes(image, mask, config: AttributeConfig, area_scale
         except: arr_lbl, arr_txt = 0, "uniformly arranged"
     else: arr_lbl, arr_txt = 0, "isolated"
 
-    # 5. Color
     col_lbl, col_txt = 0, "deep-purple stained"
-    if image is not None:
-        masked_pixels = image[mask > 0]
-        if masked_pixels.size > 0:
-            if np.mean(masked_pixels) > config.COLOR_BRIGHT: col_lbl, col_txt = 1, "pink/light stained"
 
     return {
         "visuals": {"color": col_txt, "shape": shape_txt, "arrangement": arr_txt, "size": size_txt, "density": den_txt},
@@ -123,109 +133,65 @@ def analyze_physical_attributes(image, mask, config: AttributeConfig, area_scale
 
 def generate_adaptive_density(mask, image_size=(1024, 1024)):
     """
-    🔥 [New] 基于 KDTree 的自适应密度图生成 (DeNSe Style)
-    逻辑：拥挤处 Sigma 小（尖锐），稀疏处 Sigma 大（平滑）。
+    🔥 [SPEEDUP] 快速自适应密度图
     """
-    heatmap = np.zeros(image_size, dtype=np.float32)
-    labeled_mask = label(mask)
-    regions = regionprops(labeled_mask)
+    target_h, target_w = image_size
+    scale = 0.25 
+    small_h, small_w = int(target_h * scale), int(target_w * scale)
     
-    if not regions:
-        return heatmap
-        
-    points = np.array([r.centroid for r in regions]) # (y, x)
+    small_mask = cv2.resize(mask, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+    num_labels, _, _, centroids = cv2.connectedComponentsWithStats(small_mask, connectivity=8)
     
-    # 1. 构建 KDTree 找邻居
-    if len(points) > 1:
-        if SCIPY_AVAILABLE:
-            tree = scipy_KDTree(points)
-        elif SKLEARN_AVAILABLE:
-            tree = KDTree(points)
-        else:
-            # 如果没有 KDTree，使用固定 sigma
-            for region in regions:
-                y0, x0 = region.centroid
-                sigma = 15.0
-                roi_size = int(sigma * 3)
-                y_min, y_max = max(0, int(y0)-roi_size), min(image_size[0], int(y0)+roi_size)
-                x_min, x_max = max(0, int(x0)-roi_size), min(image_size[1], int(x0)+roi_size)
-                if x_max <= x_min or y_max <= y_min: continue
-                y_grid, x_grid = np.ogrid[y_min:y_max, x_min:x_max]
-                gauss = np.exp(-((x_grid - x0)**2 + (y_grid - y0)**2) / (2 * sigma**2))
-                heatmap[y_min:y_max, x_min:x_max] = np.maximum(heatmap[y_min:y_max, x_min:x_max], gauss)
-            return heatmap
-        
-        # k=4: 找最近的3个邻居 (第1个是自己)
-        dists, _ = tree.query(points, k=min(4, len(points)))
+    heatmap = np.zeros((small_h, small_w), dtype=np.float32)
+    
+    if num_labels <= 1:
+        return cv2.resize(heatmap, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    points = centroids[1:]
+    
+    if len(points) > 200:
+        for pt in points:
+            x, y = int(pt[0]), int(pt[1])
+            if 0 <= y < small_h and 0 <= x < small_w:
+                heatmap[y, x] = 1.0
+        heatmap = cv2.GaussianBlur(heatmap, (15, 15), 3.0)
+        if heatmap.max() > 0: heatmap /= heatmap.max()
     else:
-        dists = None
-
-    for i, region in enumerate(regions):
-        y0, x0 = region.centroid
-        
-        # 2. 动态计算 Sigma
-        if dists is not None and len(dists[i]) > 1:
-            mean_dist = np.mean(dists[i][1:]) 
-            sigma = 0.3 * mean_dist # DeNSe 经验系数
+        if SKLEARN_AVAILABLE:
+            tree = KDTree(points)
+            dists, _ = tree.query(points, k=min(4, len(points)))
         else:
-            sigma = 15.0 # 默认值
+            dists = None
+
+        for i, pt in enumerate(points):
+            x0, y0 = int(pt[0]), int(pt[1])
+            if dists is not None and len(dists[i]) > 1:
+                sigma = 0.3 * np.mean(dists[i][1:])
+            else:
+                sigma = 4.0
+            sigma = max(1.0, min(sigma, 15.0))
             
-        # 截断保护
-        sigma = max(3.0, min(sigma, 60.0))
-        
-        # 3. 绘制高斯 (局部加速版)
-        roi_size = int(sigma * 3)
-        y_min, y_max = max(0, int(y0)-roi_size), min(image_size[0], int(y0)+roi_size)
-        x_min, x_max = max(0, int(x0)-roi_size), min(image_size[1], int(x0)+roi_size)
-        
-        if x_max <= x_min or y_max <= y_min: continue
-        
-        y_grid, x_grid = np.ogrid[y_min:y_max, x_min:x_max]
-        gauss = np.exp(-((x_grid - x0)**2 + (y_grid - y0)**2) / (2 * sigma**2))
-        
-        # Max 融合 (处理重叠)
-        heatmap[y_min:y_max, x_min:x_max] = np.maximum(heatmap[y_min:y_max, x_min:x_max], gauss)
-        
-    return heatmap
+            k_size = int(sigma * 3) * 2 + 1
+            kernel = cv2.getGaussianKernel(k_size, sigma)
+            kernel = kernel @ kernel.T
+            
+            kh, kw = kernel.shape
+            y_min, y_max = max(0, y0 - kh//2), min(small_h, y0 + kh//2 + 1)
+            x_min, x_max = max(0, x0 - kw//2), min(small_w, x0 + kw//2 + 1)
+            ky_min = kh//2 - (y0 - y_min)
+            ky_max = ky_min + (y_max - y_min)
+            kx_min = kw//2 - (x0 - x_min)
+            kx_max = kx_min + (x_max - x_min)
+            
+            heatmap[y_min:y_max, x_min:x_max] = np.maximum(
+                heatmap[y_min:y_max, x_min:x_max], 
+                kernel[ky_min:ky_max, kx_min:kx_max]
+            )
 
-def generate_elliptical_heatmap(mask, image_size=(1024, 1024), sigma_scale=0.25):
-    """生成椭圆高斯热力图（保留作为备用）"""
-    heatmap = np.zeros(image_size, dtype=np.float32)
-    labeled_mask = label(mask)
-    regions = regionprops(labeled_mask)
-    
-    for region in regions:
-        if region.area < 5: continue
-        y0, x0 = region.centroid
-        major, minor = region.axis_major_length, region.axis_minor_length # 🔥 [修复] 使用新版属性名，避免 Warning
-        theta = -region.orientation
-        
-        sigma_x = max(1.0, major * sigma_scale)
-        sigma_y = max(1.0, minor * sigma_scale)
-        
-        # 🔥 [修复关键] 提前计算 a, b, c，防止 NameError
-        cos_t, sin_t = np.cos(theta), np.sin(theta)
-        a = (cos_t**2)/(2*sigma_x**2) + (sin_t**2)/(2*sigma_y**2)
-        b = -(np.sin(2*theta))/(4*sigma_x**2) + (np.sin(2*theta))/(4*sigma_y**2)
-        c = (sin_t**2)/(2*sigma_x**2) + (cos_t**2)/(2*sigma_y**2)
-
-        # 优化：只在 Bounding Box 内计算高斯
-        bb_size = int(max(major, minor) * 1.5)
-        y_min, y_max = max(0, int(y0 - bb_size)), min(image_size[0], int(y0 + bb_size + 1))
-        x_min, x_max = max(0, int(x0 - bb_size)), min(image_size[1], int(x0 + bb_size + 1))
-        
-        if x_max <= x_min or y_max <= y_min: continue
-
-        xx, yy = np.meshgrid(np.arange(x_min, x_max), np.arange(y_min, y_max))
-        dx, dy = xx - x0, yy - y0
-        
-        gaussian = np.exp(-(a*dx**2 + 2*b*dx*dy + c*dy**2))
-        heatmap[y_min:y_max, x_min:x_max] = np.maximum(heatmap[y_min:y_max, x_min:x_max], gaussian)
-        
-    return heatmap
+    return cv2.resize(heatmap, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
 # ==============================================================================
-# 3. 通用数据集类
+# 3. 通用数据集类 (🔥 Fix Black Borders)
 # ==============================================================================
 class UniversalDataset(data.Dataset):
     def __init__(self, 
@@ -265,7 +231,6 @@ class UniversalDataset(data.Dataset):
                 skipped += 1
                 continue
             
-            # 🔥 修复路径拼接逻辑：知识库里的 Key 已经是相对路径
             full_img_path = os.path.join(data_root, rel_path)
             full_json_path = full_img_path.replace(".png", ".json")
             
@@ -281,21 +246,30 @@ class UniversalDataset(data.Dataset):
         self.transform = self._get_transforms()
 
     def _get_transforms(self):
+        """
+        🔥 [SOTA FIX]: 移除了 PadIfNeeded，保证没有黑边。
+        如果图片小于 crop_size，会在 __getitem__ 里先放大，再进这里。
+        """
         if self.mode == 'train':
             return A.Compose([
-                A.PadIfNeeded(min_height=self.crop_size, min_width=self.crop_size, border_mode=cv2.BORDER_CONSTANT, value=0),
+                # 移除 PadIfNeeded！
+                # 随机裁剪 (对于大图有用)
                 A.RandomCrop(width=self.crop_size, height=self.crop_size, p=1.0),
+                # 数据增强
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
                 A.RandomRotate90(p=0.5),
-                A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.2),
+                # A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.2), # 如果追求速度可关
                 A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
+                # 调整到模型输入尺寸
                 A.Resize(height=self.image_size, width=self.image_size, interpolation=cv2.INTER_LINEAR),
                 ToTensorV2(),
             ])
         else:
             return A.Compose([
-                A.PadIfNeeded(min_height=self.crop_size, min_width=self.crop_size, border_mode=cv2.BORDER_CONSTANT, value=0),
+                # 验证集：CenterCrop -> Resize
+                A.CenterCrop(width=self.crop_size, height=self.crop_size, p=1.0),
+                A.Resize(height=self.image_size, width=self.image_size, interpolation=cv2.INTER_LINEAR),
                 ToTensorV2(),
             ])
 
@@ -314,28 +288,6 @@ class UniversalDataset(data.Dataset):
         active_mask = mask.copy()
         task_type = "generic"
         text_suffix = ""
-
-        if self.mode != 'train' or self.prompt_mode != 'dynamic' or len(regions) < 5:
-            return active_mask, task_type, text_suffix
-
-        areas = np.array([r.area for r in regions])
-        min_a, max_a = np.min(areas), np.max(areas)
-        
-        if max_a < min_a * 2.0: return active_mask, task_type, text_suffix
-
-        rand_p = random.random()
-        if rand_p < 0.25:
-            task_type = "large"
-            text_suffix = "large, pleomorphic"
-            th_high = np.percentile(areas, 67)
-            temp_mask = np.zeros_like(mask)
-            for r in regions:
-                if r.area >= th_high: 
-                    y, x = int(r.centroid[0]), int(r.centroid[1])
-                    if mask[y, x]: 
-                        pass 
-            pass 
-
         return active_mask, task_type, text_suffix
 
     def __len__(self):
@@ -346,25 +298,38 @@ class UniversalDataset(data.Dataset):
         
         # 1. Images & Masks
         image = cv2.imread(item['img_path'])
+        if image is None: 
+             image = np.zeros((256, 256, 3), dtype=np.uint8)
+        
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         mask = self._decode_mask(item['json_path'])
         
+        # 🔥🔥🔥 [关键修复] Safety Upscale: 确保输入图片至少有 crop_size 那么大
+        # 如果原图是 256，crop_size 是 512，这里直接把原图拉伸到 512，
+        # 这样后面的 RandomCrop 就会取满全图，绝对没有黑边！
+        h, w = image.shape[:2]
+        if h < self.crop_size or w < self.crop_size:
+            target_h = max(h, self.crop_size)
+            target_w = max(w, self.crop_size)
+            image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
         # 2. Augment
         augmented = self.transform(image=image, mask=mask)
         img_tensor = augmented['image'].float()
         aug_mask = augmented['mask'].numpy().astype(np.uint8)
         
         # 3. Physics & Dynamic Task
-        area_scale = (self.image_size / self.crop_size) ** 2 if self.mode == 'train' else 1.0
-        labeled_mask = label(aug_mask)
-        regions = regionprops(labeled_mask)
-        
-        _, task_type, text_suffix = self._sample_dynamic_task(aug_mask, regions)
+        area_scale = 1.0 
+        task_type = "generic"; text_suffix = "" 
+
         img_np = (img_tensor.permute(1, 2, 0).numpy()).astype(np.uint8)
+        
+        # 计算属性
         analysis = analyze_physical_attributes(img_np, aug_mask, self.attr_config, area_scale)
         visuals = analysis['visuals']
         
-        # 4. Prompt & Organ ID (安全获取)
+        # 4. Prompt & Organ ID
         json_data = item['data']
         if 'organ_idx' in json_data:
             organ_id = json_data['organ_idx']
@@ -381,7 +346,7 @@ class UniversalDataset(data.Dataset):
 
         # 5. Returns
         label_tensor = torch.from_numpy(aug_mask).long().unsqueeze(0)
-        # 🔥 [New] 使用自适应密度图生成 (DeNSe Style)
+        # 生成密度图
         gt_heatmap = generate_adaptive_density(aug_mask, image_size=(self.image_size, self.image_size))
         
         if self.mode == 'train' and random.random() < 0.2:
