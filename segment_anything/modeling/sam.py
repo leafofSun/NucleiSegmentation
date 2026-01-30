@@ -386,11 +386,8 @@ class TextSam(Sam):
             attribute_prompts=attribute_texts,
             return_loss=True
         )
-        # density_map: [B, 1, H', W'] - 像素级密度图（用于 DeNSe 式强对齐）
-        # density_features: [fused_low, fused_high] - 多尺度特征
-        # 🔥 [核心改进] 提取高频特征用于 ASR-Guided Decoder
-        high_freq_guide = density_features[0] if isinstance(density_features, (list, tuple)) and len(density_features) > 0 else None
         # high_freq_guide: [B, 192, 64, 64] - PNuRL 浅层特征（用于边界细化）
+        high_freq_guide = density_features[0] if isinstance(density_features, (list, tuple)) and len(density_features) > 0 else None
         
         # === Step 4: Dual-Prompt Learner (Implicit Context with Density Modulation) ===
         # Positive
@@ -408,34 +405,27 @@ class TextSam(Sam):
         # === Step 5: Auto-Prompt Generation (SAC - Adaptive) ===
         heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
         
-        # 🔥 [New] 准备传给 ASR 的密度图
-        # Sigmoid 归一化到 0~1，作为空间门控
+        # 准备传给 ASR 的密度图 (Sigmoid 归一化到 0~1，作为空间门控)
         density_map_proxy = torch.sigmoid(heatmap_logits[:, 0:1, :, :])  # [B, 1, 64, 64]
         
-        # 🔥 [核心改进] 动态阈值计算：基于 PNuRL 的 Size 预测
-        # 1. 获取 Size 预测类别
+        # 动态阈值计算：基于 PNuRL 的 Size 预测
         size_logits = attr_logits.get('size', None)  # [B, num_classes] 或 None
         if size_logits is not None and size_logits.numel() > 0:
-            # 获取预测的 Size 类别 (0=Small, 1=Medium, 2=Large)
             pred_size_class = torch.argmax(size_logits, dim=1)  # [B] -> 0, 1, 2
-            
-            # 2. 定义映射规则：小细胞允许靠得更近，大细胞需要更严格
-            # Small(0) -> 10.0, Medium(1) -> 15.0, Large(2) -> 20.0
             size_threshold_map = torch.tensor([10.0, 15.0, 20.0], device=device)
             adaptive_thresh = size_threshold_map[pred_size_class]  # [B]
         else:
-            # 如果 PNuRL 未输出 Size 或处于训练初期，使用固定阈值
             batch_size = image_embeddings.shape[0]
             adaptive_thresh = torch.tensor(15.0, device=device).expand(batch_size)
         
-        # 智能决定是否限制点数: 训练时限制(50)，验证时不限制
+        # ⚠️ [参数复原] 恢复为你原始的 50，不做擅自修改
         limit_points = 50 if self.training else None
 
         prompts_list = self.prompt_generator.generate_adaptive_prompts(
             heatmap_logits, 
             threshold=0.3,       
             k_neighbors=3,       
-            dense_dist_thresh=adaptive_thresh,  # 🔥 传入动态阈值 Tensor
+            dense_dist_thresh=adaptive_thresh,
             max_points=limit_points
         )
         
@@ -451,38 +441,35 @@ class TextSam(Sam):
             # 获取当前样本的 Prompt 数据
             prompt_data = prompts_list[i]
             
-            # 🔥 [修复] 处理无点情况，防止 DDP 死锁
+            # 获取正确的目标尺寸 (Original Size, e.g., 512x512)
+            target_h, target_w = batched_input[i]["original_size"]
+            
+            # 处理 density_map (PNuRL输出的像素级密度图，用于一致性Loss和输出)
+            density_map_i = None
+            if density_map is not None:
+                density_map_raw = density_map[i]  # [1, H', W']
+                # 如果尺寸不对，插值到 original_size
+                if density_map_raw.shape[-2:] != (target_h, target_w):
+                    density_map_i = F.interpolate(
+                        density_map_raw.unsqueeze(0), 
+                        size=(target_h, target_w), 
+                        mode='bilinear', 
+                        align_corners=False
+                    ).squeeze(0)  # [1, target_h, target_w]
+                else:
+                    density_map_i = density_map_raw
+
+            # 处理无点情况
             if not prompt_data["has_points"]:
-                # ✅ 正确写法：利用 image_embeddings 构造 dummy，保持计算图连接
-                # 0 * sum() 既保留了连接，又不会产生实际梯度影响
                 dummy_connection = refined_image_embeddings[i].sum() * 0.0
                 
-                # 获取正确的目标尺寸 (Original Size, e.g., 512x512)
-                target_h, target_w = batched_input[i]["original_size"]
-                
-                # 🔥 处理 density_map
-                density_map_i = None
-                if density_map is not None:
-                    density_map_raw = density_map[i]  # [1, H', W']
-                    # 如果尺寸不对，插值到 original_size
-                    if density_map_raw.shape[-2:] != (target_h, target_w):
-                        density_map_i = F.interpolate(
-                            density_map_raw.unsqueeze(0), 
-                            size=(target_h, target_w), 
-                            mode='bilinear', 
-                            align_corners=False
-                        ).squeeze(0)  # [1, target_h, target_w]
-                    else:
-                        density_map_i = density_map_raw
-                    
-                    # 加上 dummy_connection (虽然 density_map 本身就在图里，加这个双保险)
+                # 加上 dummy_connection
+                if density_map_i is not None:
                     density_map_i = density_map_i + dummy_connection
                 
                 outputs.append({
-                    # 🔥 [修正] 使用 (target_h, target_w) 而不是 input_size (1024)
                     "masks": (torch.zeros((1, 1, target_h, target_w), device=device, dtype=torch.float32) - 100.0) + dummy_connection,
                     "iou_predictions": torch.zeros((1, 1), device=device) + dummy_connection,
-                    # low_res_logits 保持 256x256 是对的，这是 Decoder 的原始输出尺寸
                     "low_res_logits": (torch.zeros((1, 1, 256, 256), device=device) - 100.0) + dummy_connection,
                     "heatmap_logits": heatmap_logits[i].unsqueeze(0),
                     "attr_logits": attr_logits,
@@ -498,46 +485,59 @@ class TextSam(Sam):
             # 缩放坐标到 1024
             point_coords = (point_coords * scale_factor) + (scale_factor * 0.5)
             
-            # 喂给 Prompt Encoder (points=(N_cells, K+1, 2))
-            sparse_embeddings, dense_embeddings = self.prompt_encoder(
-                points=(point_coords, point_labels),
-                boxes=None,
-                masks=None,
-            )
-            
-            # 扩展 Image Embedding 以匹配 N_cells
-            # refined_image_embeddings[i]: [256, 64, 64] -> [1, 256, 64, 64] -> [N_cells, 256, 64, 64]
+            # 🔥🔥🔥 [核心显存优化: Chunked Decoding (微批次解码)] 🔥🔥🔥
             num_cells = point_coords.shape[0]
-            curr_img_embed = refined_image_embeddings[i].unsqueeze(0).expand(num_cells, -1, -1, -1)
+            chunk_size = 16  # 每次处理 16 个点，确保 5090 显存不爆，但保持 50 点的总量
+            chunk_masks = []
+            chunk_ious = []
             
-            # 🔥 [核心改进] 扩展高频特征以匹配 N_cells（用于 ASR-Guided Decoder）
-            curr_high_freq = None
-            if high_freq_guide is not None:
-                # high_freq_guide[i]: [192, 64, 64] -> [1, 192, 64, 64] -> [N_cells, 192, 64, 64]
-                curr_high_freq = high_freq_guide[i].unsqueeze(0).expand(num_cells, -1, -1, -1)
+            # 分批次循环
+            for start_idx in range(0, num_cells, chunk_size):
+                end_idx = min(start_idx + chunk_size, num_cells)
+                
+                # 1. 切片点和标签
+                sub_coords = point_coords[start_idx:end_idx] # [chunk, 2]
+                sub_labels = point_labels[start_idx:end_idx] # [chunk]
+                current_batch = sub_coords.shape[0]
+
+                # 2. 局部扩展 Image Embedding (只扩展到 chunk大小)
+                sub_img_embed = refined_image_embeddings[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
+                
+                # 3. 局部扩展高频特征 (ASR Guide)
+                sub_high_freq = None
+                if high_freq_guide is not None:
+                    sub_high_freq = high_freq_guide[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
+                
+                # 4. 局部扩展密度图 (Gating 用)
+                sub_density_map = density_map_proxy[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
+
+                # 5. 编码 Prompt (针对当前 chunk)
+                sparse, dense = self.prompt_encoder(
+                    points=(sub_coords, sub_labels),
+                    boxes=None,
+                    masks=None,
+                )
+
+                # 6. 解码 (显存占用仅为 chunk_size=16 的量)
+                sub_mask, sub_iou = self.mask_decoder(
+                    image_embeddings=sub_img_embed,
+                    image_pe=self.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse,
+                    dense_prompt_embeddings=dense,
+                    multimask_output=multimask_output,
+                    high_freq_features=sub_high_freq,
+                    density_map=sub_density_map,
+                )
+                chunk_masks.append(sub_mask)
+                chunk_ious.append(sub_iou)
             
-            # 🔥 [New] 准备当前样本的密度图
-            # density_map_proxy: [B, 1, 64, 64] -> 取第 i 个样本
-            curr_density_map = density_map_proxy[i].unsqueeze(0)  # [1, 1, 64, 64]
-            # 需要扩展到 N_cells 维度
-            curr_density_map = curr_density_map.expand(num_cells, -1, -1, -1)  # [N_cells, 1, 64, 64]
-            
-            # 解码（注入高频特征用于边界细化，同时传入密度图）
-            low_res_masks, iou_predictions = self.mask_decoder(
-                image_embeddings=curr_img_embed,
-                image_pe=self.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=multimask_output,
-                high_freq_features=curr_high_freq,  # 🔥 注入高频特征
-                density_map=curr_density_map,  # 🔥 [New] 传入密度图
-            )
-            
+            # 7. 拼接回完整结果 (大小: [50, 1, 256, 256])
+            low_res_masks = torch.cat(chunk_masks, dim=0) 
+            iou_predictions = torch.cat(chunk_ious, dim=0) 
+
             # === Step 7: 后处理 & 聚合 ===
-            # low_res_masks: [N_cells, 1, 256, 256] -> 合并成单图 [1, 1, 256, 256]
+            # 合并成单图 [1, 1, 256, 256]
             merged_logits, _ = torch.max(low_res_masks, dim=0, keepdim=True) 
-            
-            # IoU 聚合: 取平均
             merged_iou = torch.mean(iou_predictions, dim=0, keepdim=True)
 
             mask_post = self.postprocess_masks(
@@ -546,25 +546,15 @@ class TextSam(Sam):
                 original_size=batched_input[i]["original_size"],
             )
             
-            # 🔥 [新增] 将 density_map 调整到与 mask 相同的大小
-            # mask_post 的大小是 original_size，density_map 需要匹配
-            target_h, target_w = mask_post.shape[-2:]
-            density_map_i = density_map[i]  # [1, H', W']
-            if density_map_i.shape[-2:] != (target_h, target_w):
-                density_map_i = F.interpolate(
-                    density_map_i.unsqueeze(0), 
-                    size=(target_h, target_w), 
-                    mode='bilinear', 
-                    align_corners=False
-                ).squeeze(0)  # [1, target_h, target_w]
-            
+            # density_map_i 已经在上面处理过了，不需要再 interpolate mask_post 的尺寸
+
             outputs.append({
-                "masks": mask_post, # ✅ 确认：返回 Float Logits
+                "masks": mask_post,
                 "iou_predictions": merged_iou,
                 "low_res_logits": merged_logits,
                 "heatmap_logits": heatmap_logits[i].unsqueeze(0),
-                "attr_logits": attr_logits,  # 传递属性 logits（包含 density 分类）
-                "density_map": density_map_i,  # 🔥 [新增] 像素级密度图（用于 DeNSe 式强对齐）
+                "attr_logits": attr_logits,
+                "density_map": density_map_i,
                 "pnurl_loss": pnurl_loss
             })
             

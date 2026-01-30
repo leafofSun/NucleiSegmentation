@@ -58,7 +58,7 @@ def parse_args():
     parser.add_argument("--data_path", type=str, default="data/PanNuke", help="Root directory of dataset")
     parser.add_argument("--knowledge_path", type=str, default="data/PanNuke/medical_knowledge.json", help="Path to KB")
     
-    # 🔥 SOTA 设置：原生 512
+    # 🔥 SOTA 设置：原生 512 / 1024
     parser.add_argument("--image_size", type=int, default=512, help="SAM input resolution")
     parser.add_argument("--crop_size", type=int, default=512, help="Patch Size") 
     parser.add_argument("--mask_num", type=int, default=1, help="Number of masks per proposal")
@@ -82,10 +82,9 @@ def parse_args():
     parser.add_argument("--heatmap_weight", type=float, default=1.0)
     parser.add_argument("--attr_weight", type=float, default=0.1) 
     
-    # 🔥 [修改 1] 降低辅助任务权重，防止梯度干扰主任务
-    parser.add_argument("--consistency_weight", type=float, default=0.1)  # 原 1.0 -> 0.1
-    parser.add_argument("--consistency_warmup_epochs", type=int, default=50) # 原 20 -> 50 (延后介入)
-    parser.add_argument("--density_map_weight", type=float, default=0.5)  # 原 2.0 -> 0.5
+    parser.add_argument("--consistency_weight", type=float, default=0.1) 
+    parser.add_argument("--consistency_warmup_epochs", type=int, default=50) 
+    parser.add_argument("--density_map_weight", type=float, default=0.5) 
 
     # 🔥🔥🔥 [新增] 断点续训参数
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from")
@@ -167,7 +166,7 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
             
             patch = image[:, y1:y1+patch_size, x1:x1+patch_size]
             
-            # 安全逻辑：如果 patch 小于 target，做插值 (通常现在都是 512->512)
+            # 安全逻辑
             if patch.shape[-1] != target_size:
                 patch_resized = F.interpolate(patch.unsqueeze(0), size=(target_size, target_size), mode='bilinear', align_corners=False)
             else:
@@ -213,7 +212,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         images = batched_input['image']
         labels = batched_input['label']
 
-        # 🔥 [安全逻辑] 确保输入是 args.image_size (512)
+        # 🔥 [安全逻辑]
         if images.shape[-1] != args.image_size:
              images = F.interpolate(images, size=(args.image_size, args.image_size), mode='bilinear', align_corners=False)
              labels = F.interpolate(labels.float(), size=(args.image_size, args.image_size), mode='nearest').long()
@@ -315,20 +314,24 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             final_loss = loss_batch / len(images)
             final_loss = final_loss / args.accumulation_steps
 
+        # 1. Backward (每一步都做)
         if scaler:
             scaler.scale(final_loss).backward()
-            # 🔥 [新增 2] 梯度裁剪：防止梯度爆炸导致的指标崩塌
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         else:
             final_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
+        # 2. Optimizer Step (只在累积点做)
+        # 🔥🔥🔥 [修复] unscale_ 逻辑
         if (batch_idx + 1) % args.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
             if scaler:
-                scaler.step(optimizer); scaler.update()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
             else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+            
             optimizer.zero_grad()
 
         current_loss_val = final_loss.item() * args.accumulation_steps
@@ -349,7 +352,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
     return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses), np.mean(attr_losses)
 
 # ==================================================================================================
-# 4. Validation Logic (🔥 极速验证: Stride = Patch Size)
+# 4. Validation Logic (🔥 极速验证: 40% 抽样 + Shuffle)
 # ==================================================================================================
 @torch.no_grad()
 def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
@@ -360,19 +363,26 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
     val_results = {k: [] for k in args.metrics}
     visualize_done = False
     
-    if rank == 0: pbar = tqdm(val_loader, desc=f"Ep {epoch+1} Val")
+    # 🔥 [优化 1] 计算 40% 的截断点
+    total_val_batches = len(val_loader)
+    limit_batches = int(total_val_batches * 0.4)
+    if limit_batches < 1: limit_batches = 1
+    
+    if rank == 0: pbar = tqdm(val_loader, desc=f"Ep {epoch+1} Val (40%)", total=limit_batches)
     else: pbar = val_loader
     
-    # DDP 脱壳
     eval_model = model.module if hasattr(model, 'module') else model
     
     for batch, batched_input in enumerate(pbar):
+        # 🔥 [优化 2] 达到 40% 立即停止
+        if batch >= limit_batches:
+            break
+
         batched_input = to_device(batched_input, args.device)
         images = batched_input['image'] 
         labels = batched_input['label'].cpu().numpy()
         organ_ids = batched_input.get('organ_id', None)
 
-        # 安全逻辑: 确保验证集也是 512
         if images.shape[-1] != args.image_size:
              images = F.interpolate(images, size=(args.image_size, args.image_size), mode='bilinear', align_corners=False)
 
@@ -382,7 +392,6 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                 val = organ_ids[i]
                 curr_organ_id = val.item() if isinstance(val, torch.Tensor) else val
             
-            # 🔥 [修改 3] 给验证集一点重叠 (25% Overlap)，消除边界伪影，提升 AJI
             infer_stride = int(args.crop_size * 0.75) 
             
             with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -391,7 +400,7 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                     organ_id=curr_organ_id, 
                     patch_size=args.crop_size, 
                     target_size=args.image_size, 
-                    stride=infer_stride,  # 使用带重叠的 stride
+                    stride=infer_stride, 
                     device=args.device
                 )
             
@@ -457,19 +466,21 @@ def main(args):
         logger = get_logger(os.path.join(text_log_dir, f"{args.run_name}_{timestamp}.log"))
         writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
         logger.info(f"🚀 [Start] MP-SAM Stable (Size: {args.image_size})")
-        logger.info(f"   GPUs: {world_size}, Batch/GPU: {args.batch_size}, Resume: {args.resume if args.resume else 'No'}")
+        logger.info(f"    GPUs: {world_size}, Batch/GPU: {args.batch_size}, Resume: {args.resume if args.resume else 'No'}")
     else: logger = None; writer = None
 
     train_dataset = UniversalDataset(data_root=args.data_path, knowledge_path=args.knowledge_path, image_size=args.image_size, crop_size=args.crop_size, mode='train', prompt_mode='dynamic')
     val_dataset = UniversalDataset(data_root=args.data_path, knowledge_path=args.knowledge_path, image_size=args.image_size, crop_size=args.crop_size, mode='test', prompt_mode='generic')
     
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False) if world_size > 1 else None
+    
+    # 🔥 [优化 3] 验证集开启 Shuffle，保证 40% 抽样具有代表性
+    val_sampler = DistributedSampler(val_dataset, shuffle=True) if world_size > 1 else None
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), 
                               num_workers=8, collate_fn=stack_dict_batched, pin_memory=True, sampler=train_sampler,
                               persistent_workers=True, prefetch_factor=2)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, 
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=(val_sampler is None), 
                             num_workers=4, collate_fn=stack_dict_batched, pin_memory=True, sampler=val_sampler,
                             persistent_workers=True, prefetch_factor=2)
     
@@ -523,16 +534,16 @@ def main(args):
     criterion = FocalDiceloss_IoULoss(weight=20.0, iou_scale=1.0, ignore_index=255)
     scaler = GradScaler() if args.use_amp else None
     
-    # 🔥 [修改 4] 学习率策略改为 ReduceLROnPlateau
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-6)
 
     best_aji = 0.0; best_dice = 0.0
     
-    # 🔥 从 args.start_epoch 开始循环
     for epoch in range(args.start_epoch, args.epochs):
         if train_sampler: train_sampler.set_epoch(epoch)
+        # 🔥 [优化 4] 验证集也要 Set Epoch，保证每次随机抽样不同数据
+        if val_sampler: val_sampler.set_epoch(epoch)
+        
         loss, m_loss, h_loss, a_loss = train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank)
         val_res = validate_one_epoch(args, model, val_loader, epoch, writer, rank)
         
@@ -547,14 +558,6 @@ def main(args):
                 torch.save(raw_model.state_dict(), best_model_path)
                 logger.info(f"⭐ New Best AJI! ({best_aji:.4f}) -> Model Saved")
                 
-        # 🔥 [修改 5] Scheduler Step 传入监控指标 (AJI)
-        # 获取当前 Epoch 的验证 AJI (所有进程使用 rank 0 的结果，或者广播)
-        # 这里简化：每个进程都跑了 validate，val_res 是 synced 或者本地的近似
-        # ReduceLROnPlateau 不需要全局同步 step，只要 rank 0 打印即可
-        # 为保险起见，建议 val_res['mAJI'] 是 reduce 后的结果 (当前 validate_one_epoch 返回的是本地的，DDP 下应在外部 reduce)
-        # 但在 validate_one_epoch 内部没有做 all_reduce，这是一个潜在小问题。
-        # 考虑到当前代码架构，rank 0 会负责保存模型，scheduler 在 rank 0 step 即可 (optimizer state 需要同步吗？DDP 会处理)
-        # 简单起见，所有进程都 step，传入各自的 aji (期望分布均匀)
         val_aji = val_res.get('mAJI', 0.0)
         scheduler.step(val_aji)
 

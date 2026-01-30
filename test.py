@@ -105,7 +105,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--save_pred", action='store_true')
     parser.add_argument("--use_watershed", action='store_true', default=True)
-    parser.add_argument("--encoder_adapter", action='store_true', default=True)
+    parser.add_argument("--encoder_adapter", action='store_true', help="Enable Adapter")
     return parser.parse_args()
 
 def post_process_watershed(prob_map, threshold=0.5, min_size=20, min_distance=5):
