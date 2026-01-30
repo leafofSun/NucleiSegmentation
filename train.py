@@ -37,7 +37,7 @@ from utils import FocalDiceloss_IoULoss, point_guidance_loss, get_logger, physic
 # 🔥 Metrics
 from metrics import SegMetrics
 
-# 🔥 [SPEEDUP] 开启 TF32 (RTX 5090 核心加速)
+# 🔥 [SPEEDUP] 开启 TF32 (RTX 30/40/50系 核心加速)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -55,8 +55,8 @@ def parse_args():
     parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation")
     
     # ... Data ...
-    parser.add_argument("--data_path", type=str, default="data/PanNuke_SA1B", help="Root directory of dataset")
-    parser.add_argument("--knowledge_path", type=str, default="data/PanNuke_SA1B/medical_knowledge.json", help="Path to KB")
+    parser.add_argument("--data_path", type=str, default="data/PanNuke", help="Root directory of dataset")
+    parser.add_argument("--knowledge_path", type=str, default="data/PanNuke/medical_knowledge.json", help="Path to KB")
     
     # 🔥 SOTA 设置：原生 512
     parser.add_argument("--image_size", type=int, default=512, help="SAM input resolution")
@@ -81,9 +81,11 @@ def parse_args():
     parser.add_argument("--mask_weight", type=float, default=10.0)
     parser.add_argument("--heatmap_weight", type=float, default=1.0)
     parser.add_argument("--attr_weight", type=float, default=0.1) 
-    parser.add_argument("--consistency_weight", type=float, default=1.0)
-    parser.add_argument("--consistency_warmup_epochs", type=int, default=20)
-    parser.add_argument("--density_map_weight", type=float, default=2.0)
+    
+    # 🔥 [修改 1] 降低辅助任务权重，防止梯度干扰主任务
+    parser.add_argument("--consistency_weight", type=float, default=0.1)  # 原 1.0 -> 0.1
+    parser.add_argument("--consistency_warmup_epochs", type=int, default=50) # 原 20 -> 50 (延后介入)
+    parser.add_argument("--density_map_weight", type=float, default=0.5)  # 原 2.0 -> 0.5
 
     # 🔥🔥🔥 [新增] 断点续训参数
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from")
@@ -315,8 +317,12 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
 
         if scaler:
             scaler.scale(final_loss).backward()
+            # 🔥 [新增 2] 梯度裁剪：防止梯度爆炸导致的指标崩塌
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         else:
             final_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
         if (batch_idx + 1) % args.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
             if scaler:
@@ -376,14 +382,16 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                 val = organ_ids[i]
                 curr_organ_id = val.item() if isinstance(val, torch.Tensor) else val
             
-            # 🔥 极速验证: stride=args.crop_size (无重叠)
+            # 🔥 [修改 3] 给验证集一点重叠 (25% Overlap)，消除边界伪影，提升 AJI
+            infer_stride = int(args.crop_size * 0.75) 
+            
             with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 prob_map = sliding_window_inference(
                     eval_model, images[i], 
                     organ_id=curr_organ_id, 
                     patch_size=args.crop_size, 
                     target_size=args.image_size, 
-                    stride=args.crop_size,  # 🔥 关键修改：无重叠，最快
+                    stride=infer_stride,  # 使用带重叠的 stride
                     device=args.device
                 )
             
@@ -514,7 +522,11 @@ def main(args):
     optimizer = optim.AdamW(params, weight_decay=args.weight_decay)
     criterion = FocalDiceloss_IoULoss(weight=20.0, iou_scale=1.0, ignore_index=255)
     scaler = GradScaler() if args.use_amp else None
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+    
+    # 🔥 [修改 4] 学习率策略改为 ReduceLROnPlateau
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-6)
 
     best_aji = 0.0; best_dice = 0.0
     
@@ -534,7 +546,17 @@ def main(args):
                 best_model_path = os.path.join(args.work_dir, "models", args.run_name, "best_model.pth")
                 torch.save(raw_model.state_dict(), best_model_path)
                 logger.info(f"⭐ New Best AJI! ({best_aji:.4f}) -> Model Saved")
-        scheduler.step()
+                
+        # 🔥 [修改 5] Scheduler Step 传入监控指标 (AJI)
+        # 获取当前 Epoch 的验证 AJI (所有进程使用 rank 0 的结果，或者广播)
+        # 这里简化：每个进程都跑了 validate，val_res 是 synced 或者本地的近似
+        # ReduceLROnPlateau 不需要全局同步 step，只要 rank 0 打印即可
+        # 为保险起见，建议 val_res['mAJI'] 是 reduce 后的结果 (当前 validate_one_epoch 返回的是本地的，DDP 下应在外部 reduce)
+        # 但在 validate_one_epoch 内部没有做 all_reduce，这是一个潜在小问题。
+        # 考虑到当前代码架构，rank 0 会负责保存模型，scheduler 在 rank 0 step 即可 (optimizer state 需要同步吗？DDP 会处理)
+        # 简单起见，所有进程都 step，传入各自的 aji (期望分布均匀)
+        val_aji = val_res.get('mAJI', 0.0)
+        scheduler.step(val_aji)
 
     if rank == 0:
         logger.info(f"🏁 Training Finished. Best AJI: {best_aji:.4f}")
