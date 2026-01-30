@@ -25,21 +25,37 @@ try:
 except ImportError:
     pass
 
-# 🔥 [修正] ID_TO_ORGAN 必须是 ID (Int) -> Name (Str)
+# 器官 ID 配置
 ID_TO_ORGAN = {
-    # --- PanNuke 19 类 ---
     0: "Adrenal_gland", 1: "Bile-duct", 2: "Bladder", 3: "Breast", 
     4: "Cervix", 5: "Colon", 6: "Esophagus", 7: "HeadNeck", 
     8: "Kidney", 9: "Liver", 10: "Lung", 11: "Ovarian", 
     12: "Pancreatic", 13: "Prostate", 14: "Skin", 15: "Stomach", 
     16: "Testis", 17: "Thyroid", 18: "Uterus",
-    # --- 补充 ---
     19: "Brain", 20: "Generic"
 }
-
-# 🔥 [新增] 反向字典
 ORGAN_TO_ID = {v.lower().replace("-", "_"): k for k, v in ID_TO_ORGAN.items()}
 ORGAN_TO_ID.update({"bile_duct": 1, "head_neck": 7, "adrenal gland": 0})
+
+# 🔥 权重适配 (必须保留，用于适配不同分辨率的权重文件)
+def resize_pos_embed(state_dict, model_state_dict):
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k in model_state_dict:
+            if v.shape != model_state_dict[k].shape:
+                if 'pos_embed' in k:
+                    v = v.permute(0, 3, 1, 2)
+                    v = F.interpolate(v, size=model_state_dict[k].shape[1:3], mode='bicubic', align_corners=False)
+                    v = v.permute(0, 2, 3, 1)
+                elif 'rel_pos' in k:
+                    v = v.unsqueeze(0).permute(0, 2, 1)
+                    target_len = model_state_dict[k].shape[0]
+                    v = F.interpolate(v, size=target_len, mode='linear', align_corners=False)
+                    v = v.permute(0, 2, 1).squeeze(0)
+            new_state_dict[k] = v
+        else:
+            new_state_dict[k] = v
+    return new_state_dict
 
 class OrganPredictor:
     def __init__(self, device):
@@ -50,7 +66,6 @@ class OrganPredictor:
         self.valid_ids = sorted(list(ID_TO_ORGAN.keys())) 
         self.organs = [ID_TO_ORGAN[i] for i in self.valid_ids]
         self.templates = [f"A histology image of {org} tissue." for org in self.organs]
-        
         with torch.no_grad():
             text_inputs = clip.tokenize(self.templates).to(device)
             self.text_features = self.model.encode_text(text_inputs)
@@ -65,7 +80,6 @@ class OrganPredictor:
             image_features /= image_features.norm(dim=-1, keepdim=True)
             similarity = (100.0 * image_features @ self.text_features.T).softmax(dim=-1)
             values, indices = similarity[0].topk(1)
-            
         best_list_idx = indices.item()
         confidence = values.item()
         return self.organs[best_list_idx], self.valid_ids[best_list_idx], confidence
@@ -73,11 +87,17 @@ class OrganPredictor:
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work_dir", type=str, default="workdir")
-    parser.add_argument("--run_name", type=str, default="run_test") 
-    parser.add_argument("--text_prompt", type=str, default=None, help="Custom Class prompt override")
-    parser.add_argument("--patch_size", type=int, default=512)
-    parser.add_argument("--image_size", type=int, default=512)
-    parser.add_argument("--stride", type=int, default=128)
+    parser.add_argument("--run_name", type=str, default="universal_test") 
+    parser.add_argument("--text_prompt", type=str, default=None)
+    
+    # 🔥🔥🔥 核心定义 🔥🔥🔥
+    # patch_size: 在原图上切多大的窗口 (例如 PanNuke 原图 256，WSI 可能 1024)
+    parser.add_argument("--patch_size", type=int, default=256, help="Window size to crop from original image")
+    # image_size: 缩放成多大喂给模型 (例如模型是 512 训练的)
+    parser.add_argument("--image_size", type=int, default=512, help="Input size expected by the model")
+    # stride: 滑窗步长 (重叠控制)
+    parser.add_argument("--stride", type=int, default=128, help="Sliding window stride")
+    
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument("--data_path", type=str, default="data/PanNuke/test") 
     parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'])
@@ -88,39 +108,27 @@ def parse_args():
     parser.add_argument("--encoder_adapter", action='store_true', default=True)
     return parser.parse_args()
 
-def analyze_predictions(pred_mask):
-    labeled = label(pred_mask)
-    regions = regionprops(labeled)
-    if not regions: return 0.0, 0.0, 0
-    areas = [r.area for r in regions]
-    roundnesses = [(4 * np.pi * r.area) / (r.perimeter ** 2) if r.perimeter > 0 else 0 for r in regions]
-    return np.mean(areas), np.mean(roundnesses), len(regions)
-
-# 🔥 [新增] 分水岭后处理 (AJI 提升的关键)
 def post_process_watershed(prob_map, threshold=0.5, min_size=20, min_distance=5):
     binary_mask = prob_map > threshold
     if not np.any(binary_mask): return np.zeros_like(binary_mask, dtype=np.int32)
-
     distance = ndimage.distance_transform_edt(binary_mask)
-    # 稍微调小 min_distance 适应 256px 的小细胞
     local_maxi = peak_local_max(distance, min_distance=min_distance, labels=binary_mask)
-    
     local_maxi_mask = np.zeros_like(prob_map, dtype=bool)
     local_maxi_mask[tuple(local_maxi.T)] = True
     markers = label(local_maxi_mask)
-    
     labels = watershed(-distance, markers, mask=binary_mask)
-    
     if min_size > 0:
         labels = remove_small_objects(labels, min_size=min_size)
         labels = label(labels > 0)
-        
     return labels.astype(np.int32)
 
+# 🔥🔥🔥 通用滑窗推理函数 🔥🔥🔥
+# 逻辑：原图 -> Padding -> 切Patch -> Resize(image_size) -> 预测 -> ResizeBack(patch_size) -> 拼回原图
 def sliding_window_inference(model, image, device, patch_size, image_size, stride, 
                              text_prompt, organ_id, attribute_text=None, filename=None):
     h, w = image.shape[:2]
-    # Padding 逻辑 (保留你的原始逻辑，这很重要)
+    
+    # 1. Padding 保证能被切尽 (基于 patch_size)
     pad_h = (patch_size - h % patch_size) % patch_size
     pad_w = (patch_size - w % patch_size) % patch_size
     image_pad = cv2.copyMakeBorder(image, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
@@ -129,10 +137,14 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
     prob_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
     count_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
     
-    y_steps = list(range(0, h_pad - patch_size + 1, stride))
-    if (h_pad - patch_size) % stride != 0: y_steps.append(h_pad - patch_size)
-    x_steps = list(range(0, w_pad - patch_size + 1, stride))
-    if (w_pad - patch_size) % stride != 0: x_steps.append(w_pad - patch_size)
+    # 2. 生成滑窗坐标
+    # 注意：步长不能大于 patch_size
+    real_stride = min(stride, patch_size)
+    
+    y_steps = list(range(0, h_pad - patch_size + 1, real_stride))
+    if (h_pad - patch_size) % real_stride != 0: y_steps.append(h_pad - patch_size)
+    x_steps = list(range(0, w_pad - patch_size + 1, real_stride))
+    if (w_pad - patch_size) % real_stride != 0: x_steps.append(w_pad - patch_size)
     
     if attribute_text is None: attribute_text = ""
 
@@ -140,9 +152,18 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
     with torch.no_grad():
         for y in y_steps:
             for x in x_steps:
+                # A. 裁剪 Patch (物理尺寸)
                 patch = image_pad[y:y+patch_size, x:x+patch_size, :]
-                patch_large = cv2.resize(patch, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-                img_tensor = torch.from_numpy(patch_large).permute(2, 0, 1).float().to(device)
+                
+                # B. Resize 到模型输入尺寸 (image_size)
+                # 例如：PanNuke 256 -> 512 (放大)
+                # 例如：WSI 1024 -> 512 (缩小)
+                if patch_size != image_size:
+                    patch_input = cv2.resize(patch, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+                else:
+                    patch_input = patch
+                
+                img_tensor = torch.from_numpy(patch_input).permute(2, 0, 1).float().to(device)
                 
                 input_sample = [{
                     'image': img_tensor,
@@ -152,23 +173,30 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
                     'attribute_text': attribute_text 
                 }]
                 
+                # C. 预测
                 outputs = model(input_sample, multimask_output=True)
                 out = outputs[0]
-                scores = out['iou_predictions'].squeeze()
-                best_idx = torch.argmax(scores).item()
-                logits_large = out['masks'][0, best_idx, :, :] 
+                best_idx = torch.argmax(out['iou_predictions']).item()
+                logits = out['masks'][0, best_idx, :, :] # [image_size, image_size]
                 
-                logits_large = logits_large.unsqueeze(0).unsqueeze(0)
-                logits_small = F.interpolate(logits_large, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
-                prob_small = torch.sigmoid(logits_small).squeeze().cpu().numpy()
+                # D. Resize Back 到物理尺寸 (patch_size)
+                # 这步很关键，保证拼回去的时候像素是对齐的
+                logits = logits.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+                if patch_size != image_size:
+                    logits_orig = F.interpolate(logits, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
+                else:
+                    logits_orig = logits
                 
-                prob_map_full[y:y+patch_size, x:x+patch_size] += prob_small
+                prob_patch = torch.sigmoid(logits_orig).squeeze().cpu().numpy()
+                
+                # E. 累加到全图
+                prob_map_full[y:y+patch_size, x:x+patch_size] += prob_patch
                 count_map_full[y:y+patch_size, x:x+patch_size] += 1.0
                 
     count_map_full[count_map_full == 0] = 1.0
     avg_prob = prob_map_full / count_map_full
     
-    # 🔥 [重要] 改回你的原始裁剪逻辑 (直接取前 h, w)，修复黑边问题
+    # 3. 裁剪回原始图片尺寸
     return avg_prob[:h, :w]
 
 def get_organ_from_json(img_path):
@@ -183,30 +211,10 @@ def get_organ_from_json(img_path):
                 if key in ORGAN_TO_ID: return ID_TO_ORGAN[ORGAN_TO_ID[key]], ORGAN_TO_ID[key]
                 for k_name, v_id in ORGAN_TO_ID.items():
                     if k_name in key or key in k_name: return ID_TO_ORGAN[v_id], v_id
-        except Exception as e:
-            print(f"❌ Error reading JSON {json_path}: {e}")
+        except: pass
     return None, None
 
 def load_filtered_gt(img_path, attr_data, target_tag=None):
-    # (前面逻辑不变...)
-    base_name = os.path.basename(img_path)
-    filename_key = None
-    if base_name in attr_data: filename_key = base_name
-    else:
-        for k in attr_data.keys():
-            if base_name in k or k in base_name:
-                filename_key = k
-                break
-    
-    valid_ids = None 
-    if filename_key and filename_key in attr_data:
-        instances = attr_data[filename_key]
-        if target_tag and target_tag not in ["Generic", "Cell nuclei", "Auto_Organ", None]:
-            valid_ids = set()
-            for inst in instances:
-                tags = [t.lower() for t in inst.get('tags', [])]
-                if target_tag.split()[0].lower() in tags: valid_ids.add(inst['id'])
-    
     json_path = os.path.splitext(img_path)[0] + ".json"
     if not os.path.exists(json_path):
         possible_json = img_path.rsplit('.', 1)[0] + ".json"
@@ -222,31 +230,22 @@ def load_filtered_gt(img_path, attr_data, target_tag=None):
         if temp_img is None: return None
         h, w = temp_img.shape[:2]
         
-        # 🔥 [修改 1] 使用 int32 存储实例 ID
         mask = np.zeros((h, w), dtype=np.int32)
-        
         for idx, ann in enumerate(anns):
-            if valid_ids is not None and idx not in valid_ids: continue
-            if 'segmentation' not in ann: continue
-            seg = ann['segmentation']
-            
-            # 🔥 [修改 2] 填入 idx+1 
+            seg = ann.get('segmentation', [])
             inst_id = idx + 1
-
-            if isinstance(seg, dict) and 'counts' in seg: 
-                # (RLE logic skipped for brevity, similar to before but with inst_id)
-                pass 
-            elif isinstance(seg, list):
+            if isinstance(seg, list):
                 for poly in seg:
                     pts = np.array(poly, dtype=np.int32).reshape((-1, 2))
                     cv2.fillPoly(mask, [pts], inst_id)
         return mask
-    except Exception as e:
-        print(f"⚠️ Error loading GT: {e}")
-        return None
+    except: return None
 
 def main(args):
+    # 初始化 SAM (注意这里 img_size 要设为模型实际大小)
     vanilla_sam = sam_model_registry[args.model_type](args)
+    vanilla_sam.image_encoder.img_size = args.image_size 
+
     model = TextSam(
         image_encoder=vanilla_sam.image_encoder,
         prompt_encoder=vanilla_sam.prompt_encoder,
@@ -256,8 +255,11 @@ def main(args):
     ).to(args.device)
     
     if os.path.exists(args.checkpoint):
-        checkpoint = torch.load(args.checkpoint, map_location=args.device)
-        model.load_state_dict(checkpoint.get('model', checkpoint), strict=False)
+        checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
+        state_dict = checkpoint.get('model', checkpoint)
+        # 权重自适应 (无论权重是 256 还是 512，都适配当前 args.image_size)
+        state_dict = resize_pos_embed(state_dict, model.state_dict())
+        model.load_state_dict(state_dict, strict=False)
         print(f"✅ Loaded checkpoint: {args.checkpoint}")
     else:
         print(f"❌ Checkpoint not found")
@@ -276,7 +278,7 @@ def main(args):
     if args.save_pred: os.makedirs(save_dir, exist_ok=True)
 
     print('*'*60)
-    print(f"🚀 Running Inference: {args.run_name}")
+    print(f"🚀 Inference Config: Window={args.patch_size} -> Model={args.image_size}")
     print('*'*60)
 
     pbar = tqdm(image_files)
@@ -306,15 +308,16 @@ def main(args):
         attribute_prompt_text = "" 
         pbar.write(f"🖼️  {filename} | {log_msg} -> Class: '{class_prompt_text}' | Attr: [AUTO]")
 
-        # 🔥 [恢复] 传入原始 Image (256)，让 sliding_window 做 padding
+        # 🔥 通用推理
         pred_prob = sliding_window_inference(
             model, image_rgb, args.device, 
-            patch_size=args.patch_size, image_size=args.image_size, stride=args.stride,
+            patch_size=args.patch_size,  # 切多大 (如 256)
+            image_size=args.image_size,  # 喂多大 (如 512)
+            stride=args.stride,          # 步长 (如 128)
             text_prompt=class_prompt_text, organ_id=current_organ_id, 
             attribute_text=attribute_prompt_text, filename=filename
         )
         
-        # 🔥 [后处理] 
         if args.use_watershed:
             pred_mask = post_process_watershed(pred_prob, threshold=0.5)
         else:
@@ -332,8 +335,7 @@ def main(args):
             vis = image.copy()
             cnts_pred, _ = cv2.findContours((pred_mask>0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(vis, cnts_pred, -1, (0, 255, 0), 2)
-            save_path = os.path.join(save_dir, filename.replace('.tif','.jpg').replace('.png', '.jpg'))
-            cv2.imwrite(save_path, vis)
+            cv2.imwrite(os.path.join(save_dir, filename), vis)
 
     print("\n" + "="*40)
     print(f"📊 Final Results:")
