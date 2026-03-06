@@ -1,5 +1,6 @@
 import argparse
 import os
+import warnings
 import torch
 import numpy as np
 import cv2
@@ -91,11 +92,8 @@ def parse_args():
     parser.add_argument("--text_prompt", type=str, default=None)
     
     # 🔥🔥🔥 核心定义 🔥🔥🔥
-    # patch_size: 在原图上切多大的窗口 (例如 PanNuke 原图 256，WSI 可能 1024)
     parser.add_argument("--patch_size", type=int, default=256, help="Window size to crop from original image")
-    # image_size: 缩放成多大喂给模型 (例如模型是 512 训练的)
     parser.add_argument("--image_size", type=int, default=512, help="Input size expected by the model")
-    # stride: 滑窗步长 (重叠控制)
     parser.add_argument("--stride", type=int, default=128, help="Sliding window stride")
     
     parser.add_argument('--device', type=str, default='cuda')
@@ -108,37 +106,62 @@ def parse_args():
     parser.add_argument("--encoder_adapter", action='store_true', help="Enable Adapter")
     return parser.parse_args()
 
-def post_process_watershed(prob_map, threshold=0.5, min_size=20, min_distance=5):
+def post_process_watershed_advanced(prob_map, heatmap_map, threshold=0.5, min_size=20):
+    # 1. 获取全局二值区域 (Foreground)
     binary_mask = prob_map > threshold
     if not np.any(binary_mask): return np.zeros_like(binary_mask, dtype=np.int32)
+    
+    # 2. 从你模型的 Heatmap 中提取“种子点” (Markers)
+    local_maxi = peak_local_max(heatmap_map, min_distance=3, threshold_abs=0.5, labels=binary_mask)
+    
+    # 🔥 计算距离变换图，它比 prob_map 更平滑，是完美的分水岭地形图
     distance = ndimage.distance_transform_edt(binary_mask)
-    local_maxi = peak_local_max(distance, min_distance=min_distance, labels=binary_mask)
+    
+    # 如果没找到点，退回到传统的 distance 方法作为保险
+    if len(local_maxi) == 0:
+        local_maxi = peak_local_max(distance, min_distance=5, labels=binary_mask)
+        
+    if len(local_maxi) == 0: # 极端保护：还是没点，直接返回空
+        return np.zeros_like(binary_mask, dtype=np.int32)
+        
     local_maxi_mask = np.zeros_like(prob_map, dtype=bool)
     local_maxi_mask[tuple(local_maxi.T)] = True
+    
+    # 3. 标记种子点
     markers = label(local_maxi_mask)
-    labels = watershed(-distance, markers, mask=binary_mask)
+    
+    # 4. 执行分水岭 (🔥 修正：用平滑的 -distance 作为地形高度)
+    labels_ws = watershed(-distance, markers, mask=binary_mask)
+    
+    # 5. 移除小物体并屏蔽警告 (自适应兼容 skimage 版本)
     if min_size > 0:
-        labels = remove_small_objects(labels, min_size=min_size)
-        labels = label(labels > 0)
-    return labels.astype(np.int32)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                # 尝试使用新版本 (>= 0.26.0) 的 API
+                labels_ws = remove_small_objects(labels_ws, max_size=min_size)
+            except TypeError:
+                # 回退到老 API
+                labels_ws = remove_small_objects(labels_ws, min_size=min_size)
+            
+    return labels_ws.astype(np.int32)
 
 # 🔥🔥🔥 通用滑窗推理函数 🔥🔥🔥
-# 逻辑：原图 -> Padding -> 切Patch -> Resize(image_size) -> 预测 -> ResizeBack(patch_size) -> 拼回原图
 def sliding_window_inference(model, image, device, patch_size, image_size, stride, 
                              text_prompt, organ_id, attribute_text=None, filename=None):
     h, w = image.shape[:2]
     
-    # 1. Padding 保证能被切尽 (基于 patch_size)
+    # 1. Padding 保证能被切尽
     pad_h = (patch_size - h % patch_size) % patch_size
     pad_w = (patch_size - w % patch_size) % patch_size
     image_pad = cv2.copyMakeBorder(image, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
     h_pad, w_pad = image_pad.shape[:2]
     
     prob_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
+    heatmap_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
     count_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
     
     # 2. 生成滑窗坐标
-    # 注意：步长不能大于 patch_size
     real_stride = min(stride, patch_size)
     
     y_steps = list(range(0, h_pad - patch_size + 1, real_stride))
@@ -152,12 +175,10 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
     with torch.no_grad():
         for y in y_steps:
             for x in x_steps:
-                # A. 裁剪 Patch (物理尺寸)
+                # A. 裁剪 Patch
                 patch = image_pad[y:y+patch_size, x:x+patch_size, :]
                 
-                # B. Resize 到模型输入尺寸 (image_size)
-                # 例如：PanNuke 256 -> 512 (放大)
-                # 例如：WSI 1024 -> 512 (缩小)
+                # B. Resize 到模型输入尺寸
                 if patch_size != image_size:
                     patch_input = cv2.resize(patch, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
                 else:
@@ -177,27 +198,35 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
                 outputs = model(input_sample, multimask_output=True)
                 out = outputs[0]
                 best_idx = torch.argmax(out['iou_predictions']).item()
-                logits = out['masks'][0, best_idx, :, :] # [image_size, image_size]
                 
-                # D. Resize Back 到物理尺寸 (patch_size)
-                # 这步很关键，保证拼回去的时候像素是对齐的
-                logits = logits.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+                logits = out['masks'][0, best_idx, :, :]
+                heatmap_logits = out['heatmap_logits'][0, 0, :, :]
+                
+                # D. Resize Back 到物理尺寸
+                logits = logits.unsqueeze(0).unsqueeze(0)
+                heatmap_logits = heatmap_logits.unsqueeze(0).unsqueeze(0)
+                
                 if patch_size != image_size:
                     logits_orig = F.interpolate(logits, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
+                    heatmap_orig = F.interpolate(heatmap_logits, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
                 else:
                     logits_orig = logits
+                    heatmap_orig = heatmap_logits
                 
                 prob_patch = torch.sigmoid(logits_orig).squeeze().cpu().numpy()
+                heatmap_patch = torch.sigmoid(heatmap_orig).squeeze().cpu().numpy()
                 
                 # E. 累加到全图
                 prob_map_full[y:y+patch_size, x:x+patch_size] += prob_patch
+                heatmap_map_full[y:y+patch_size, x:x+patch_size] += heatmap_patch 
                 count_map_full[y:y+patch_size, x:x+patch_size] += 1.0
-                
+
     count_map_full[count_map_full == 0] = 1.0
     avg_prob = prob_map_full / count_map_full
+    avg_heatmap = heatmap_map_full / count_map_full 
     
-    # 3. 裁剪回原始图片尺寸
-    return avg_prob[:h, :w]
+    # 3. 裁剪回原始图片尺寸并返回两个图
+    return avg_prob[:h, :w], avg_heatmap[:h, :w]
 
 def get_organ_from_json(img_path):
     json_path = os.path.splitext(img_path)[0] + ".json"
@@ -242,7 +271,6 @@ def load_filtered_gt(img_path, attr_data, target_tag=None):
     except: return None
 
 def main(args):
-    # 初始化 SAM (注意这里 img_size 要设为模型实际大小)
     vanilla_sam = sam_model_registry[args.model_type](args)
     vanilla_sam.image_encoder.img_size = args.image_size 
 
@@ -257,7 +285,6 @@ def main(args):
     if os.path.exists(args.checkpoint):
         checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
         state_dict = checkpoint.get('model', checkpoint)
-        # 权重自适应 (无论权重是 256 还是 512，都适配当前 args.image_size)
         state_dict = resize_pos_embed(state_dict, model.state_dict())
         model.load_state_dict(state_dict, strict=False)
         print(f"✅ Loaded checkpoint: {args.checkpoint}")
@@ -278,7 +305,7 @@ def main(args):
     if args.save_pred: os.makedirs(save_dir, exist_ok=True)
 
     print('*'*60)
-    print(f"🚀 Inference Config: Window={args.patch_size} -> Model={args.image_size}")
+    print(f"🚀 Inference Config: Window={args.patch_size} -> Model={args.image_size} | Stride={args.stride}")
     print('*'*60)
 
     pbar = tqdm(image_files)
@@ -308,18 +335,45 @@ def main(args):
         attribute_prompt_text = "" 
         pbar.write(f"🖼️  {filename} | {log_msg} -> Class: '{class_prompt_text}' | Attr: [AUTO]")
 
-        # 🔥 通用推理
-        pred_prob = sliding_window_inference(
-            model, image_rgb, args.device, 
-            patch_size=args.patch_size,  # 切多大 (如 256)
-            image_size=args.image_size,  # 喂多大 (如 512)
-            stride=args.stride,          # 步长 (如 128)
-            text_prompt=class_prompt_text, organ_id=current_organ_id, 
-            attribute_text=attribute_prompt_text, filename=filename
-        )
+        # 🔥 TTA (Test-Time Augmentation) 推理集成
+        # 1. 原图
+        prob_orig, heat_orig = sliding_window_inference(
+            model, image_rgb, args.device, args.patch_size, args.image_size, args.stride, 
+            class_prompt_text, current_organ_id, attribute_prompt_text, filename)
         
+        # 2. 水平翻转 (H-Flip)
+        img_flip_h = cv2.flip(image_rgb, 1)
+        prob_h, heat_h = sliding_window_inference(
+            model, img_flip_h, args.device, args.patch_size, args.image_size, args.stride, 
+            class_prompt_text, current_organ_id, attribute_prompt_text, filename)
+        prob_h = cv2.flip(prob_h, 1)
+        heat_h = cv2.flip(heat_h, 1)
+        
+        # 3. 垂直翻转 (V-Flip)
+        img_flip_v = cv2.flip(image_rgb, 0)
+        prob_v, heat_v = sliding_window_inference(
+            model, img_flip_v, args.device, args.patch_size, args.image_size, args.stride, 
+            class_prompt_text, current_organ_id, attribute_prompt_text, filename)
+        prob_v = cv2.flip(prob_v, 0)
+        heat_v = cv2.flip(heat_v, 0)
+
+        # 🔥 安全对齐：防止某些特殊奇数分辨率图翻转后产生 shape 差异
+        target_shape = prob_orig.shape
+        def safe_crop(arr, shape):
+            return arr[:shape[0], :shape[1]]
+            
+        prob_h = safe_crop(prob_h, target_shape)
+        heat_h = safe_crop(heat_h, target_shape)
+        prob_v = safe_crop(prob_v, target_shape)
+        heat_v = safe_crop(heat_v, target_shape)
+
+        # 4. 求均值集成
+        pred_prob = (prob_orig + prob_h + prob_v) / 3.0
+        pred_heatmap = (heat_orig + heat_h + heat_v) / 3.0
+        
+        # 5. 后处理
         if args.use_watershed:
-            pred_mask = post_process_watershed(pred_prob, threshold=0.5)
+            pred_mask = post_process_watershed_advanced(pred_prob, pred_heatmap, threshold=0.5)
         else:
             pred_mask = label(pred_prob > 0.5).astype(np.int32)
         

@@ -223,10 +223,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         base_texts = batched_input.get('text_prompt', ["Cell nuclei"] * len(images))
         attr_labels = batched_input.get('attr_labels', None)
 
-        # 🔥 30% 概率丢弃文本
-        if np.random.rand() < 0.3:
-             attr_texts = [""] * len(images)
-
         for i in range(len(images)):
             curr_id = 20
             if organ_ids is not None:
