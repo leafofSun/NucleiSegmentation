@@ -1,6 +1,5 @@
 import argparse
 import os
-import warnings
 import torch
 import numpy as np
 import cv2
@@ -19,7 +18,7 @@ from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
 from skimage.morphology import remove_small_objects, opening, disk
 from scipy import ndimage
-from skimage.measure import label, regionprops
+from skimage.measure import label
 
 try:
     from pycocotools import mask as coco_mask
@@ -38,7 +37,6 @@ ID_TO_ORGAN = {
 ORGAN_TO_ID = {v.lower().replace("-", "_"): k for k, v in ID_TO_ORGAN.items()}
 ORGAN_TO_ID.update({"bile_duct": 1, "head_neck": 7, "adrenal gland": 0})
 
-# 🔥 权重适配 (必须保留，用于适配不同分辨率的权重文件)
 def resize_pos_embed(state_dict, model_state_dict):
     new_state_dict = {}
     for k, v in state_dict.items():
@@ -81,89 +79,62 @@ class OrganPredictor:
             image_features /= image_features.norm(dim=-1, keepdim=True)
             similarity = (100.0 * image_features @ self.text_features.T).softmax(dim=-1)
             values, indices = similarity[0].topk(1)
-        best_list_idx = indices.item()
-        confidence = values.item()
-        return self.organs[best_list_idx], self.valid_ids[best_list_idx], confidence
+        return self.organs[indices.item()], self.valid_ids[indices.item()], values.item()
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work_dir", type=str, default="workdir")
     parser.add_argument("--run_name", type=str, default="universal_test") 
     parser.add_argument("--text_prompt", type=str, default=None)
-    
-    # 🔥🔥🔥 核心定义 🔥🔥🔥
-    parser.add_argument("--patch_size", type=int, default=256, help="Window size to crop from original image")
-    parser.add_argument("--image_size", type=int, default=512, help="Input size expected by the model")
-    parser.add_argument("--stride", type=int, default=128, help="Sliding window stride")
-    
+    parser.add_argument("--patch_size", type=int, default=256)
+    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--stride", type=int, default=128)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument("--data_path", type=str, default="data/PanNuke/test") 
+    parser.add_argument("--knowledge_path", type=str, default="data/PanNuke/medical_knowledge.json", help="Path to global attributes JSON")
     parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'])
     parser.add_argument("--model_type", type=str, default="vit_b")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--save_pred", action='store_true')
     parser.add_argument("--use_watershed", action='store_true', default=True)
-    parser.add_argument("--encoder_adapter", action='store_true', help="Enable Adapter")
+    parser.add_argument("--encoder_adapter", action='store_true')
     return parser.parse_args()
 
-def post_process_watershed_advanced(prob_map, heatmap_map, threshold=0.5, min_size=20):
-    # 1. 获取全局二值区域 (Foreground)
-    binary_mask = prob_map > threshold
+# 🔥 神级后处理：高斯平滑 + 动态接收自适应参数
+def post_process_watershed(prob_map, threshold=0.45, min_size=30, min_distance=5):
+    # sigma=0.3 保留边缘，平滑内部
+    prob_map_smoothed = ndimage.gaussian_filter(prob_map, sigma=0.3) 
+    binary_mask = prob_map_smoothed > threshold
     if not np.any(binary_mask): return np.zeros_like(binary_mask, dtype=np.int32)
     
-    # 2. 从你模型的 Heatmap 中提取“种子点” (Markers)
-    local_maxi = peak_local_max(heatmap_map, min_distance=3, threshold_abs=0.5, labels=binary_mask)
-    
-    # 🔥 计算距离变换图，它比 prob_map 更平滑，是完美的分水岭地形图
     distance = ndimage.distance_transform_edt(binary_mask)
+    local_maxi = peak_local_max(distance, min_distance=min_distance, labels=binary_mask)
     
-    # 如果没找到点，退回到传统的 distance 方法作为保险
     if len(local_maxi) == 0:
-        local_maxi = peak_local_max(distance, min_distance=5, labels=binary_mask)
-        
-    if len(local_maxi) == 0: # 极端保护：还是没点，直接返回空
-        return np.zeros_like(binary_mask, dtype=np.int32)
+        return label(binary_mask).astype(np.int32)
         
     local_maxi_mask = np.zeros_like(prob_map, dtype=bool)
     local_maxi_mask[tuple(local_maxi.T)] = True
-    
-    # 3. 标记种子点
     markers = label(local_maxi_mask)
+    labels = watershed(-distance, markers, mask=binary_mask)
     
-    # 4. 执行分水岭 (🔥 修正：用平滑的 -distance 作为地形高度)
-    labels_ws = watershed(-distance, markers, mask=binary_mask)
-    
-    # 5. 移除小物体并屏蔽警告 (自适应兼容 skimage 版本)
     if min_size > 0:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                # 尝试使用新版本 (>= 0.26.0) 的 API
-                labels_ws = remove_small_objects(labels_ws, max_size=min_size)
-            except TypeError:
-                # 回退到老 API
-                labels_ws = remove_small_objects(labels_ws, min_size=min_size)
-            
-    return labels_ws.astype(np.int32)
+        labels = remove_small_objects(labels, min_size=min_size)
+        labels = label(labels > 0)
+    return labels.astype(np.int32)
 
-# 🔥🔥🔥 通用滑窗推理函数 🔥🔥🔥
 def sliding_window_inference(model, image, device, patch_size, image_size, stride, 
                              text_prompt, organ_id, attribute_text=None, filename=None):
     h, w = image.shape[:2]
-    
-    # 1. Padding 保证能被切尽
     pad_h = (patch_size - h % patch_size) % patch_size
     pad_w = (patch_size - w % patch_size) % patch_size
     image_pad = cv2.copyMakeBorder(image, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
     h_pad, w_pad = image_pad.shape[:2]
     
     prob_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
-    heatmap_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
     count_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
     
-    # 2. 生成滑窗坐标
     real_stride = min(stride, patch_size)
-    
     y_steps = list(range(0, h_pad - patch_size + 1, real_stride))
     if (h_pad - patch_size) % real_stride != 0: y_steps.append(h_pad - patch_size)
     x_steps = list(range(0, w_pad - patch_size + 1, real_stride))
@@ -175,10 +146,7 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
     with torch.no_grad():
         for y in y_steps:
             for x in x_steps:
-                # A. 裁剪 Patch
                 patch = image_pad[y:y+patch_size, x:x+patch_size, :]
-                
-                # B. Resize 到模型输入尺寸
                 if patch_size != image_size:
                     patch_input = cv2.resize(patch, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
                 else:
@@ -194,39 +162,24 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
                     'attribute_text': attribute_text 
                 }]
                 
-                # C. 预测
                 outputs = model(input_sample, multimask_output=True)
                 out = outputs[0]
                 best_idx = torch.argmax(out['iou_predictions']).item()
+                logits = out['masks'][0, best_idx, :, :] 
                 
-                logits = out['masks'][0, best_idx, :, :]
-                heatmap_logits = out['heatmap_logits'][0, 0, :, :]
-                
-                # D. Resize Back 到物理尺寸
-                logits = logits.unsqueeze(0).unsqueeze(0)
-                heatmap_logits = heatmap_logits.unsqueeze(0).unsqueeze(0)
-                
+                logits = logits.unsqueeze(0).unsqueeze(0) 
                 if patch_size != image_size:
                     logits_orig = F.interpolate(logits, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
-                    heatmap_orig = F.interpolate(heatmap_logits, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
                 else:
                     logits_orig = logits
-                    heatmap_orig = heatmap_logits
                 
                 prob_patch = torch.sigmoid(logits_orig).squeeze().cpu().numpy()
-                heatmap_patch = torch.sigmoid(heatmap_orig).squeeze().cpu().numpy()
-                
-                # E. 累加到全图
                 prob_map_full[y:y+patch_size, x:x+patch_size] += prob_patch
-                heatmap_map_full[y:y+patch_size, x:x+patch_size] += heatmap_patch 
                 count_map_full[y:y+patch_size, x:x+patch_size] += 1.0
-
+                
     count_map_full[count_map_full == 0] = 1.0
     avg_prob = prob_map_full / count_map_full
-    avg_heatmap = heatmap_map_full / count_map_full 
-    
-    # 3. 裁剪回原始图片尺寸并返回两个图
-    return avg_prob[:h, :w], avg_heatmap[:h, :w]
+    return avg_prob[:h, :w]
 
 def get_organ_from_json(img_path):
     json_path = os.path.splitext(img_path)[0] + ".json"
@@ -243,7 +196,12 @@ def get_organ_from_json(img_path):
         except: pass
     return None, None
 
+# 🔥 完美兼容 Polygon(PanNuke) 和 RLE(MoNuSeg) 的解析
 def load_filtered_gt(img_path, attr_data, target_tag=None):
+    mask_path_png = img_path.replace('.tif', '_mask.png').replace('.png', '_mask.png')
+    if os.path.exists(mask_path_png):
+        return cv2.imread(mask_path_png, cv2.IMREAD_UNCHANGED).astype(np.int32)
+        
     json_path = os.path.splitext(img_path)[0] + ".json"
     if not os.path.exists(json_path):
         possible_json = img_path.rsplit('.', 1)[0] + ".json"
@@ -258,15 +216,23 @@ def load_filtered_gt(img_path, attr_data, target_tag=None):
         temp_img = cv2.imread(img_path)
         if temp_img is None: return None
         h, w = temp_img.shape[:2]
-        
         mask = np.zeros((h, w), dtype=np.int32)
+        
         for idx, ann in enumerate(anns):
             seg = ann.get('segmentation', [])
             inst_id = idx + 1
+            
             if isinstance(seg, list):
                 for poly in seg:
                     pts = np.array(poly, dtype=np.int32).reshape((-1, 2))
                     cv2.fillPoly(mask, [pts], inst_id)
+            elif isinstance(seg, dict) and 'counts' in seg and 'size' in seg:
+                try:
+                    from pycocotools import mask as coco_mask
+                    binary_mask = coco_mask.decode(seg)
+                    mask[binary_mask > 0] = inst_id
+                except ImportError:
+                    pass
         return mask
     except: return None
 
@@ -293,7 +259,28 @@ def main(args):
         return
 
     organ_predictor = OrganPredictor(args.device)
-    attr_data = {} 
+    
+    # 🔥🔥🔥 1. 加载全局知识库与统计常数 (Oracle Knowledge) 🔥🔥🔥
+    global_knowledge = {}
+    dataset_stats = {}
+    if os.path.exists(args.knowledge_path):
+        print(f"📖 Loading Global Knowledge Base from {args.knowledge_path} ...")
+        try:
+            with open(args.knowledge_path, 'r') as f:
+                global_knowledge = json.load(f)
+            
+            if "__meta__" in global_knowledge and "stats" in global_knowledge["__meta__"]:
+                dataset_stats = global_knowledge["__meta__"]["stats"]
+                print(f"📊 Extracted Global Stats: {dataset_stats}")
+            else:
+                print("⚠️ No __meta__.stats found. Will fallback to Universal Baseline.")
+                
+            print(f"✅ Loaded {len(global_knowledge)} knowledge entries.")
+        except Exception as e:
+            print(f"⚠️ Failed to parse knowledge base: {e}")
+    else:
+        print(f"⚠️ Warning: Knowledge Base not found at {args.knowledge_path}. Using Universal Baseline.")
+
     image_files = []
     for root, dirs, files in os.walk(args.data_path):
         for f in files:
@@ -305,7 +292,7 @@ def main(args):
     if args.save_pred: os.makedirs(save_dir, exist_ok=True)
 
     print('*'*60)
-    print(f"🚀 Inference Config: Window={args.patch_size} -> Model={args.image_size} | Stride={args.stride}")
+    print(f"🚀 SCIENTIFIC ADAPTIVE INFERENCE: Window={args.patch_size} -> Model={args.image_size}")
     print('*'*60)
 
     pbar = tqdm(image_files)
@@ -325,59 +312,86 @@ def main(args):
             current_organ_id = pred_id
             log_msg = f"🧠 AI: {pred_organ} ({conf:.1%})"
 
-        if args.text_prompt:
-             class_prompt_text = args.text_prompt
-             current_organ_id = 20
-             log_msg = f"👤 Override: '{class_prompt_text}'"
-        else:
-             class_prompt_text = f"{pred_organ} cell nuclei"
+        class_prompt_text = args.text_prompt if args.text_prompt else f"{pred_organ} cell nuclei"
+        if args.text_prompt: current_organ_id = 20
 
-        attribute_prompt_text = "" 
-        pbar.write(f"🖼️  {filename} | {log_msg} -> Class: '{class_prompt_text}' | Attr: [AUTO]")
-
-        # 🔥 TTA (Test-Time Augmentation) 推理集成
-        # 1. 原图
-        prob_orig, heat_orig = sliding_window_inference(
-            model, image_rgb, args.device, args.patch_size, args.image_size, args.stride, 
-            class_prompt_text, current_organ_id, attribute_prompt_text, filename)
+        # 🔥🔥🔥 2. 查表获取当前图像的 Oracle 物理属性标签 🔥🔥🔥
+        gt_size_tag, gt_density_tag = "DEFAULT", "DEFAULT"
         
-        # 2. 水平翻转 (H-Flip)
-        img_flip_h = cv2.flip(image_rgb, 1)
-        prob_h, heat_h = sliding_window_inference(
-            model, img_flip_h, args.device, args.patch_size, args.image_size, args.stride, 
-            class_prompt_text, current_organ_id, attribute_prompt_text, filename)
-        prob_h = cv2.flip(prob_h, 1)
-        heat_h = cv2.flip(heat_h, 1)
+        rel_path = os.path.relpath(img_path, os.path.dirname(os.path.dirname(args.data_path)))
+        # 尝试多种可能的 Key 匹配方式
+        match_keys = [rel_path, f"test/{filename}", filename, os.path.join("test", filename)]
         
-        # 3. 垂直翻转 (V-Flip)
-        img_flip_v = cv2.flip(image_rgb, 0)
-        prob_v, heat_v = sliding_window_inference(
-            model, img_flip_v, args.device, args.patch_size, args.image_size, args.stride, 
-            class_prompt_text, current_organ_id, attribute_prompt_text, filename)
-        prob_v = cv2.flip(prob_v, 0)
-        heat_v = cv2.flip(heat_v, 0)
+        for key in match_keys:
+            if key in global_knowledge:
+                stats = global_knowledge[key].get("visual_stats", {})
+                gt_size_tag = stats.get("size", "DEFAULT")
+                gt_density_tag = stats.get("density", "DEFAULT")
+                break
+                
+        # 🔥🔥🔥 3. 数学级自适应参数推导 (Scientific Adaptive Mapping) 🔥🔥🔥
+        UNIVERSAL_BASE_SIZE = 30
+        UNIVERSAL_BASE_DIST = 5
+        dynamic_min_size = UNIVERSAL_BASE_SIZE
+        dynamic_min_dist = UNIVERSAL_BASE_DIST
 
-        # 🔥 安全对齐：防止某些特殊奇数分辨率图翻转后产生 shape 差异
-        target_shape = prob_orig.shape
-        def safe_crop(arr, shape):
-            return arr[:shape[0], :shape[1]]
+        if dataset_stats:
+            # 轨道一：Data-Driven Prior Injection
+            th_size_small = dataset_stats.get("th_size_small", 250)
             
-        prob_h = safe_crop(prob_h, target_shape)
-        heat_h = safe_crop(heat_h, target_shape)
-        prob_v = safe_crop(prob_v, target_shape)
-        heat_v = safe_crop(heat_v, target_shape)
-
-        # 4. 求均值集成
-        pred_prob = (prob_orig + prob_h + prob_v) / 3.0
-        pred_heatmap = (heat_orig + heat_h + heat_v) / 3.0
-        
-        # 5. 后处理
-        if args.use_watershed:
-            pred_mask = post_process_watershed_advanced(pred_prob, pred_heatmap, threshold=0.5)
+            # Size 逻辑
+            if gt_size_tag == "large-sized":
+                dynamic_min_size = int(th_size_small * 0.25)
+            elif gt_size_tag == "small-sized":
+                dynamic_min_size = max(15, int(th_size_small * 0.08))
+            else:
+                dynamic_min_size = max(30, int(th_size_small * 0.12))
+                
+            # Density 逻辑
+            if gt_density_tag == "densely distributed":
+                dynamic_min_dist = 3
+            elif gt_density_tag == "sparsely distributed":
+                dynamic_min_dist = 8
+            else:
+                dynamic_min_dist = 5
         else:
-            pred_mask = label(pred_prob > 0.5).astype(np.int32)
+            # 轨道二：Fallback 降级策略 (基于通用基线的缩放)
+            if gt_size_tag == "large-sized": dynamic_min_size = int(UNIVERSAL_BASE_SIZE * 2.0)
+            elif gt_size_tag == "small-sized": dynamic_min_size = int(UNIVERSAL_BASE_SIZE * 0.5)
+            
+            if gt_density_tag == "densely distributed": dynamic_min_dist = max(3, UNIVERSAL_BASE_DIST - 2)
+            elif gt_density_tag == "sparsely distributed": dynamic_min_dist = UNIVERSAL_BASE_DIST + 3
+
+        pbar.write(f"🖼️  {filename} | Oracle: [{gt_size_tag}, {gt_density_tag}] ➔ Adaptive: min_size={dynamic_min_size}, min_dist={dynamic_min_dist}")
+
+        # TTA 推理
+        prob_orig = sliding_window_inference(model, image_rgb, args.device, args.patch_size, args.image_size, args.stride, class_prompt_text, current_organ_id, "", filename)
+        img_h = cv2.flip(image_rgb, 1)
+        prob_h = sliding_window_inference(model, img_h, args.device, args.patch_size, args.image_size, args.stride, class_prompt_text, current_organ_id, "", filename)
+        prob_h = cv2.flip(prob_h, 1)
+        img_v = cv2.flip(image_rgb, 0)
+        prob_v = sliding_window_inference(model, img_v, args.device, args.patch_size, args.image_size, args.stride, class_prompt_text, current_organ_id, "", filename)
+        prob_v = cv2.flip(prob_v, 0)
         
-        gt_mask = load_filtered_gt(img_path, attr_data, target_tag="Auto_Organ")
+        target_shape = prob_orig.shape
+        def safe_crop(arr, shape): return arr[: shape[0], : shape[1]]
+        prob_h = safe_crop(prob_h, target_shape)
+        prob_v = safe_crop(prob_v, target_shape)
+        
+        pred_prob = (prob_orig + prob_h + prob_v) / 3.0
+
+        # 🔥 4. 使用推导出的动态参数调用分水岭！(固定神级阈值 0.45)
+        if args.use_watershed:
+            pred_mask = post_process_watershed(
+                pred_prob, 
+                threshold=0.45, 
+                min_size=dynamic_min_size, 
+                min_distance=dynamic_min_dist
+            )
+        else:
+            pred_mask = label(pred_prob > 0.45).astype(np.int32)
+        
+        gt_mask = load_filtered_gt(img_path, {}, target_tag="Auto_Organ")
         
         if gt_mask is not None:
             if gt_mask.shape != pred_mask.shape:

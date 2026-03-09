@@ -81,27 +81,40 @@ class DatasetAnalyzer:
         print(f"   -> Sparse < {self.stats['th_dens_sparse']:.1f} | Dense > {self.stats['th_dens_dense']:.1f}\n")
 
     def analyze_single_image(self, mask: np.ndarray) -> Dict[str, str]:
+        # 遇到无效 Mask，统一返回默认的中等规范标签
         if not self.stats or mask.max() == 0:
-            return {"size": "medium", "density": "moderate", "shape": "round"}
+            return {"size": "medium-sized", "density": "moderately distributed", "shape": "round"}
 
         props = measure.regionprops(mask)
         if not props:
-            return {"size": "medium", "density": "moderate", "shape": "round"}
+            return {"size": "medium-sized", "density": "moderately distributed", "shape": "round"}
 
+        # 1. 严格规范 Size 标签
         local_mean_area = np.mean([p.area for p in props])
-        if local_mean_area < self.stats['th_size_small']: size_txt = "small"
-        elif local_mean_area > self.stats['th_size_large']: size_txt = "large, enlarged"
-        else: size_txt = "medium-sized"
+        if local_mean_area < self.stats['th_size_small']: 
+            size_txt = "small-sized"
+        elif local_mean_area > self.stats['th_size_large']: 
+            size_txt = "large-sized"
+        else: 
+            size_txt = "medium-sized"
 
+        # 2. 严格规范 Density 标签
         count = len(props)
-        if count < self.stats['th_dens_sparse']: dens_txt = "sparsely distributed"
-        elif count > self.stats['th_dens_dense']: dens_txt = "densely packed"
-        else: dens_txt = "moderately distributed"
+        if count < self.stats['th_dens_sparse']: 
+            dens_txt = "sparsely distributed"
+        elif count > self.stats['th_dens_dense']: 
+            dens_txt = "densely distributed"
+        else: 
+            dens_txt = "moderately distributed"
 
+        # 3. 严格规范 Shape 标签 (如果你的 PNuRL 也分类这个的话)
         mean_ecc = np.mean([p.eccentricity for p in props])
-        if mean_ecc < 0.6: shape_txt = "round"
-        elif mean_ecc > 0.85: shape_txt = "elongated"
-        else: shape_txt = "oval"
+        if mean_ecc < 0.6: 
+            shape_txt = "round"
+        elif mean_ecc > 0.85: 
+            shape_txt = "elongated"
+        else: 
+            shape_txt = "oval"
 
         return {"size": size_txt, "density": dens_txt, "shape": shape_txt}
 
@@ -120,21 +133,43 @@ class KnowledgeGenerator:
             with open(json_path, 'r') as f:
                 data = json.load(f)
             
-            h = data.get("height", 256)
-            w = data.get("width", 256)
+            # 🔥 智能提取图片宽高，完美兼容嵌套结构
+            if "image" in data and isinstance(data["image"], dict):
+                # MoNuSeg 格式
+                h = data["image"].get("height", 1000)
+                w = data["image"].get("width", 1000)
+            else:
+                # PanNuke 格式
+                h = data.get("height", 256)
+                w = data.get("width", 256)
+                
             mask = np.zeros((h, w), dtype=np.int32)
             organ_type = data.get("organ_type", "Generic")
             
             for i, ann in enumerate(data.get("annotations", [])):
-                for poly in ann.get("segmentation", []):
-                    pts = np.array(poly).reshape(-1, 2).astype(np.int32)
-                    cv2.fillPoly(mask, [pts], i + 1)
-            
+                seg = ann.get("segmentation", [])
+                inst_id = i + 1
+                
+                # 🚀 格式 1：多边形轮廓坐标 (Polygon)
+                if isinstance(seg, list):
+                    for poly in seg:
+                        pts = np.array(poly).reshape(-1, 2).astype(np.int32)
+                        cv2.fillPoly(mask, [pts], inst_id)
+                        
+                # 🚀 格式 2：COCO RLE 字符串编码
+                elif isinstance(seg, dict) and 'counts' in seg and 'size' in seg:
+                    try:
+                        from pycocotools import mask as coco_mask
+                        binary_mask = coco_mask.decode(seg)
+                        mask[binary_mask > 0] = inst_id
+                    except ImportError:
+                        print("⚠️ [Error] 缺少 pycocotools 库，无法解码 RLE。")
+                        return None, "Generic"
+
             return mask, organ_type
         except Exception as e:
-            # print(f"Error reading {json_path}: {e}")
+            print(f"⚠️ Error decoding mask from {json_path}: {e}")
             return None, "Generic"
-
     def run(self):
         # 递归扫描 train 和 test
         search_path = os.path.join(self.data_root, "**", "*.json")
@@ -204,7 +239,7 @@ class KnowledgeGenerator:
 # ==============================================================================
 if __name__ == "__main__":
     # 配置你的数据集根目录 (SA-1B 格式的根目录，包含 train/ 和 test/ 文件夹)
-    ROOT_DIR = "data/PanNuke_SA1B" 
+    ROOT_DIR = "data/MoNuSeg" 
     SAVE_PATH = os.path.join(ROOT_DIR, "medical_knowledge.json")
     
     generator = KnowledgeGenerator(ROOT_DIR, SAVE_PATH)
