@@ -5,7 +5,7 @@ import numpy as np
 from scipy.spatial import KDTree
 
 class TextGuidedPointGenerator(nn.Module):
-    def __init__(self, embed_dim=256, text_dim=512):
+    def __init__(self, embed_dim=256, text_dim=512, num_heads=8):
         super().__init__()
         # 1. 文本投影层
         self.text_proj = nn.Linear(text_dim, embed_dim)
@@ -17,25 +17,49 @@ class TextGuidedPointGenerator(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # 3. Logit Scale
+        # 3. 🔥 [新增] Cross-Attention 融合模块
+        # batch_first=True 允许输入形状为 (Batch, Seq_Len, Dim)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+        # 加入 LayerNorm 稳定深层特征的训练
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        
+        # 4. Logit Scale
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
     def forward(self, image_embeddings, text_embeddings):
         B, C, H, W = image_embeddings.shape
         _, N_Classes, _ = text_embeddings.shape 
         
-        img_feat = self.img_conv(image_embeddings) 
-        txt_feat = self.text_proj(text_embeddings)
+        # 提取初始特征
+        img_feat = self.img_conv(image_embeddings)  # [B, C, H, W]
+        txt_feat = self.text_proj(text_embeddings)  # [B, N_Classes, C]
         
-        img_feat = F.normalize(img_feat, dim=1)      
-        txt_feat = F.normalize(txt_feat, dim=-1)     
+        # === 🔥 [新增] 跨模态深度交互 (Cross-Attention) ===
+        # 1. 展平图像特征：[B, C, H, W] -> [B, C, H*W] -> [B, H*W, C]
+        img_flat = img_feat.flatten(2).transpose(1, 2)
+        
+        # 2. Attention 计算
+        # Query: 图像的每个像素点; Key/Value: 文本特征
+        attn_output, _ = self.cross_attn(query=img_flat, key=txt_feat, value=txt_feat)
+        
+        # 3. 残差连接与归一化 (防梯度消失)
+        img_fused = self.layer_norm(img_flat + attn_output)
+        # =================================================
+        
+        # 恢复通道维度在前，准备计算相似度: [B, H*W, C] -> [B, C, H*W]
+        img_fused = img_fused.transpose(1, 2)
+        
+        # L2 归一化 (依然遵循 CLIP 的对比学习流形)
+        img_norm = F.normalize(img_fused, dim=1)      
+        txt_norm = F.normalize(txt_feat, dim=-1)     
 
-        img_flat = img_feat.view(B, C, -1)           
-        match_score = torch.bmm(txt_feat, img_flat)  
+        # 相似度矩阵乘法: [B, N_Classes, C] @ [B, C, H*W] -> [B, N_Classes, H*W]
+        match_score = torch.bmm(txt_norm, img_norm)  
         
         logit_scale = self.logit_scale.exp().clamp(max=100)
         match_score = match_score * logit_scale
         
+        # 还原为空间热力图
         heatmap_logits = match_score.view(B, N_Classes, H, W)
         return heatmap_logits
 

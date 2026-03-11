@@ -3,6 +3,7 @@ import os
 import time
 import datetime
 import random
+from contextlib import nullcontext
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -69,6 +70,8 @@ def parse_args():
     parser.add_argument("--clip_model", type=str, default="ViT-B/16", help="CLIP model version")
     parser.add_argument("--num_organs", type=int, default=21, help="Number of organ categories")
     parser.add_argument("--encoder_adapter", action='store_true', default=True, help="Use Adapters")
+    # Cross-Attention 超参数
+    parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads for multi-modal fusion")
 
     parser.add_argument("--epochs", type=int, default=300) 
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU") 
@@ -310,15 +313,21 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             final_loss = loss_batch / len(images)
             final_loss = final_loss / args.accumulation_steps
 
-        # 1. Backward (每一步都做)
-        if scaler:
-            scaler.scale(final_loss).backward()
-        else:
-            final_loss.backward()
-            
+        # 判断是否在累加阶段 (不是最后一步)
+        is_accumulating = (batch_idx + 1) % args.accumulation_steps != 0 and (batch_idx + 1) != len(train_loader)
+
+        # 如果在累加，就关闭 DDP 同步；否则正常同步 (单卡时 no_sync 不存在，用 nullcontext)
+        sync_context = model.no_sync() if (is_accumulating and hasattr(model, 'no_sync')) else nullcontext()
+
+        # 1. Backward (每一步都做，累加时 no_sync 避免无效跨卡通信)
+        with sync_context:
+            if scaler:
+                scaler.scale(final_loss).backward()
+            else:
+                final_loss.backward()
+
         # 2. Optimizer Step (只在累积点做)
-        # 🔥🔥🔥 [修复] unscale_ 逻辑
-        if (batch_idx + 1) % args.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+        if not is_accumulating:
             if scaler:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -327,7 +336,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             else:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-            
+
             optimizer.zero_grad()
 
         current_loss_val = final_loss.item() * args.accumulation_steps
@@ -495,7 +504,8 @@ def main(args):
             if rank == 0: logger.warning(f"⚠️ Checkpoint loading failed: {e}")
     
     model = TextSam(image_encoder=vanilla_sam.image_encoder, prompt_encoder=vanilla_sam.prompt_encoder,
-                    mask_decoder=vanilla_sam.mask_decoder, clip_model_name=args.clip_model, num_organs=args.num_organs).to(args.device)
+                    mask_decoder=vanilla_sam.mask_decoder, clip_model_name=args.clip_model, num_organs=args.num_organs,
+                    num_heads=args.num_heads).to(args.device)
     del vanilla_sam
 
     if world_size > 1:

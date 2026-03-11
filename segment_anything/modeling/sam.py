@@ -291,7 +291,8 @@ class TextSam(Sam):
         clip_model_name="ViT-B/16",
         text_dim=512,
         embed_dim=256,
-        num_organs=21 
+        num_organs=21,
+        num_heads=8
     ):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
         
@@ -321,7 +322,8 @@ class TextSam(Sam):
         # 4. Auto-Prompt Generator (Trainable)
         self.prompt_generator = TextGuidedPointGenerator(
             embed_dim=embed_dim,
-            text_dim=text_dim
+            text_dim=text_dim,
+            num_heads=num_heads
         )
         
         # 5. 冻结策略
