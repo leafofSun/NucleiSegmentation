@@ -92,47 +92,34 @@ class TextGuidedPointGenerator(nn.Module):
         return torch.tensor(peak_counts, device=heatmap_logits.device, dtype=torch.float32)
 
     @torch.no_grad()
-    def generate_adaptive_prompts(self, heatmap_logits, threshold=0.3, k_neighbors=3, dense_dist_thresh=15.0, max_points=None):
+    def generate_adaptive_prompts(self, heatmap_logits, threshold=0.3, k_neighbors=3, dense_dist_thresh=15.0, pred_density=None):
         """
-        🔥 [核心修正] 全局邻域构建 + 随机采样训练 (Global Neighborhood + Random Sampling)
-        
-        逻辑流：
-        1. 提取全图所有潜在细胞点 (All Points)。
-        2. 基于 All Points 构建 KDTree，确保邻居关系的物理真实性 (Neighbor Integrity)。
-        3. 如果训练需要限制数量 (max_points)，则从 All Points 中【随机采样】N 个作为目标。
-           注意：这里使用 Random 而不是 Top-K，以保证模型见过"差生"(低置信度样本)。
-        4. 为这 N 个目标构建 Prompt，其负提示来源于 KDTree (即来源于全集)。
-        
-        Args:
-            dense_dist_thresh: float 或 torch.Tensor [B] - 每个样本的动态阈值
+        🔥 [核心修正] 密度图动态配额 + Top-K 智能截断
         """
         B, C, H, W = heatmap_logits.shape
         device = heatmap_logits.device
-        
-        # 🔥 [新增] 处理动态阈值：支持 float 或 Tensor
+
+        # 处理动态阈值
         if isinstance(dense_dist_thresh, torch.Tensor):
-            # 确保是 1D tensor，长度为 B
             if dense_dist_thresh.dim() == 0:
                 dense_dist_thresh = dense_dist_thresh.unsqueeze(0).expand(B)
             elif dense_dist_thresh.shape[0] != B:
-                raise ValueError(f"dense_dist_thresh tensor length ({dense_dist_thresh.shape[0]}) must match batch size ({B})")
-            # 转换为 numpy 数组以便后续使用
+                raise ValueError(f"dense_dist_thresh tensor length must match batch size")
             dense_dist_thresh_np = dense_dist_thresh.cpu().numpy()
         else:
-            # float 类型：为所有样本使用相同阈值
             dense_dist_thresh_np = np.full(B, float(dense_dist_thresh))
-        
-        # 1. NMS 提取所有点
+
+        # NMS 提取所有候选点
         scores = torch.sigmoid(heatmap_logits)
         local_max = F.max_pool2d(scores, kernel_size=5, stride=1, padding=2)
         is_local_max = (scores == local_max) & (scores > threshold)
-        
+
         batch_prompts = []
 
         for b in range(B):
-            fg_map = is_local_max[b, 0] 
+            fg_map = is_local_max[b, 0]
             y_inds, x_inds = torch.where(fg_map)
-            
+
             # === 情况 A: 图中无细胞 ===
             if len(y_inds) == 0:
                 batch_prompts.append({
@@ -141,93 +128,89 @@ class TextGuidedPointGenerator(nn.Module):
                     "has_points": False
                 })
                 continue
-                
-            # === 关键步骤 1: 获取全量点集 (Global Set) ===
-            # 这些点既是潜在的 Target，也是潜在的 Negative Neighbor
+
+            # 🔥🔥🔥 [创新核心 1]: 引入密度图动态配额
+            if pred_density is not None:
+                # 累加当前样本的密度图，得到物理预估的细胞总数
+                estimated_count = int(pred_density[b].sum().item())
+                dynamic_max = min(max(int(estimated_count * 1.5), 10), 128)
+            else:
+                # 保底机制
+                dynamic_max = 128
+
+            # 🔥🔥🔥 [创新核心 2]: 放弃随机抽样，采用 Top-K 智能过滤
+            if len(y_inds) > dynamic_max:
+                # 获取当前所有候选点的置信度得分
+                peak_scores = scores[b, 0, y_inds, x_inds]
+                # 选出得分最高的前 dynamic_max 个点
+                _, topk_idx = torch.topk(peak_scores, k=dynamic_max)
+
+                # 仅保留高置信度的点坐标 (彻底切断 OOM 隐患)
+                y_inds = y_inds[topk_idx]
+                x_inds = x_inds[topk_idx]
+
+            # === 关键步骤 1: 获取安全的全量点集 ===
+            # 经过上面的过滤，这里的点数绝对安全，不会再让 KDTree 和 Transformer 崩溃
             all_points_np = torch.stack([x_inds.float(), y_inds.float()], dim=1).cpu().numpy()
             total_num_points = len(all_points_np)
-            
-            # === 关键步骤 2: 基于全量点集构建 KDTree (保证邻居完整性) ===
-            # 无论我们后面采样哪 50 个训练，找邻居必须在全集里找！
+
+            # === 关键步骤 2: 构建 KDTree 寻找负提示邻居 ===
             tree = None
             dists_all, indices_all = None, None
-            
+
             if total_num_points > 1:
                 tree = KDTree(all_points_np)
-                # 预先计算所有点的邻居信息 (查询 k+1 个，包含自己)
                 k_query = min(total_num_points, k_neighbors + 1)
                 dists_all, indices_all = tree.query(all_points_np, k=k_query)
 
-            # === 关键步骤 3: 确定训练目标 (Target Selection) ===
-            # 默认使用所有点
-            target_indices = np.arange(total_num_points)
-            
-            # 如果点数超过限制，进行【随机采样】，而不是 Top-K
-            # max_points 通常在训练时设为 50，验证时设为 None
-            if max_points is not None and total_num_points > max_points:
-                # 🔥 [策略修正] 使用随机采样，保证泛化性
-                # replace=False 表示不重复采样
-                target_indices = np.random.choice(total_num_points, max_points, replace=False)
-                
-            # === 关键步骤 4: 构建 Prompt (只针对选中的 Target) ===
+            # === 关键步骤 3: 构建 Prompt ===
             image_point_coords = []
             image_point_labels = []
 
-            for i in target_indices:
-                # 1. 正提示 (Self) - 来源于全集
+            # 现在，所有留下的点都是优质目标，直接全部遍历
+            for i in range(total_num_points):
                 current_pt = all_points_np[i]
                 pts = [current_pt]
-                lbls = [1] # 1 = Positive
-                
-                # 2. 密度判断 & 负提示注入 (使用全集的 KDTree 结果)
+                lbls = [1]  # 1 = Positive
+
                 is_crowded = False
                 if dists_all is not None:
-                    # 获取第 i 个点的邻居距离信息
-                    d_i = dists_all[i] # 距离数组
-                    idx_i = indices_all[i] # 邻居索引数组
-                    
+                    d_i = dists_all[i]
+                    idx_i = indices_all[i]
+
                     if np.size(d_i) > 1:
-                        # 兼容 shape
-                        if d_i.ndim == 0: d_i = [d_i] 
-                        
-                        # dists_all[i][1] 是最近邻居的距离 (index 0 是自己)
+                        if d_i.ndim == 0:
+                            d_i = [d_i]
                         if len(d_i) > 1:
                             nearest_dist = d_i[1]
-                            # 🔥 [核心修改] 使用当前样本的动态阈值
                             current_thresh = dense_dist_thresh_np[b]
                             if nearest_dist < current_thresh:
                                 is_crowded = True
-                
-                # 3. 负提示注入 (Neighboring Negatives)
+
+                # 注入相邻负提示
                 if is_crowded:
-                    # 遍历邻居 (跳过下标0，因为是自己)
-                    # 注意：idx_i 里面存的是在 all_points_np 中的下标
-                    # 即使某个邻居没有被选进 target_indices，它依然会被加进来做负提示！✅
                     current_neighbors = idx_i if np.ndim(idx_i) > 0 else [idx_i]
-                    
                     for j in range(1, len(current_neighbors)):
                         neighbor_idx = current_neighbors[j]
-                        # 只有当 neighbor_idx 有效时
                         if neighbor_idx < total_num_points:
                             neighbor_pt = all_points_np[neighbor_idx]
                             pts.append(neighbor_pt)
-                            lbls.append(0) # 0 = Negative
-                
-                # 4. Padding
+                            lbls.append(0)  # 0 = Negative
+
+                # Padding
                 while len(pts) < k_neighbors + 1:
-                    pts.append([0.0, 0.0]) 
+                    pts.append([0.0, 0.0])
                     lbls.append(-1)
-                
+
                 image_point_coords.append(pts)
                 image_point_labels.append(lbls)
 
-            # 转为 Tensor
             batch_prompts.append({
                 "point_coords": torch.tensor(np.array(image_point_coords), device=device).float(),
                 "point_labels": torch.tensor(np.array(image_point_labels), device=device).long(),
                 "has_points": True
             })
-            
+
         return batch_prompts
 
 # === Loss 函数 ===

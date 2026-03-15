@@ -420,15 +420,13 @@ class TextSam(Sam):
             batch_size = image_embeddings.shape[0]
             adaptive_thresh = torch.tensor(15.0, device=device).expand(batch_size)
         
-        # ⚠️ [参数复原] 恢复为你原始的 50，不做擅自修改
-        limit_points = 50 if self.training else None
-
+        # 🔥 [密度图动态配额] 将 PNuRL 预测的密度图传入，实现物理约束与语义生成的闭环
         prompts_list = self.prompt_generator.generate_adaptive_prompts(
-            heatmap_logits, 
-            threshold=0.3,       
-            k_neighbors=3,       
+            heatmap_logits,
+            threshold=0.3,
+            k_neighbors=3,
             dense_dist_thresh=adaptive_thresh,
-            max_points=limit_points
+            pred_density=density_map  # 密度头预测的图 [B, 1, H, W]，用于动态配额
         )
         
         # 坐标映射 (Feature Grid -> Original Image)
