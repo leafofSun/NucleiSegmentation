@@ -9,6 +9,7 @@ from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
 from .pnurl import PNuRL
+from .sg_ot import SemanticGuidedOT
 import sys
 import os
 
@@ -282,9 +283,9 @@ class DualPromptLearner(nn.Module):
 # === 🔥 [模块 2] MP-SAM (TextSam) 核心类 ===
 class TextSam(Sam):
     def __init__(
-        self, 
-        image_encoder, 
-        prompt_encoder, 
+        self,
+        image_encoder,
+        prompt_encoder,
         mask_decoder,
         pixel_mean=[123.675, 116.28, 103.53],
         pixel_std=[58.395, 57.12, 57.375],
@@ -292,10 +293,12 @@ class TextSam(Sam):
         text_dim=512,
         embed_dim=256,
         num_organs=21,
-        num_heads=8
+        num_heads=8,
+        sg_epsilon=0.05,
+        sg_iters=3
     ):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
-        
+
         print(f"🚀 Initializing MP-SAM (Multi-granularity Prompt SAM)...")
         
         # 1. 加载 CLIP (Freeze)
@@ -325,7 +328,10 @@ class TextSam(Sam):
             text_dim=text_dim,
             num_heads=num_heads
         )
-        
+
+        # 🔥 初始化 SG-OT 引擎
+        self.sg_ot = SemanticGuidedOT(img_dim=embed_dim, txt_dim=text_dim, epsilon=sg_epsilon, sinkhorn_iters=sg_iters)
+
         # 5. 冻结策略
         for param in self.image_encoder.parameters(): param.requires_grad = False
         for param in self.prompt_encoder.parameters(): param.requires_grad = False
@@ -404,29 +410,43 @@ class TextSam(Sam):
         neg_feats = neg_feats / neg_feats.norm(dim=-1, keepdim=True)
         text_features = torch.stack([pos_feats, neg_feats], dim=1).float() # [B, 2, 512]
 
-        # === Step 5: Auto-Prompt Generation (SAC - Adaptive) ===
-        heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
-        
-        # 准备传给 ASR 的密度图 (Sigmoid 归一化到 0~1，作为空间门控)
+        # === Step 5: SG-OT 语义引导的最优传输 ===
+        # 提取 Positive 文本特征 [B, 512]
+        pos_text_feats = text_features[:, 0, :]
+
+        # density_map 为 None 时使用均匀分布兜底
+        sg_ot_density = density_map
+        if sg_ot_density is None:
+            B, C, H, W = refined_image_embeddings.shape
+            sg_ot_density = torch.ones(B, 1, H, W, device=device) / (H * W)
+
+        # 🔥 执行 SG-OT 融合，取代传统的 prompt_generator 找点机制
+        fused_image_embeddings, heatmap_logits = self.sg_ot(
+            img_feat=refined_image_embeddings,
+            txt_feat=pos_text_feats,
+            density_map=sg_ot_density
+        )
+
+        # 准备传给 Mask Decoder 空间门控的密度图
         density_map_proxy = torch.sigmoid(heatmap_logits[:, 0:1, :, :])  # [B, 1, 64, 64]
-        
-        # 动态阈值计算：基于 PNuRL 的 Size 预测
-        size_logits = attr_logits.get('size', None)  # [B, num_classes] 或 None
+
+        # 动态阈值计算 (保留原本精妙的设计)
+        size_logits = attr_logits.get('size', None)
         if size_logits is not None and size_logits.numel() > 0:
-            pred_size_class = torch.argmax(size_logits, dim=1)  # [B] -> 0, 1, 2
+            pred_size_class = torch.argmax(size_logits, dim=1)
             size_threshold_map = torch.tensor([10.0, 15.0, 20.0], device=device)
-            adaptive_thresh = size_threshold_map[pred_size_class]  # [B]
+            adaptive_thresh = size_threshold_map[pred_size_class]
         else:
             batch_size = image_embeddings.shape[0]
             adaptive_thresh = torch.tensor(15.0, device=device).expand(batch_size)
-        
-        # 🔥 [密度图动态配额] 将 PNuRL 预测的密度图传入，实现物理约束与语义生成的闭环
+
+        # 沿用点配额截断逻辑提取点 (点依然需要传入 Mask Decoder)
         prompts_list = self.prompt_generator.generate_adaptive_prompts(
             heatmap_logits,
             threshold=0.3,
             k_neighbors=3,
             dense_dist_thresh=adaptive_thresh,
-            pred_density=density_map  # 密度头预测的图 [B, 1, H, W]，用于动态配额
+            pred_density=density_map
         )
         
         # 坐标映射 (Feature Grid -> Original Image)
@@ -461,7 +481,7 @@ class TextSam(Sam):
 
             # 处理无点情况
             if not prompt_data["has_points"]:
-                dummy_connection = refined_image_embeddings[i].sum() * 0.0
+                dummy_connection = fused_image_embeddings[i].sum() * 0.0
                 
                 # 加上 dummy_connection
                 if density_map_i is not None:
@@ -500,8 +520,8 @@ class TextSam(Sam):
                 sub_labels = point_labels[start_idx:end_idx] # [chunk]
                 current_batch = sub_coords.shape[0]
 
-                # 2. 局部扩展 Image Embedding (只扩展到 chunk大小)
-                sub_img_embed = refined_image_embeddings[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
+                # 2. 局部扩展 Image Embedding (使用 OT 拓扑搬运后的特征)
+                sub_img_embed = fused_image_embeddings[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
                 
                 # 3. 局部扩展高频特征 (ASR Guide)
                 sub_high_freq = None

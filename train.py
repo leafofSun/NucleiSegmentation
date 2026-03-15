@@ -73,6 +73,10 @@ def parse_args():
     # Cross-Attention 超参数
     parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads for multi-modal fusion")
 
+    # 🔥 SG-OT 核心超参数
+    parser.add_argument("--sg_epsilon", type=float, default=0.05, help="Sinkhorn熵正则化系数 (越大越平滑, 越小越精确但易溢出)")
+    parser.add_argument("--sg_iters", type=int, default=3, help="Sinkhorn迭代次数 (通常 3~5 次即收敛)")
+
     parser.add_argument("--epochs", type=int, default=300) 
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU") 
     parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate")
@@ -505,7 +509,9 @@ def main(args):
     
     model = TextSam(image_encoder=vanilla_sam.image_encoder, prompt_encoder=vanilla_sam.prompt_encoder,
                     mask_decoder=vanilla_sam.mask_decoder, clip_model_name=args.clip_model, num_organs=args.num_organs,
-                    num_heads=args.num_heads).to(args.device)
+                    num_heads=args.num_heads,
+                    sg_epsilon=args.sg_epsilon,
+                    sg_iters=args.sg_iters).to(args.device)
     del vanilla_sam
 
     if world_size > 1:
@@ -533,6 +539,8 @@ def main(args):
               {'params': raw_model.prompt_generator.parameters(), 'lr': args.lr * 5}]
     if hasattr(raw_model, 'prompt_learner'): params.append({'params': raw_model.prompt_learner.parameters(), 'lr': args.lr})
     if hasattr(raw_model, 'pnurl'): params.append({'params': raw_model.pnurl.parameters(), 'lr': args.lr})
+    # 🔥 注册 SG-OT 模块到优化器
+    if hasattr(raw_model, 'sg_ot'): params.append({'params': raw_model.sg_ot.parameters(), 'lr': args.lr * 5})
     adapter_params = [p for n, p in raw_model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
     if adapter_params: params.append({'params': adapter_params, 'lr': args.lr})
 
