@@ -100,6 +100,20 @@ def parse_args():
     parser.add_argument("--encoder_adapter", action='store_true')
     return parser.parse_args()
 
+# 🔥 高斯权重图缓存，避免每次推理重复计算
+GAUSSIAN_MAP_CACHE = {}
+
+def get_gaussian_map(patch_size):
+    """越靠近 Patch 中心的预测越可信，越靠近边缘的权重越低，消除拼接缝隙"""
+    if patch_size in GAUSSIAN_MAP_CACHE:
+        return GAUSSIAN_MAP_CACHE[patch_size]
+    center = patch_size / 2.0
+    sigma = patch_size / 4.0
+    y_grid, x_grid = np.ogrid[-center:patch_size - center, -center:patch_size - center]
+    g = np.exp(-(x_grid * x_grid + y_grid * y_grid) / (2 * sigma * sigma)).astype(np.float32)
+    GAUSSIAN_MAP_CACHE[patch_size] = g
+    return g
+
 # 🔥 神级后处理：高斯平滑 + 动态接收自适应参数
 def post_process_watershed(prob_map, threshold=0.45, min_size=30, min_distance=5):
     # sigma=0.3 保留边缘，平滑内部
@@ -107,7 +121,8 @@ def post_process_watershed(prob_map, threshold=0.45, min_size=30, min_distance=5
     binary_mask = prob_map_smoothed > threshold
     if not np.any(binary_mask): return np.zeros_like(binary_mask, dtype=np.int32)
     
-    distance = ndimage.distance_transform_edt(binary_mask)
+    # 🔥 OpenCV 优化的距离变换，比 scipy 快数倍
+    distance = cv2.distanceTransform(binary_mask.astype(np.uint8), cv2.DIST_L2, 5)
     local_maxi = peak_local_max(distance, min_distance=min_distance, labels=binary_mask)
     
     if len(local_maxi) == 0:
@@ -142,40 +157,45 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
     
     if attribute_text is None: attribute_text = ""
 
+    # 🔥 高斯权重图：中心可信度高，边缘权重低，消除拼接缝隙
+    weight_map = get_gaussian_map(patch_size)
+
     model.eval()
-    with torch.no_grad():
-        for y in y_steps:
-            for x in x_steps:
-                patch = image_pad[y:y+patch_size, x:x+patch_size, :]
-                if patch_size != image_size:
-                    patch_input = cv2.resize(patch, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-                else:
-                    patch_input = patch
-                
-                img_tensor = torch.from_numpy(patch_input).permute(2, 0, 1).float().to(device)
-                
-                input_sample = [{
-                    'image': img_tensor,
-                    'original_size': (image_size, image_size), 
-                    'text_prompt': text_prompt, 
-                    'organ_id': organ_id, 
-                    'attribute_text': attribute_text 
-                }]
-                
+    for y in y_steps:
+        for x in x_steps:
+            patch = image_pad[y:y+patch_size, x:x+patch_size, :]
+            if patch_size != image_size:
+                patch_input = cv2.resize(patch, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+            else:
+                patch_input = patch
+            
+            img_tensor = torch.from_numpy(patch_input).permute(2, 0, 1).float().to(device)
+            
+            input_sample = [{
+                'image': img_tensor,
+                'original_size': (image_size, image_size), 
+                'text_prompt': text_prompt, 
+                'organ_id': organ_id, 
+                'attribute_text': attribute_text 
+            }]
+            
+            # 🔥 AMP + Inference Mode：5090 满血推理
+            with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 outputs = model(input_sample, multimask_output=True)
                 out = outputs[0]
                 best_idx = torch.argmax(out['iou_predictions']).item()
                 logits = out['masks'][0, best_idx, :, :] 
-                
-                logits = logits.unsqueeze(0).unsqueeze(0) 
-                if patch_size != image_size:
-                    logits_orig = F.interpolate(logits, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
-                else:
-                    logits_orig = logits
-                
-                prob_patch = torch.sigmoid(logits_orig).squeeze().cpu().numpy()
-                prob_map_full[y:y+patch_size, x:x+patch_size] += prob_patch
-                count_map_full[y:y+patch_size, x:x+patch_size] += 1.0
+            
+            logits = logits.unsqueeze(0).unsqueeze(0) 
+            if patch_size != image_size:
+                logits_orig = F.interpolate(logits, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
+            else:
+                logits_orig = logits
+            
+            prob_patch = torch.sigmoid(logits_orig).squeeze().cpu().float().numpy()
+            # 🔥 高斯加权拼接：消除 Patch 边缘突变
+            prob_map_full[y:y+patch_size, x:x+patch_size] += prob_patch * weight_map
+            count_map_full[y:y+patch_size, x:x+patch_size] += weight_map
                 
     count_map_full[count_map_full == 0] = 1.0
     avg_prob = prob_map_full / count_map_full
