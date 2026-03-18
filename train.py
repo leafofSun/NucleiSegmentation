@@ -525,8 +525,11 @@ def main(args):
     if args.resume and os.path.exists(args.resume):
         if rank == 0: logger.info(f"🔄 Resuming from: {args.resume} (Start Epoch: {args.start_epoch})")
         try:
-            ckpt = torch.load(args.resume, map_location='cpu')
-            raw_model.load_state_dict(ckpt, strict=False)
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+            state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+            # 🔥 关键：插值拉伸位置编码，512→1024 拒绝"失忆"！
+            state_dict = resize_pos_embed(state_dict, raw_model.state_dict())
+            raw_model.load_state_dict(state_dict, strict=False)
             if rank == 0: logger.info("✅ Resume weights loaded successfully.")
         except Exception as e:
             if rank == 0: logger.warning(f"⚠️ Resume failed: {e}")
