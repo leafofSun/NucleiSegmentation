@@ -209,7 +209,9 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
                     iou_preds = out[0]['iou_predictions']
                     best_idx = torch.argmax(iou_preds).item()
                     pred_logits_target = out[0]['masks'][0, best_idx]
-                    hv_logits_target = out[0].get('hv_logits', None) # 提取 HV
+                    hv_logits_target = out[0].get('hv_logits', None)  # 提取 HV
+                    if hv_logits_target is not None:
+                        hv_logits_target = torch.tanh(hv_logits_target)
             
             pred_logits_256 = F.interpolate(pred_logits_target.unsqueeze(0).unsqueeze(0), size=(patch_size, patch_size), mode='bilinear', align_corners=False).squeeze()
             pred_prob_256 = torch.sigmoid(pred_logits_256)
@@ -258,7 +260,8 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         organ_ids = batched_input.get('organ_id', None)
         attr_texts = batched_input.get('attribute_text', ["Cell nuclei"] * len(images))
         base_texts = batched_input.get('text_prompt', ["Cell nuclei"] * len(images))
-        attr_labels = batched_input.get('attr_labels', None)
+        # 与 TextSam 期望的 attribute_labels / attribute_prompts 对齐
+        attr_labels = batched_input.get('attribute_labels', batched_input.get('attr_labels', None))
 
         for i in range(len(images)):
             curr_id = 20
@@ -267,8 +270,12 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 curr_id = val.item() if isinstance(val, torch.Tensor) else val
 
             model_input.append({
-                'image': images[i], 'original_size': (args.image_size, args.image_size), 'organ_id': curr_id,
-                'attribute_text': attr_texts[i], 'text_prompt': base_texts[i], 'attr_labels': attr_labels[i] if attr_labels is not None else None
+                'image': images[i],
+                'original_size': (args.image_size, args.image_size),
+                'organ_id': curr_id,
+                'attribute_text': attr_texts[i],
+                'text_prompt': base_texts[i],
+                'attribute_labels': attr_labels[i] if attr_labels is not None else None,
             })
 
         with autocast('cuda', enabled=args.use_amp):
@@ -304,42 +311,46 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 if pred_hv is not None:
                     if pred_hv.dim() == 3:
                         pred_hv = pred_hv.unsqueeze(0)
+                    # 约束到 [-1, 1] 空间，与 GT 一致
+                    pred_hv = torch.tanh(pred_hv)
 
                     with torch.no_grad():
                         gt_hv_map_batch = batched_input.get("gt_hv_map", None)
                         if gt_hv_map_batch is not None:
-                            gt_hv_full = gt_hv_map_batch[i].to(pred_hv.device)  
+                            gt_hv_full = gt_hv_map_batch[i].to(pred_hv.device)
                             if gt_hv_full.dim() == 3:
-                                gt_hv_full = gt_hv_full.unsqueeze(0)  
+                                gt_hv_full = gt_hv_full.unsqueeze(0)
                         else:
                             inst_batch = batched_input.get("label_inst", None)
-                            if inst_batch is not None:
-                                inst_map = inst_batch[i].squeeze(0).long()
+                            if inst_batch is None:
+                                gt_hv_full = None
                             else:
-                                inst_map = labels[i].squeeze(0).long()
-                            inst_map = inst_map.clone()
-                            inst_map[inst_map == 255] = 0
-                            gt_hv_full = generate_hv_map_from_inst(inst_map).unsqueeze(0)  
+                                inst_map = inst_batch[i].squeeze(0).long()
+                                inst_map = inst_map.clone()
+                                inst_map[inst_map == 255] = 0
+                                gt_hv_full = generate_hv_map_from_inst(inst_map).unsqueeze(0)
 
-                        gt_hv = F.interpolate(
-                            gt_hv_full.float(),
-                            size=pred_hv.shape[-2:],
-                            mode='bilinear',
-                            align_corners=False,
-                        )
+                        if gt_hv_full is not None:
+                            gt_hv = F.interpolate(
+                                gt_hv_full.float(),
+                                size=pred_hv.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False,
+                            )
 
-                        inst_batch = batched_input.get("label_inst", None)
-                        if inst_batch is not None:
-                            focus_full = (inst_batch[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
-                        else:
-                            focus_full = (labels[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
-                        focus = F.interpolate(focus_full, size=pred_hv.shape[-2:], mode='nearest').squeeze(1)  
+                            inst_batch = batched_input.get("label_inst", None)
+                            if inst_batch is not None:
+                                focus_full = (inst_batch[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
+                            else:
+                                focus_full = (labels[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
+                            focus = F.interpolate(focus_full, size=pred_hv.shape[-2:], mode='nearest').squeeze(1)
 
-                    focus_exp = focus.unsqueeze(1)  
-                    mse_map = F.mse_loss(pred_hv.float(), gt_hv.float(), reduction='none')
-                    loss_hv_mse = (mse_map * focus_exp).sum() / (focus_exp.sum() * pred_hv.shape[1] + 1e-8)
-                    loss_hv_grad = msge_loss(gt_hv, pred_hv, focus)
-                    loss_hv = loss_hv_mse + 2.0 * loss_hv_grad
+                    if pred_hv is not None and gt_hv_full is not None:
+                        focus_exp = focus.unsqueeze(1)
+                        mse_map = F.mse_loss(pred_hv.float(), gt_hv.float(), reduction='none')
+                        loss_hv_mse = (mse_map * focus_exp).sum() / (focus_exp.sum() * pred_hv.shape[1] + 1e-8)
+                        loss_hv_grad = msge_loss(gt_hv, pred_hv, focus)
+                        loss_hv = loss_hv_mse + 2.0 * loss_hv_grad
                 
                 loss_attr = out.get('pnurl_loss', torch.tensor(0.0, device=loss_m.device))
                 if loss_attr.dim() > 0: loss_attr = loss_attr.mean()

@@ -214,6 +214,8 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
                 best_idx = torch.argmax(out['iou_predictions']).item()
                 logits = out['masks'][0, best_idx, :, :]
                 hv_logits = out.get('hv_logits', None)  # [1,2,h,w] or None
+                if hv_logits is not None:
+                    hv_logits = torch.tanh(hv_logits)
             
             logits = logits.unsqueeze(0).unsqueeze(0) 
             if patch_size != image_size:
