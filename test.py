@@ -25,6 +25,32 @@ try:
 except ImportError:
     pass
 
+# HoVer-style HV post-process (watershed from HV gradients)
+def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, min_marker_size=10):
+    """
+    prob_map: [H, W] float, nucleus probability
+    hv_map:   [2, H, W] float, (V,H) distances (0: V, 1: H)
+    """
+    mask = prob_map > prob_thresh
+    if not np.any(mask):
+        return np.zeros_like(mask, dtype=np.int32)
+
+    v_map = hv_map[0].astype(np.float32)
+    h_map = hv_map[1].astype(np.float32)
+
+    # Large-kernel Sobel to emphasize instance boundaries from HV collisions
+    sobel_h = cv2.Sobel(h_map, cv2.CV_32F, 1, 0, ksize=5)
+    sobel_v = cv2.Sobel(v_map, cv2.CV_32F, 0, 1, ksize=5)
+    sobel_mag = np.sqrt(sobel_h * sobel_h + sobel_v * sobel_v)
+    sobel_mag = 1.0 - (sobel_mag / (np.max(sobel_mag) + 1e-8))
+
+    marker_map = (sobel_mag * prob_map) > marker_thresh
+    marker_map = remove_small_objects(marker_map, min_size=min_marker_size)
+    markers = label(marker_map).astype(np.int32)
+
+    inst_map = watershed(-prob_map, markers, mask=mask)
+    return inst_map.astype(np.int32)
+
 # 器官 ID 配置
 ID_TO_ORGAN = {
     0: "Adrenal_gland", 1: "Bile-duct", 2: "Bladder", 3: "Breast", 
@@ -86,9 +112,9 @@ def parse_args():
     parser.add_argument("--work_dir", type=str, default="workdir")
     parser.add_argument("--run_name", type=str, default="universal_test") 
     parser.add_argument("--text_prompt", type=str, default=None)
-    parser.add_argument("--patch_size", type=int, default=256)
-    parser.add_argument("--image_size", type=int, default=512)
-    parser.add_argument("--stride", type=int, default=128)
+    parser.add_argument("--patch_size", type=int, default=512)
+    parser.add_argument("--image_size", type=int, default=1024)
+    parser.add_argument("--stride", type=int, default=256)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument("--data_path", type=str, default="data/PanNuke/test") 
     parser.add_argument("--knowledge_path", type=str, default="data/PanNuke/medical_knowledge.json", help="Path to global attributes JSON")
@@ -97,6 +123,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--save_pred", action='store_true')
     parser.add_argument("--use_watershed", action='store_true', default=True)
+    parser.add_argument("--use_hover_watershed", action='store_true', default=False, help="Use HoVer HV-gradient watershed post-process")
     parser.add_argument("--encoder_adapter", action='store_true')
     return parser.parse_args()
 
@@ -147,6 +174,7 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
     h_pad, w_pad = image_pad.shape[:2]
     
     prob_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
+    hv_map_full = np.zeros((2, h_pad, w_pad), dtype=np.float32)  # (V,H)
     count_map_full = np.zeros((h_pad, w_pad), dtype=np.float32)
     
     real_stride = min(stride, patch_size)
@@ -184,7 +212,8 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
                 outputs = model(input_sample, multimask_output=True)
                 out = outputs[0]
                 best_idx = torch.argmax(out['iou_predictions']).item()
-                logits = out['masks'][0, best_idx, :, :] 
+                logits = out['masks'][0, best_idx, :, :]
+                hv_logits = out.get('hv_logits', None)  # [1,2,h,w] or None
             
             logits = logits.unsqueeze(0).unsqueeze(0) 
             if patch_size != image_size:
@@ -193,13 +222,25 @@ def sliding_window_inference(model, image, device, patch_size, image_size, strid
                 logits_orig = logits
             
             prob_patch = torch.sigmoid(logits_orig).squeeze().cpu().float().numpy()
+
+            hv_patch = None
+            if hv_logits is not None:
+                # hv at feature resolution -> patch_size
+                if hv_logits.dim() == 3:
+                    hv_logits = hv_logits.unsqueeze(0)
+                hv_up = F.interpolate(hv_logits.float(), size=(patch_size, patch_size), mode='bilinear', align_corners=False)
+                hv_patch = hv_up.squeeze(0).detach().cpu().numpy().astype(np.float32)  # [2, ps, ps]
+
             # 🔥 高斯加权拼接：消除 Patch 边缘突变
             prob_map_full[y:y+patch_size, x:x+patch_size] += prob_patch * weight_map
+            if hv_patch is not None:
+                hv_map_full[:, y:y+patch_size, x:x+patch_size] += hv_patch * weight_map[None, ...]
             count_map_full[y:y+patch_size, x:x+patch_size] += weight_map
                 
     count_map_full[count_map_full == 0] = 1.0
     avg_prob = prob_map_full / count_map_full
-    return avg_prob[:h, :w]
+    avg_hv = hv_map_full / count_map_full[None, ...]
+    return avg_prob[:h, :w], avg_hv[:, :h, :w]
 
 def get_organ_from_json(img_path):
     json_path = os.path.splitext(img_path)[0] + ".json"
@@ -384,30 +425,68 @@ def main(args):
 
         pbar.write(f"🖼️  {filename} | Oracle: [{gt_size_tag}, {gt_density_tag}] ➔ Adaptive: min_size={dynamic_min_size}, min_dist={dynamic_min_dist}")
 
-        # TTA 推理
-        prob_orig = sliding_window_inference(model, image_rgb, args.device, args.patch_size, args.image_size, args.stride, class_prompt_text, current_organ_id, "", filename)
+        # TTA 推理 (同时返回 prob + hv)
+        prob_orig, hv_orig = sliding_window_inference(
+            model, image_rgb, args.device, args.patch_size, args.image_size, args.stride,
+            class_prompt_text, current_organ_id, "", filename
+        )
+
+        # Horizontal flip: spatial flip + H 通道取反
         img_h = cv2.flip(image_rgb, 1)
-        prob_h = sliding_window_inference(model, img_h, args.device, args.patch_size, args.image_size, args.stride, class_prompt_text, current_organ_id, "", filename)
+        prob_h, hv_h = sliding_window_inference(
+            model, img_h, args.device, args.patch_size, args.image_size, args.stride,
+            class_prompt_text, current_organ_id, "", filename
+        )
         prob_h = cv2.flip(prob_h, 1)
+        hv_h = np.flip(hv_h, axis=2).copy()
+        hv_h[1] = -hv_h[1]
+
+        # Vertical flip: spatial flip + V 通道取反
         img_v = cv2.flip(image_rgb, 0)
-        prob_v = sliding_window_inference(model, img_v, args.device, args.patch_size, args.image_size, args.stride, class_prompt_text, current_organ_id, "", filename)
+        prob_v, hv_v = sliding_window_inference(
+            model, img_v, args.device, args.patch_size, args.image_size, args.stride,
+            class_prompt_text, current_organ_id, "", filename
+        )
         prob_v = cv2.flip(prob_v, 0)
+        hv_v = np.flip(hv_v, axis=1).copy()
+        hv_v[0] = -hv_v[0]
         
         target_shape = prob_orig.shape
-        def safe_crop(arr, shape): return arr[: shape[0], : shape[1]]
-        prob_h = safe_crop(prob_h, target_shape)
-        prob_v = safe_crop(prob_v, target_shape)
-        
-        pred_prob = (prob_orig + prob_h + prob_v) / 3.0
+        def safe_crop2d(arr, shape): return arr[: shape[0], : shape[1]]
+        def safe_crop3d(arr, shape): return arr[:, : shape[0], : shape[1]]
+        prob_h = safe_crop2d(prob_h, target_shape)
+        prob_v = safe_crop2d(prob_v, target_shape)
+        hv_h = safe_crop3d(hv_h, target_shape)
+        hv_v = safe_crop3d(hv_v, target_shape)
 
-        # 🔥 4. 使用推导出的动态参数调用分水岭！(固定神级阈值 0.45)
+        pred_prob = (prob_orig + prob_h + prob_v) / 3.0
+        pred_hv = (hv_orig + hv_h + hv_v) / 3.0
+
+        # 🔥 4. 后处理：可控消融 (HoVer-Watershed vs 传统距离分水岭)
         if args.use_watershed:
-            pred_mask = post_process_watershed(
-                pred_prob, 
-                threshold=0.45, 
-                min_size=dynamic_min_size, 
-                min_distance=dynamic_min_dist
-            )
+            if args.use_hover_watershed:
+                pred_mask = hover_post_process(
+                    pred_prob,
+                    pred_hv,
+                    prob_thresh=0.45,
+                    marker_thresh=0.4,
+                    min_marker_size=max(10, int(dynamic_min_size * 0.25)),
+                )
+                # 如果 marker 太少导致失败，fallback 到传统分水岭
+                if pred_mask.max() == 0:
+                    pred_mask = post_process_watershed(
+                        pred_prob,
+                        threshold=0.45,
+                        min_size=dynamic_min_size,
+                        min_distance=dynamic_min_dist,
+                    )
+            else:
+                pred_mask = post_process_watershed(
+                    pred_prob,
+                    threshold=0.45,
+                    min_size=dynamic_min_size,
+                    min_distance=dynamic_min_dist,
+                )
         else:
             pred_mask = label(pred_prob > 0.45).astype(np.int32)
         

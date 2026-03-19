@@ -190,6 +190,41 @@ def generate_adaptive_density(mask, image_size=(1024, 1024)):
 
     return cv2.resize(heatmap, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
+
+def generate_hv_map(inst_mask: np.ndarray) -> np.ndarray:
+    """
+    将实例掩膜转化为 HoVer 风格 HV 距离图。
+    返回: [2, H, W] 的 numpy 数组 (0: V, 1: H), 范围约在 [-1, 1]，背景为 0。
+    """
+    if inst_mask.ndim != 2:
+        raise ValueError(f"inst_mask must be 2D, got shape={inst_mask.shape}")
+
+    h, w = inst_mask.shape
+    hv_map = np.zeros((2, h, w), dtype=np.float32)
+
+    props = regionprops(inst_mask.astype(np.int32))
+    for prop in props:
+        y_min, x_min, y_max, x_max = prop.bbox
+        y_c, x_c = prop.centroid
+
+        # local grids
+        y_grid, x_grid = np.mgrid[y_min:y_max, x_min:x_max]
+
+        # normalize to [-1, 1]
+        y_den = (y_max - y_min) / 2.0 + 1e-8
+        x_den = (x_max - x_min) / 2.0 + 1e-8
+        y_dist = (y_grid - y_c) / y_den
+        x_dist = (x_grid - x_c) / x_den
+
+        y_dist = np.clip(y_dist, -1.0, 1.0).astype(np.float32)
+        x_dist = np.clip(x_dist, -1.0, 1.0).astype(np.float32)
+
+        inst_bool = inst_mask[y_min:y_max, x_min:x_max] == prop.label
+        hv_map[0, y_min:y_max, x_min:x_max][inst_bool] = y_dist[inst_bool]  # V
+        hv_map[1, y_min:y_max, x_min:x_max][inst_bool] = x_dist[inst_bool]  # H
+
+    return hv_map
+
 # ==============================================================================
 # 3. 通用数据集类 (🔥 Fix Black Borders)
 # ==============================================================================
@@ -277,11 +312,14 @@ class UniversalDataset(data.Dataset):
         with open(json_path, 'r') as f:
             data = json.load(f)
         h, w = data.get('height', 256), data.get('width', 256)
-        mask = np.zeros((h, w), dtype=np.uint8)
+        # 🔥 保留实例 ID（避免所有 nuclei 融合为二值图）
+        mask = np.zeros((h, w), dtype=np.int32)
+        inst_id = 1
         for ann in data.get('annotations', []):
             for poly in ann.get('segmentation', []):
                 pts = np.array(poly, dtype=np.int32).reshape((-1, 2))
-                cv2.fillPoly(mask, [pts], 1)
+                cv2.fillPoly(mask, [pts], inst_id)
+                inst_id += 1
         return mask
 
     def _sample_dynamic_task(self, mask, regions):
@@ -317,7 +355,9 @@ class UniversalDataset(data.Dataset):
         # 2. Augment
         augmented = self.transform(image=image, mask=mask)
         img_tensor = augmented['image'].float()
-        aug_mask = augmented['mask'].numpy().astype(np.uint8)
+        # albumentations 会保持 mask 的整数语义，这里显式转为 int32 作为实例图
+        aug_mask_inst = augmented['mask'].numpy().astype(np.int32)
+        aug_mask = (aug_mask_inst > 0).astype(np.uint8)
         
         # 3. Physics & Dynamic Task
         area_scale = 1.0 
@@ -348,6 +388,8 @@ class UniversalDataset(data.Dataset):
         label_tensor = torch.from_numpy(aug_mask).long().unsqueeze(0)
         # 生成密度图
         gt_heatmap = generate_adaptive_density(aug_mask, image_size=(self.image_size, self.image_size))
+        # 🔥 生成 HV GT（基于实例图）
+        gt_hv_map = generate_hv_map(aug_mask_inst)
         
         if self.mode == 'train' and random.random() < 0.2:
             organ_id = 20
@@ -355,7 +397,9 @@ class UniversalDataset(data.Dataset):
         return {
             "image": img_tensor,
             "label": label_tensor,
+            "label_inst": torch.from_numpy(aug_mask_inst).long().unsqueeze(0),
             "gt_heatmap": torch.from_numpy(gt_heatmap).float().unsqueeze(0),
+            "gt_hv_map": torch.from_numpy(gt_hv_map).float(),
             "organ_id": organ_id,
             "text_prompt": text_prompt,
             "attr_labels": torch.tensor(analysis['labels']).long(),

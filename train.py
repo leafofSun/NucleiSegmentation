@@ -34,9 +34,15 @@ from DataLoader import UniversalDataset, stack_dict_batched
 
 # 🔥 Core Tools
 from utils import FocalDiceloss_IoULoss, point_guidance_loss, get_logger, physical_semantic_consistency_loss, density_map_loss
-
-# 🔥 Metrics
 from metrics import SegMetrics
+
+# HoVer-style HV supervision
+from hover_loss import msge_loss, generate_hv_map_from_inst
+
+# 后处理依赖
+from skimage.segmentation import watershed
+from skimage.morphology import remove_small_objects
+from skimage.measure import label as skimage_label
 
 # 🔥 [SPEEDUP] 开启 TF32 (RTX 30/40/50系 核心加速)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -48,34 +54,29 @@ torch.backends.cudnn.allow_tf32 = True
 def parse_args():
     parser = argparse.ArgumentParser(description="MP-SAM: Explicit-Implicit Dual-Stream Training")
     
-    # ... Environment ...
     parser.add_argument("--work_dir", type=str, default="workdir", help="Directory to save logs and models")
     parser.add_argument("--run_name", type=str, default="mp_sam_pannuke_final", help="Experiment name")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation")
     
-    # ... Data ...
     parser.add_argument("--data_path", type=str, default="data/PanNuke", help="Root directory of dataset")
     parser.add_argument("--knowledge_path", type=str, default="data/PanNuke/medical_knowledge.json", help="Path to KB")
     
-    # 🔥 SOTA 设置：原生 512 / 1024
     parser.add_argument("--image_size", type=int, default=512, help="SAM input resolution")
     parser.add_argument("--crop_size", type=int, default=512, help="Patch Size") 
     parser.add_argument("--mask_num", type=int, default=1, help="Number of masks per proposal")
 
-    # ... Model ...
     parser.add_argument("--model_type", type=str, default="vit_b", choices=["vit_b", "vit_l", "vit_h"], help="Backbone")
     parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d_b.pth", help="Checkpoint")
     parser.add_argument("--clip_model", type=str, default="ViT-B/16", help="CLIP model version")
     parser.add_argument("--num_organs", type=int, default=21, help="Number of organ categories")
     parser.add_argument("--encoder_adapter", action='store_true', default=True, help="Use Adapters")
-    # Cross-Attention 超参数
+    parser.add_argument("--hv_weight", type=float, default=1.0, help="Weight for HoVer HV supervision loss")
     parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads for multi-modal fusion")
 
-    # 🔥 SG-OT 核心超参数
-    parser.add_argument("--sg_epsilon", type=float, default=0.05, help="Sinkhorn熵正则化系数 (越大越平滑, 越小越精确但易溢出)")
-    parser.add_argument("--sg_iters", type=int, default=3, help="Sinkhorn迭代次数 (通常 3~5 次即收敛)")
+    parser.add_argument("--sg_epsilon", type=float, default=0.05, help="Sinkhorn熵正则化系数")
+    parser.add_argument("--sg_iters", type=int, default=3, help="Sinkhorn迭代次数")
 
     parser.add_argument("--epochs", type=int, default=300) 
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU") 
@@ -84,7 +85,6 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--use_amp", action='store_true', default=True, help="Use AMP")
     
-    # ... Loss ...
     parser.add_argument("--mask_weight", type=float, default=10.0)
     parser.add_argument("--heatmap_weight", type=float, default=1.0)
     parser.add_argument("--attr_weight", type=float, default=0.1) 
@@ -93,7 +93,6 @@ def parse_args():
     parser.add_argument("--consistency_warmup_epochs", type=int, default=50) 
     parser.add_argument("--density_map_weight", type=float, default=0.5) 
 
-    # 🔥🔥🔥 [新增] 断点续训参数
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from")
     parser.add_argument("--start_epoch", type=int, default=0, help="Epoch to start from")
 
@@ -102,7 +101,7 @@ def parse_args():
     return parser.parse_args()
 
 # ==================================================================================================
-# 2. Utils
+# 2. Utils & Post-Processing
 # ==================================================================================================
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -152,10 +151,34 @@ def get_gaussian_weight_map(patch_size, device):
     weight_map = weight_map / weight_map.max()
     return weight_map
 
+# 🔥 [新增] 训练集适用的 HoVer 后处理 (优化 ksize=5)
+def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, min_marker_size=10):
+    mask = prob_map > prob_thresh
+    if not np.any(mask):
+        return np.zeros_like(mask, dtype=np.int32)
+
+    v_map = hv_map[0].astype(np.float32)
+    h_map = hv_map[1].astype(np.float32)
+
+    # 缩小感受野，精确刻画边界
+    sobel_h = cv2.Sobel(h_map, cv2.CV_32F, 1, 0, ksize=5)
+    sobel_v = cv2.Sobel(v_map, cv2.CV_32F, 0, 1, ksize=5)
+    sobel_mag = np.sqrt(sobel_h * sobel_h + sobel_v * sobel_v)
+    sobel_mag = 1.0 - (sobel_mag / (np.max(sobel_mag) + 1e-8))
+
+    marker_map = (sobel_mag * prob_map) > marker_thresh
+    marker_map = remove_small_objects(marker_map, min_size=min_marker_size)
+    markers = skimage_label(marker_map).astype(np.int32)
+
+    inst_map = watershed(-prob_map, markers, mask=mask)
+    return inst_map.astype(np.int32)
+
+# 🔥 [修改] 返回概率图和 HV 图
 def sliding_window_inference(model, image, organ_id, patch_size=256, target_size=512, stride=None, device='cuda'):
     C, H, W = image.shape
     if stride is None: stride = patch_size // 2
     full_prob_map = torch.zeros((H, W), device=device)
+    full_hv_map = torch.zeros((2, H, W), device=device) # 新增 HV Map
     count_map = torch.zeros((H, W), device=device)
     weight_map = get_gaussian_weight_map(patch_size, device)
 
@@ -173,7 +196,6 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
             
             patch = image[:, y1:y1+patch_size, x1:x1+patch_size]
             
-            # 安全逻辑
             if patch.shape[-1] != target_size:
                 patch_resized = F.interpolate(patch.unsqueeze(0), size=(target_size, target_size), mode='bilinear', align_corners=False)
             else:
@@ -187,18 +209,26 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
                     iou_preds = out[0]['iou_predictions']
                     best_idx = torch.argmax(iou_preds).item()
                     pred_logits_target = out[0]['masks'][0, best_idx]
+                    hv_logits_target = out[0].get('hv_logits', None) # 提取 HV
             
-            # 还原尺寸
             pred_logits_256 = F.interpolate(pred_logits_target.unsqueeze(0).unsqueeze(0), size=(patch_size, patch_size), mode='bilinear', align_corners=False).squeeze()
             pred_prob_256 = torch.sigmoid(pred_logits_256)
             full_prob_map[y1:y1+patch_size, x1:x1+patch_size] += pred_prob_256 * weight_map
+            
+            if hv_logits_target is not None:
+                hv_logits_target = hv_logits_target.squeeze(0) if hv_logits_target.dim() == 4 else hv_logits_target
+                hv_256 = F.interpolate(hv_logits_target.unsqueeze(0), size=(patch_size, patch_size), mode='bilinear', align_corners=False).squeeze(0)
+                full_hv_map[:, y1:y1+patch_size, x1:x1+patch_size] += hv_256 * weight_map
+
             count_map[y1:y1+patch_size, x1:x1+patch_size] += weight_map
 
-    full_prob_map /= torch.clamp(count_map, min=1e-5)
-    return full_prob_map
+    count_map = torch.clamp(count_map, min=1e-5)
+    full_prob_map /= count_map
+    full_hv_map /= count_map
+    return full_prob_map, full_hv_map
 
 # ==================================================================================================
-# 3. Training Logic (Native 512 + 30% Dropout)
+# 3. Training Logic
 # ==================================================================================================
 def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank):
     model.train()
@@ -219,7 +249,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         images = batched_input['image']
         labels = batched_input['label']
 
-        # 🔥 [安全逻辑]
         if images.shape[-1] != args.image_size:
              images = F.interpolate(images, size=(args.image_size, args.image_size), mode='bilinear', align_corners=False)
              labels = F.interpolate(labels.float(), size=(args.image_size, args.image_size), mode='nearest').long()
@@ -265,6 +294,48 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                     gt_nuclei = F.interpolate(target_mask, size=pred_heatmap.shape[-2:], mode='nearest').squeeze(0)
                     gt_nuclei[gt_nuclei==255] = 0
                 loss_h = point_guidance_loss(pred_heatmap, gt_nuclei.unsqueeze(0))
+
+                loss_hv = torch.tensor(0.0, device=loss_m.device)
+                pred_hv = out.get('hv_logits', None)
+                if pred_hv is not None:
+                    if pred_hv.dim() == 3:
+                        pred_hv = pred_hv.unsqueeze(0)
+
+                    with torch.no_grad():
+                        gt_hv_map_batch = batched_input.get("gt_hv_map", None)
+                        if gt_hv_map_batch is not None:
+                            gt_hv_full = gt_hv_map_batch[i].to(pred_hv.device)  
+                            if gt_hv_full.dim() == 3:
+                                gt_hv_full = gt_hv_full.unsqueeze(0)  
+                        else:
+                            inst_batch = batched_input.get("label_inst", None)
+                            if inst_batch is not None:
+                                inst_map = inst_batch[i].squeeze(0).long()
+                            else:
+                                inst_map = labels[i].squeeze(0).long()
+                            inst_map = inst_map.clone()
+                            inst_map[inst_map == 255] = 0
+                            gt_hv_full = generate_hv_map_from_inst(inst_map).unsqueeze(0)  
+
+                        gt_hv = F.interpolate(
+                            gt_hv_full.float(),
+                            size=pred_hv.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False,
+                        )
+
+                        inst_batch = batched_input.get("label_inst", None)
+                        if inst_batch is not None:
+                            focus_full = (inst_batch[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
+                        else:
+                            focus_full = (labels[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
+                        focus = F.interpolate(focus_full, size=pred_hv.shape[-2:], mode='nearest').squeeze(1)  
+
+                    focus_exp = focus.unsqueeze(1)  
+                    mse_map = F.mse_loss(pred_hv.float(), gt_hv.float(), reduction='none')
+                    loss_hv_mse = (mse_map * focus_exp).sum() / (focus_exp.sum() * pred_hv.shape[1] + 1e-8)
+                    loss_hv_grad = msge_loss(gt_hv, pred_hv, focus)
+                    loss_hv = loss_hv_mse + 2.0 * loss_hv_grad
                 
                 loss_attr = out.get('pnurl_loss', torch.tensor(0.0, device=loss_m.device))
                 if loss_attr.dim() > 0: loss_attr = loss_attr.mean()
@@ -290,7 +361,12 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                     B_zero, C_zero, H_zero, W_zero = pred_mask_logits.shape
                     density_map_list.append(torch.zeros((B_zero, 1, H_zero, W_zero), device=pred_mask.device))
                 
-                loss_i = args.mask_weight * loss_m + args.heatmap_weight * loss_h + args.attr_weight * loss_attr
+                loss_i = (
+                    args.mask_weight * loss_m
+                    + args.heatmap_weight * loss_h
+                    + args.attr_weight * loss_attr
+                    + getattr(args, "hv_weight", 1.0) * loss_hv
+                )
                 loss_batch += loss_i
                 loss_m_accum += loss_m.item(); loss_h_accum += loss_h.item(); loss_attr_accum += loss_attr.item()
             
@@ -317,20 +393,15 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             final_loss = loss_batch / len(images)
             final_loss = final_loss / args.accumulation_steps
 
-        # 判断是否在累加阶段 (不是最后一步)
         is_accumulating = (batch_idx + 1) % args.accumulation_steps != 0 and (batch_idx + 1) != len(train_loader)
-
-        # 如果在累加，就关闭 DDP 同步；否则正常同步 (单卡时 no_sync 不存在，用 nullcontext)
         sync_context = model.no_sync() if (is_accumulating and hasattr(model, 'no_sync')) else nullcontext()
 
-        # 1. Backward (每一步都做，累加时 no_sync 避免无效跨卡通信)
         with sync_context:
             if scaler:
                 scaler.scale(final_loss).backward()
             else:
                 final_loss.backward()
 
-        # 2. Optimizer Step (只在累积点做)
         if not is_accumulating:
             if scaler:
                 scaler.unscale_(optimizer)
@@ -340,7 +411,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             else:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-
             optimizer.zero_grad()
 
         current_loss_val = final_loss.item() * args.accumulation_steps
@@ -361,7 +431,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
     return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses), np.mean(attr_losses)
 
 # ==================================================================================================
-# 4. Validation Logic (🔥 极速验证: 40% 抽样 + Shuffle)
+# 4. Validation Logic (🔥 接入 HoVer-Watershed)
 # ==================================================================================================
 @torch.no_grad()
 def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
@@ -372,7 +442,6 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
     val_results = {k: [] for k in args.metrics}
     visualize_done = False
     
-    # 🔥 [优化 1] 计算 40% 的截断点
     total_val_batches = len(val_loader)
     limit_batches = int(total_val_batches * 0.4)
     if limit_batches < 1: limit_batches = 1
@@ -383,7 +452,6 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
     eval_model = model.module if hasattr(model, 'module') else model
     
     for batch, batched_input in enumerate(pbar):
-        # 🔥 [优化 2] 达到 40% 立即停止
         if batch >= limit_batches:
             break
 
@@ -404,7 +472,8 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
             infer_stride = int(args.crop_size * 0.75) 
             
             with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                prob_map = sliding_window_inference(
+                # 🔥 接收 prob_map 和 hv_map
+                prob_map, hv_map = sliding_window_inference(
                     eval_model, images[i], 
                     organ_id=curr_organ_id, 
                     patch_size=args.crop_size, 
@@ -413,7 +482,16 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                     device=args.device
                 )
             
-            pred_mask = (prob_map.cpu().numpy() > 0.5).astype(np.uint8)
+            prob_np = prob_map.cpu().numpy()
+            hv_np = hv_map.cpu().numpy()
+
+            # 🔥 执行快速的神级分水岭
+            pred_mask = hover_post_process(prob_np, hv_np, prob_thresh=0.45, marker_thresh=0.4, min_marker_size=10)
+            
+            # Fallback 保护
+            if pred_mask.max() == 0:
+                pred_mask = (prob_np > 0.5).astype(np.uint8)
+
             gt = labels[i]; gt = gt[0] if gt.ndim == 3 else gt
             gt_valid = gt.copy(); gt_valid[gt == 255] = 0
             
@@ -429,7 +507,9 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                 img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min() + 1e-5)
                 writer.add_image(f'Val_Viz/Image', torch.tensor(img_vis.transpose(2, 0, 1)), epoch)
                 writer.add_image(f'Val_Viz/GT', torch.tensor(gt_valid * 255).unsqueeze(0).to(torch.uint8), epoch)
-                writer.add_image(f'Val_Viz/Pred', torch.tensor(pred_mask * 255).unsqueeze(0).to(torch.uint8), epoch)
+                # 因为 watershed 输出的是实例图 (1,2,3...), 用于可视化时二值化
+                pred_binary = (pred_mask > 0).astype(np.uint8)
+                writer.add_image(f'Val_Viz/Pred', torch.tensor(pred_binary * 255).unsqueeze(0).to(torch.uint8), epoch)
                 visualize_done = True
         
         if rank == 0 and 'mAJI' in args.metrics and len(val_results['mAJI']) > 0:
@@ -473,17 +553,15 @@ def main(args):
         model_save_dir = os.path.join(args.work_dir, "models", args.run_name)
         os.makedirs(run_log_dir, exist_ok=True); os.makedirs(text_log_dir, exist_ok=True); os.makedirs(model_save_dir, exist_ok=True)
         logger = get_logger(os.path.join(text_log_dir, f"{args.run_name}_{timestamp}.log"))
-        writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
         logger.info(f"🚀 [Start] MP-SAM Stable (Size: {args.image_size})")
         logger.info(f"    GPUs: {world_size}, Batch/GPU: {args.batch_size}, Resume: {args.resume if args.resume else 'No'}")
+        writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
     else: logger = None; writer = None
 
     train_dataset = UniversalDataset(data_root=args.data_path, knowledge_path=args.knowledge_path, image_size=args.image_size, crop_size=args.crop_size, mode='train', prompt_mode='dynamic')
     val_dataset = UniversalDataset(data_root=args.data_path, knowledge_path=args.knowledge_path, image_size=args.image_size, crop_size=args.crop_size, mode='test', prompt_mode='generic')
     
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
-    
-    # 🔥 [优化 3] 验证集开启 Shuffle，保证 40% 抽样具有代表性
     val_sampler = DistributedSampler(val_dataset, shuffle=True) if world_size > 1 else None
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), 
@@ -518,16 +596,13 @@ def main(args):
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
-    # 兼容性定义
     raw_model = model.module if world_size > 1 else model
 
-    # 🔥🔥🔥 [关键] 断点续训逻辑
     if args.resume and os.path.exists(args.resume):
         if rank == 0: logger.info(f"🔄 Resuming from: {args.resume} (Start Epoch: {args.start_epoch})")
         try:
             checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
             state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-            # 🔥 关键：插值拉伸位置编码，512→1024 拒绝"失忆"！
             state_dict = resize_pos_embed(state_dict, raw_model.state_dict())
             raw_model.load_state_dict(state_dict, strict=False)
             if rank == 0: logger.info("✅ Resume weights loaded successfully.")
@@ -542,7 +617,6 @@ def main(args):
               {'params': raw_model.prompt_generator.parameters(), 'lr': args.lr * 5}]
     if hasattr(raw_model, 'prompt_learner'): params.append({'params': raw_model.prompt_learner.parameters(), 'lr': args.lr})
     if hasattr(raw_model, 'pnurl'): params.append({'params': raw_model.pnurl.parameters(), 'lr': args.lr})
-    # 🔥 注册 SG-OT 模块到优化器
     if hasattr(raw_model, 'sg_ot'): params.append({'params': raw_model.sg_ot.parameters(), 'lr': args.lr * 5})
     adapter_params = [p for n, p in raw_model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
     if adapter_params: params.append({'params': adapter_params, 'lr': args.lr})
@@ -558,7 +632,6 @@ def main(args):
     
     for epoch in range(args.start_epoch, args.epochs):
         if train_sampler: train_sampler.set_epoch(epoch)
-        # 🔥 [优化 4] 验证集也要 Set Epoch，保证每次随机抽样不同数据
         if val_sampler: val_sampler.set_epoch(epoch)
         
         loss, m_loss, h_loss, a_loss = train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank)

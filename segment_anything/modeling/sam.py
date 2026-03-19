@@ -421,7 +421,7 @@ class TextSam(Sam):
             sg_ot_density = torch.ones(B, 1, H, W, device=device) / (H * W)
 
         # 🔥 执行 SG-OT 融合，取代传统的 prompt_generator 找点机制
-        fused_image_embeddings, heatmap_logits = self.sg_ot(
+        fused_image_embeddings, heatmap_logits, hv_logits = self.sg_ot(
             img_feat=refined_image_embeddings,
             txt_feat=pos_text_feats,
             density_map=sg_ot_density
@@ -492,6 +492,7 @@ class TextSam(Sam):
                     "iou_predictions": torch.zeros((1, 1), device=device) + dummy_connection,
                     "low_res_logits": (torch.zeros((1, 1, 256, 256), device=device) - 100.0) + dummy_connection,
                     "heatmap_logits": heatmap_logits[i].unsqueeze(0),
+                    "hv_logits": hv_logits[i].unsqueeze(0),
                     "attr_logits": attr_logits,
                     "density_map": density_map_i,
                     "pnurl_loss": pnurl_loss
@@ -573,6 +574,7 @@ class TextSam(Sam):
                 "iou_predictions": merged_iou,
                 "low_res_logits": merged_logits,
                 "heatmap_logits": heatmap_logits[i].unsqueeze(0),
+                "hv_logits": hv_logits[i].unsqueeze(0),
                 "attr_logits": attr_logits,
                 "density_map": density_map_i,
                 "pnurl_loss": pnurl_loss
