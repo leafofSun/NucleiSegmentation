@@ -38,13 +38,13 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, mi
     v_map = hv_map[0].astype(np.float32)
     h_map = hv_map[1].astype(np.float32)
 
-    # Large-kernel Sobel to emphasize instance boundaries from HV collisions
+    # Sobel 梯度幅值，使用绝对阈值而非按 max 归一化
     sobel_h = cv2.Sobel(h_map, cv2.CV_32F, 1, 0, ksize=5)
     sobel_v = cv2.Sobel(v_map, cv2.CV_32F, 0, 1, ksize=5)
     sobel_mag = np.sqrt(sobel_h * sobel_h + sobel_v * sobel_v)
-    sobel_mag = 1.0 - (sobel_mag / (np.max(sobel_mag) + 1e-8))
 
-    marker_map = (sobel_mag * prob_map) > marker_thresh
+    grad_thr = 0.5
+    marker_map = (sobel_mag < grad_thr) & (prob_map > prob_thresh)
     marker_map = remove_small_objects(marker_map, min_size=min_marker_size)
     markers = label(marker_map).astype(np.int32)
 

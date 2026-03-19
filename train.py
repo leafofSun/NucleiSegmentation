@@ -160,13 +160,13 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, mi
     v_map = hv_map[0].astype(np.float32)
     h_map = hv_map[1].astype(np.float32)
 
-    # 缩小感受野，精确刻画边界
+    # 缩小感受野，精确刻画边界；使用绝对梯度阈值，避免按 max 归一化放大噪声
     sobel_h = cv2.Sobel(h_map, cv2.CV_32F, 1, 0, ksize=5)
     sobel_v = cv2.Sobel(v_map, cv2.CV_32F, 0, 1, ksize=5)
     sobel_mag = np.sqrt(sobel_h * sobel_h + sobel_v * sobel_v)
-    sobel_mag = 1.0 - (sobel_mag / (np.max(sobel_mag) + 1e-8))
 
-    marker_map = (sobel_mag * prob_map) > marker_thresh
+    grad_thr = 0.5
+    marker_map = (sobel_mag < grad_thr) & (prob_map > prob_thresh)
     marker_map = remove_small_objects(marker_map, min_size=min_marker_size)
     markers = skimage_label(marker_map).astype(np.int32)
 
@@ -241,6 +241,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
     mask_losses = []
     heatmap_losses = []
     attr_losses = []
+    hv_losses = []
     
     optimizer.zero_grad(set_to_none=True)
     
@@ -273,7 +274,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         with autocast('cuda', enabled=args.use_amp):
             outputs = model(model_input, multimask_output=True)
             loss_batch = 0
-            loss_m_accum = 0; loss_h_accum = 0; loss_attr_accum = 0
+            loss_m_accum = 0.0
+            loss_h_accum = 0.0
+            loss_attr_accum = 0.0
+            loss_hv_accum = 0.0
             peak_counts_list = []; density_logits_list = []; density_map_list = []; pred_mask_list = []
             
             for i, out in enumerate(outputs):
@@ -368,7 +372,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                     + getattr(args, "hv_weight", 1.0) * loss_hv
                 )
                 loss_batch += loss_i
-                loss_m_accum += loss_m.item(); loss_h_accum += loss_h.item(); loss_attr_accum += loss_attr.item()
+                loss_m_accum += loss_m.item()
+                loss_h_accum += loss_h.item()
+                loss_attr_accum += loss_attr.item()
+                loss_hv_accum += loss_hv.item()
             
             loss_consistency = torch.tensor(0.0, device=loss_m.device)
             loss_consistency_accum = 0.0
@@ -414,19 +421,38 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             optimizer.zero_grad()
 
         current_loss_val = final_loss.item() * args.accumulation_steps
+        mean_m = loss_m_accum / len(images)
+        mean_h = loss_h_accum / len(images)
+        mean_attr = loss_attr_accum / len(images)
+        mean_hv = loss_hv_accum / len(images)
+
         losses.append(current_loss_val)
-        mask_losses.append(loss_m_accum / len(images)); heatmap_losses.append(loss_h_accum / len(images)); attr_losses.append(loss_attr_accum / len(images))
+        mask_losses.append(mean_m)
+        heatmap_losses.append(mean_h)
+        attr_losses.append(mean_attr)
+        hv_losses.append(mean_hv)
         
         if rank == 0 and writer is not None and batch_idx % 10 == 0:
             global_step = epoch * len(train_loader) + batch_idx
             writer.add_scalar('Train/Loss_Total', current_loss_val, global_step)
-            writer.add_scalar('Train/Loss_Mask', loss_m_accum / len(images), global_step)
-            writer.add_scalar('Train/Loss_Heatmap', loss_h_accum / len(images), global_step)
+            writer.add_scalar('Train/Loss_Mask', mean_m, global_step)
+            writer.add_scalar('Train/Loss_Heatmap', mean_h, global_step)
+            writer.add_scalar('Train/Loss_HV', mean_hv, global_step)
+            writer.add_scalar('Train/Loss_Attr', mean_attr, global_step)
             writer.add_scalar('Train/LR', optimizer.param_groups[0]['lr'], global_step)
         
         if rank == 0:
-            consistency_info = f" | Consist: {loss_consistency_accum:.3f}" if epoch >= args.consistency_warmup_epochs else ""
-            pbar.set_postfix(Loss=f"{current_loss_val:.3f}", Consist=consistency_info)
+            consistency_info = f"Cons={loss_consistency_accum:.3f}" if epoch >= args.consistency_warmup_epochs else "Cons=N/A"
+            dmap_info = f"DMap={loss_density_map_accum:.3f}"
+            pbar.set_postfix(
+                L=f"{current_loss_val:.3f}",
+                M=f"{mean_m:.3f}",
+                H=f"{mean_h:.3f}",
+                HV=f"{mean_hv:.3f}",
+                A=f"{mean_attr:.3f}",
+                Cons=consistency_info,
+                DMap=dmap_info,
+            )
 
     return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses), np.mean(attr_losses)
 
