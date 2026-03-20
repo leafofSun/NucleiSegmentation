@@ -20,6 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
 # Native AMP support
 try:
@@ -64,7 +65,7 @@ def parse_args():
     parser.add_argument("--knowledge_path", type=str, default="data/PanNuke/medical_knowledge.json", help="Path to KB")
     
     parser.add_argument("--image_size", type=int, default=512, help="SAM input resolution")
-    parser.add_argument("--crop_size", type=int, default=512, help="Patch Size") 
+    parser.add_argument("--crop_size", type=int, default=256, help="Patch Size") 
     parser.add_argument("--mask_num", type=int, default=1, help="Number of masks per proposal")
 
     parser.add_argument("--model_type", type=str, default="vit_b", choices=["vit_b", "vit_l", "vit_h"], help="Backbone")
@@ -662,8 +663,18 @@ def main(args):
     criterion = FocalDiceloss_IoULoss(weight=20.0, iou_scale=1.0, ignore_index=255)
     scaler = GradScaler() if args.use_amp else None
     
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-6)
+    warmup_epochs = 5
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, args.epochs - warmup_epochs),
+        eta_min=getattr(args, "min_lr", 1e-6),
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
+    )
 
     best_aji = 0.0; best_dice = 0.0
     
@@ -685,8 +696,7 @@ def main(args):
                 torch.save(raw_model.state_dict(), best_model_path)
                 logger.info(f"⭐ New Best AJI! ({best_aji:.4f}) -> Model Saved")
                 
-        val_aji = val_res.get('mAJI', 0.0)
-        scheduler.step(val_aji)
+        scheduler.step()
 
     if rank == 0:
         logger.info(f"🏁 Training Finished. Best AJI: {best_aji:.4f}")
