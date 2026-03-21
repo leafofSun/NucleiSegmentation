@@ -531,6 +531,7 @@ class TextSam(Sam):
                 
                 # 4. 局部扩展密度图 (Gating 用)
                 sub_density_map = density_map_proxy[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
+                sub_text_feat = pos_text_feats[i].unsqueeze(0).expand(current_batch, -1)
 
                 # 5. 编码 Prompt (针对当前 chunk)
                 sparse, dense = self.prompt_encoder(
@@ -548,6 +549,7 @@ class TextSam(Sam):
                     multimask_output=multimask_output,
                     high_freq_features=sub_high_freq,
                     density_map=sub_density_map,
+                    text_features=sub_text_feat,
                 )
                 chunk_masks.append(sub_mask)
                 chunk_ious.append(sub_iou)

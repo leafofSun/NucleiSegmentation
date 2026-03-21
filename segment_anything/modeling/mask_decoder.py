@@ -116,6 +116,7 @@ class MaskDecoder(nn.Module):
         iou_head_hidden_dim: int = 256,
         use_asr: bool = True,  # 🔥 新增开关：是否使用 ASR 高频细化
         guide_dim: int = None,  # 🔥 PNuRL fused_low 的维度，默认 192 (3 * 256 // 4)
+        text_feature_dim: int = 512,  # 文本特征维度（用于像素-文本对齐）
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -184,6 +185,7 @@ class MaskDecoder(nn.Module):
         self.iou_prediction_head = MLP(
             transformer_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth
         )  #256 256 4 3
+        self.text_to_pixel_proj = nn.Linear(text_feature_dim, transformer_dim // 8)
 
     def forward(
         self,
@@ -194,6 +196,7 @@ class MaskDecoder(nn.Module):
         multimask_output: bool,
         high_freq_features: torch.Tensor = None,  # 🔥 新增：PNuRL 的 fused_low 特征 [B, 192, 64, 64]
         density_map: torch.Tensor = None,  # 🔥 [New] AutoPoint 生成的密度图 [B, 1, 64, 64]
+        text_features: torch.Tensor = None,  # [B, D] 或 [B, K, D] 文本语义特征
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -218,6 +221,7 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             high_freq_features=high_freq_features,  # 🔥 传递高频特征
             density_map=density_map,  # 🔥 [New] 传递密度图
+            text_features=text_features,
         )
 
         # Select the correct mask or masks for output
@@ -239,6 +243,7 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         high_freq_features: torch.Tensor = None,  # 🔥 新增参数
         density_map: torch.Tensor = None,  # 🔥 [New] 密度图参数
+        text_features: torch.Tensor = None,  # [B, D] 或 [B, K, D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
         # Concatenate output tokens
@@ -270,6 +275,20 @@ class MaskDecoder(nn.Module):
             upscaled_embedding = self.asr_upscale_2(upscaled_embedding)
         else:
             upscaled_embedding = self.output_upscaling(src)
+
+        # 像素-文本分数对齐：仅放大语义匹配区域，抑制语义不一致像素
+        if text_features is not None:
+            if text_features.dim() == 3:
+                # 若传入 [B, K, D]，默认使用第一个文本向量（通常为正类）
+                text_features = text_features[:, 0, :]
+
+            t_feat = self.text_to_pixel_proj(text_features.to(upscaled_embedding.dtype))
+            t_feat = F.normalize(t_feat, dim=-1, eps=1e-6)
+
+            pixel_feat = F.normalize(upscaled_embedding, dim=1, eps=1e-6)
+            score_map = torch.einsum("bchw,bc->bhw", pixel_feat, t_feat).unsqueeze(1)
+            upscaled_embedding = upscaled_embedding * (1.0 + torch.sigmoid(score_map))
+
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
