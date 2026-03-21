@@ -161,19 +161,22 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, mi
     v_map = hv_map[0].astype(np.float32)
     h_map = hv_map[1].astype(np.float32)
 
-    # 缩小感受野，精确刻画边界；使用绝对梯度阈值，避免按 max 归一化放大噪声
-    sobel_h = cv2.Sobel(h_map, cv2.CV_32F, 1, 0, ksize=5)
-    sobel_v = cv2.Sobel(v_map, cv2.CV_32F, 0, 1, ksize=5)
-    sobel_mag = np.sqrt(sobel_h * sobel_h + sobel_v * sobel_v)
-
-    grad_thr = 0.5
-    marker_map = (sobel_mag < grad_thr) & (prob_map > prob_thresh)
+    # 舍弃 cv2.Sobel，改用更直接、对 [-1, 1] 更敏感的 np.gradient
+    diff_v = np.gradient(v_map, axis=0) 
+    diff_h = np.gradient(h_map, axis=1) 
+    
+    # 扩大梯度的响应范围，增强切断粘连的能力
+    sobel_mag = np.sqrt(diff_v**2 + diff_h**2)
+    
+    # 直接使用原始梯度幅值，避免在低边界场景中放大背景噪声
+    marker_map = prob_map - sobel_mag
+    marker_map = (marker_map > marker_thresh) & mask
+    
     marker_map = remove_small_objects(marker_map, min_size=min_marker_size)
     markers = skimage_label(marker_map).astype(np.int32)
 
     inst_map = watershed(-prob_map, markers, mask=mask)
     return inst_map.astype(np.int32)
-
 # 🔥 [修改] 返回概率图和 HV 图
 def sliding_window_inference(model, image, organ_id, patch_size=256, target_size=512, stride=None, device='cuda'):
     C, H, W = image.shape
@@ -295,6 +298,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 pred_mask = out['masks'][best_idx, :, :] if out['masks'].ndim==3 else out['masks'][0, best_idx]
                 pred_iou = iou_preds[best_idx]
                 gt_mask = labels[i].squeeze(0).float()
+                gt_mask = (gt_mask > 0).float()
                 
                 if pred_mask.shape != gt_mask.shape:
                       gt_mask = F.interpolate(gt_mask.unsqueeze(0).unsqueeze(0), size=pred_mask.shape, mode='nearest').squeeze()
@@ -401,7 +405,15 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             loss_density_map = torch.tensor(0.0, device=loss_m.device)
             loss_density_map_accum = 0.0
             if len(density_map_list) > 0:
-                gt_mask_batch = torch.cat([l.squeeze(0).float().unsqueeze(0).unsqueeze(0) if l.dim()==3 else l.float().unsqueeze(0) for l in labels], dim=0)
+                gt_mask_batch = []
+                for l in labels:
+                    binary_l = (l > 0).float()
+                    if binary_l.dim() == 2:
+                        binary_l = binary_l.unsqueeze(0).unsqueeze(0)
+                    elif binary_l.dim() == 3:
+                        binary_l = binary_l.unsqueeze(0)
+                    gt_mask_batch.append(binary_l)
+                gt_mask_batch = torch.cat(gt_mask_batch, dim=0)
                 loss_density_map, _, _ = density_map_loss(
                     pred_density_map=torch.cat(density_map_list, dim=0), gt_mask=gt_mask_batch,
                     pred_mask=torch.cat(pred_mask_list, dim=0), mse_weight=1.0, iou_weight=0.5,
@@ -495,7 +507,7 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
 
         batched_input = to_device(batched_input, args.device)
         images = batched_input['image'] 
-        labels = batched_input['label'].cpu().numpy()
+        inst_labels = batched_input.get('label_inst', batched_input['label']).cpu().numpy()
         organ_ids = batched_input.get('organ_id', None)
 
         if images.shape[-1] != args.image_size:
@@ -507,30 +519,61 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                 val = organ_ids[i]
                 curr_organ_id = val.item() if isinstance(val, torch.Tensor) else val
             
-            infer_stride = int(args.crop_size * 0.75) 
-            
             with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                # 🔥 接收 prob_map 和 hv_map
-                prob_map, hv_map = sliding_window_inference(
-                    eval_model, images[i], 
-                    organ_id=curr_organ_id, 
-                    patch_size=args.crop_size, 
-                    target_size=args.image_size, 
-                    stride=infer_stride, 
-                    device=args.device
-                )
+                # Full-image inference keeps HoVer geometry intact.
+                model_input = [{
+                    'image': images[i],
+                    'original_size': (args.image_size, args.image_size),
+                    'text_prompt': "Cell nuclei",
+                    'organ_id': curr_organ_id,
+                    'attribute_text': "Cell nuclei",
+                }]
+                out = eval_model(model_input, multimask_output=True)
+                iou_preds = out[0]['iou_predictions']
+                if iou_preds.ndim == 2:
+                    iou_preds = iou_preds.squeeze(0)
+                best_idx = torch.argmax(iou_preds).item()
+                pred_logits = out[0]['masks'][0, best_idx]
+                prob_map = torch.sigmoid(pred_logits)
+
+                hv_logits = out[0].get('hv_logits', None)
+                if hv_logits is not None:
+                    hv_map = torch.tanh(hv_logits)
+
+                    # F.interpolate expects 4D input [B, C, H, W].
+                    is_expanded = False
+                    if hv_map.dim() == 3:
+                        hv_map = hv_map.unsqueeze(0)
+                        is_expanded = True
+
+                    target_hw = prob_map.shape[-2:]
+                    hv_map = F.interpolate(
+                        hv_map.float(),
+                        size=target_hw,
+                        mode='bilinear',
+                        align_corners=False
+                    )
+
+                    # Keep output as [2, H, W] for hover_post_process.
+                    if is_expanded:
+                        hv_map = hv_map.squeeze(0)
+                    elif hv_map.dim() == 4 and hv_map.shape[0] == 1:
+                        hv_map = hv_map.squeeze(0)
+                else:
+                    target_hw = prob_map.shape[-2:]
+                    hv_map = torch.zeros((2, target_hw[0], target_hw[1]), device=args.device)
             
-            prob_np = prob_map.cpu().numpy()
-            hv_np = hv_map.cpu().numpy()
+            prob_np = prob_map.float().cpu().numpy()
+            hv_np = hv_map.float().cpu().numpy()
 
             # 🔥 执行快速的神级分水岭
             pred_mask = hover_post_process(prob_np, hv_np, prob_thresh=0.45, marker_thresh=0.4, min_marker_size=10)
             
             # Fallback 保护
             if pred_mask.max() == 0:
-                pred_mask = (prob_np > 0.5).astype(np.uint8)
+                pred_mask = skimage_label(prob_np > 0.5).astype(np.int32)
 
-            gt = labels[i]; gt = gt[0] if gt.ndim == 3 else gt
+            gt = inst_labels[i]; gt = gt[0] if gt.ndim == 3 else gt
             gt_valid = gt.copy(); gt_valid[gt == 255] = 0
             
             if pred_mask.shape != gt_valid.shape:
