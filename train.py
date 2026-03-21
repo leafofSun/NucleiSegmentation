@@ -662,7 +662,26 @@ def main(args):
             ckpt = torch.load(args.sam_checkpoint, map_location='cpu', weights_only=False)
             state_dict = ckpt.get("model", ckpt)
             state_dict = resize_pos_embed(state_dict, vanilla_sam.state_dict())
-            vanilla_sam.load_state_dict(state_dict, strict=False)
+
+            # Map original SAM upscaling weights into ASRBlock upscalers.
+            key_mapping = {
+                "mask_decoder.output_upscaling.0.weight": "mask_decoder.asr_upscale_1.structure_upsample.0.weight",
+                "mask_decoder.output_upscaling.0.bias": "mask_decoder.asr_upscale_1.structure_upsample.0.bias",
+                "mask_decoder.output_upscaling.1.weight": "mask_decoder.asr_upscale_1.structure_upsample.1.weight",
+                "mask_decoder.output_upscaling.1.bias": "mask_decoder.asr_upscale_1.structure_upsample.1.bias",
+                "mask_decoder.output_upscaling.3.weight": "mask_decoder.asr_upscale_2.structure_upsample.0.weight",
+                "mask_decoder.output_upscaling.3.bias": "mask_decoder.asr_upscale_2.structure_upsample.0.bias",
+            }
+            mapped_state_dict = dict(state_dict)
+            mapped_count = 0
+            for old_key, new_key in key_mapping.items():
+                if old_key in state_dict:
+                    mapped_state_dict[new_key] = state_dict[old_key]
+                    mapped_count += 1
+
+            vanilla_sam.load_state_dict(mapped_state_dict, strict=False)
+            if rank == 0:
+                logger.info(f"✅ ASRBlock upscaling weights mapped: {mapped_count}/{len(key_mapping)}")
         except Exception as e:
             if rank == 0: logger.warning(f"⚠️ Checkpoint loading failed: {e}")
     

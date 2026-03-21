@@ -79,14 +79,15 @@ class ASRBlock(nn.Module):
             if density_map is not None:
                 # 对齐尺寸
                 if density_map.shape[-2:] != g.shape[-2:]:
-                    d_map = F.interpolate(density_map, size=g.shape[-2:], mode='bilinear', align_corners=False)
+                    d_map = F.interpolate(density_map.float(), size=g.shape[-2:], mode='bilinear', align_corners=False)
                 else:
                     d_map = density_map
-                
-                # ⚠️ 关键操作：Spatial Gating
-                # 只有在密度高的地方，才注入"形状特征"。
-                # 这保证了背景处不会因为注入了 Shape 特征而产生幻觉。
-                g = g * d_map  # [B, C, H, W] * [B, 1, H, W] -> [B, C, H, W]
+
+                # 仅把密度图作为先验门控，避免 mask loss 反向污染密度分支
+                d_map = d_map.detach()
+                # 约束到 [0, 1]，防止稀疏区域被削弱或密集区域特征放大
+                d_gate = torch.clamp(d_map, min=0.0, max=1.0).to(g.dtype)
+                g = g * d_gate  # [B, C, H, W] * [B, 1, H, W] -> [B, C, H, W]
             
             # 3. 计算门控权重 (关注 x 和 g 的差异区，即边界)
             combined = torch.cat([x, g], dim=1)
