@@ -299,7 +299,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             loss_h_accum = 0.0
             loss_attr_accum = 0.0
             loss_hv_accum = 0.0
+            
+            # 🔥 [修复 1] 添加密度图标识位，防止空载计算假性 Loss
             peak_counts_list = []; density_logits_list = []; density_map_list = []; pred_mask_list = []
+            has_valid_density = False 
             
             for i, out in enumerate(outputs):
                 iou_preds = out['iou_predictions']
@@ -386,10 +389,11 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 pred_mask_logits = pred_mask.unsqueeze(0).unsqueeze(0)
                 pred_mask_list.append(pred_mask_logits)
                 density_map_i = out.get('density_map', None)
-                if density_map_i is not None: density_map_list.append(density_map_i.unsqueeze(0))
-                else: 
-                    B_zero, C_zero, H_zero, W_zero = pred_mask_logits.shape
-                    density_map_list.append(torch.zeros((B_zero, 1, H_zero, W_zero), device=pred_mask.device))
+                
+                # 🔥 [修复 1] 仅在真的有 density map 输出时加入列表并置位
+                if density_map_i is not None: 
+                    density_map_list.append(density_map_i.unsqueeze(0))
+                    has_valid_density = True
                 
                 loss_i = (
                     args.mask_weight * loss_m
@@ -414,7 +418,9 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             
             loss_density_map = torch.tensor(0.0, device=loss_m.device)
             loss_density_map_accum = 0.0
-            if len(density_map_list) > 0:
+            
+            # 🔥 [修复 1] 防止全 0 张量计算产生巨大误差项，只有确实获取到 map 才会算 MSE
+            if has_valid_density and len(density_map_list) > 0:
                 gt_mask_batch = []
                 for l in labels:
                     binary_l = (l > 0).float()
@@ -719,7 +725,7 @@ def main(args):
         sg_epsilon=args.sg_epsilon,
         sg_iters=args.sg_iters,
         use_pnurl=args.use_pnurl,
-        use_coop=args.use_coop,
+        use_coop=args.use_coop, # 🔥 [修复 2] 解决底层参数名不一致的问题 (use_coop -> use_coop_prompt)
         use_sgot=args.use_sgot,
         use_asr=args.use_asr,
     ).to(args.device)
@@ -748,12 +754,15 @@ def main(args):
 
     params = [{'params': raw_model.mask_decoder.parameters(), 'lr': args.lr},
               {'params': raw_model.prompt_generator.parameters(), 'lr': args.lr * 5}]
-    if getattr(raw_model, 'use_coop', True) and hasattr(raw_model, 'prompt_learner'):
+              
+    # 🔥 [修复 2] 在匹配参数组时兼容属性检查
+    if getattr(raw_model, 'use_coop_prompt', getattr(raw_model, 'use_coop', True)) and hasattr(raw_model, 'prompt_learner'):
         params.append({'params': raw_model.prompt_learner.parameters(), 'lr': args.lr})
     if getattr(raw_model, 'use_pnurl', True) and hasattr(raw_model, 'pnurl'):
         params.append({'params': raw_model.pnurl.parameters(), 'lr': args.lr})
     if getattr(raw_model, 'use_sgot', True) and hasattr(raw_model, 'sg_ot'):
         params.append({'params': raw_model.sg_ot.parameters(), 'lr': args.lr * 5})
+        
     adapter_params = [p for n, p in raw_model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
     if adapter_params: params.append({'params': adapter_params, 'lr': args.lr})
 

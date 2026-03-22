@@ -170,6 +170,7 @@ class PNuRL(nn.Module):
         self,
         embed_dim: int = 256,
         text_dim: int = 256,
+        feat_dim: int = 256,
         clip_model_path: Optional[str] = "ViT-B/16",
         num_classes_per_attr: List[int] = [2, 3, 2, 3, 3], 
         attr_loss_weight: float = 1.0,

@@ -45,7 +45,7 @@ def resize_pos_embed(state_dict, model_state_dict):
 # ==================================================================================================
 # 1. 核心后处理：完全对齐 train.py 的基础版 HoVer-Watershed (np.gradient)
 # ==================================================================================================
-def hover_post_process(prob_map, hv_map, prob_thresh=0.35, marker_thresh=0.4, min_marker_size=10):
+def hover_post_process(prob_map, hv_map, prob_thresh=0.35, marker_thresh=0.4, min_marker_size=250):
     mask = prob_map > prob_thresh
     if not np.any(mask):
         return np.zeros_like(mask, dtype=np.int32)
@@ -231,8 +231,8 @@ def parse_args():
     parser.add_argument("--encoder_adapter", action='store_true', default=True)
     parser.add_argument('--device', type=str, default='cuda')
     # 🚀 替换为搜索出的最佳阈值
-    parser.add_argument("--prob_thresh", type=float, default=0.40)
-    parser.add_argument("--marker_thresh", type=float, default=0.35)
+    parser.add_argument("--prob_thresh", type=float, default=0.35)
+    parser.add_argument("--marker_thresh", type=float, default=0.40)
     parser.add_argument("--save_pred", action='store_true')
     parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'])
     return parser.parse_args()

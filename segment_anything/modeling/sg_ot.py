@@ -34,7 +34,7 @@ class SemanticGuidedOT(nn.Module):
         
         # 🔥 [新增参数] 空间代价矩阵的权重系数。设为可学习或常数均可，初始值为 0.5
         # 如果消融实验想退化为纯语义 OT，可在传参时将其置为 0.0
-        self.spatial_weight = nn.Parameter(torch.ones(1) * 0.5)
+        self.spatial_weight = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, img_feat, txt_feat, density_map):
         B, C, H, W = img_feat.shape
