@@ -295,56 +295,81 @@ class TextSam(Sam):
         num_organs=21,
         num_heads=8,
         sg_epsilon=0.05,
-        sg_iters=3
+        sg_iters=3,
+        use_pnurl: bool = True,
+        use_coop: bool = True,
+        use_sgot: bool = True,
+        use_asr: bool = True,
     ):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
 
+        self.use_pnurl = use_pnurl
+        self.use_coop = use_coop
+        self.use_sgot = use_sgot
+        self.use_asr = use_asr
+
         print(f"🚀 Initializing MP-SAM (Multi-granularity Prompt SAM)...")
-        
+        print(
+            f"   Ablation: PNuRL={use_pnurl}, CoOp={use_coop}, SG-OT={use_sgot}, ASR={use_asr}"
+        )
+
         # 1. 加载 CLIP (Freeze)
         self.clip_model, _ = clip.load(clip_model_name, device="cpu")
         for param in self.clip_model.parameters():
-            param.requires_grad = False 
-            
-        # 2. Dual-Prompt Learner (Trainable)
+            param.requires_grad = False
+
+        # 2. Dual-Prompt Learner (Trainable; 关闭 CoOp 时不更新)
         self.prompt_learner = DualPromptLearner(
-            self.clip_model, 
-            num_organs=num_organs, 
-            n_ctx_gen=8, 
+            self.clip_model,
+            num_organs=num_organs,
+            n_ctx_gen=8,
             n_ctx_spec=8,
-            embed_dim=embed_dim  # 传递 embed_dim 用于初始化 DensityAdapter
-        )
-        for param in self.prompt_learner.parameters():
-            param.requires_grad = True 
-            
-        # 3. PNuRL (Trainable)
-        self.pnurl = PNuRL(
             embed_dim=embed_dim,
         )
-        
+        for param in self.prompt_learner.parameters():
+            param.requires_grad = use_coop
+
+        # 3. PNuRL (Trainable; 关闭时不更新)
+        self.pnurl = PNuRL(embed_dim=embed_dim)
+        for param in self.pnurl.parameters():
+            param.requires_grad = use_pnurl
+
         # 4. Auto-Prompt Generator (Trainable)
         self.prompt_generator = TextGuidedPointGenerator(
             embed_dim=embed_dim,
             text_dim=text_dim,
-            num_heads=num_heads
+            num_heads=num_heads,
         )
 
-        # 🔥 初始化 SG-OT 引擎
-        self.sg_ot = SemanticGuidedOT(img_dim=embed_dim, txt_dim=text_dim, epsilon=sg_epsilon, sinkhorn_iters=sg_iters)
+        # SG-OT（关闭时不更新）
+        self.sg_ot = SemanticGuidedOT(
+            img_dim=embed_dim,
+            txt_dim=text_dim,
+            epsilon=sg_epsilon,
+            sinkhorn_iters=sg_iters,
+        )
+        for param in self.sg_ot.parameters():
+            param.requires_grad = use_sgot
 
         # 5. 冻结策略
-        for param in self.image_encoder.parameters(): param.requires_grad = False
-        for param in self.prompt_encoder.parameters(): param.requires_grad = False
-        for param in self.mask_decoder.parameters(): param.requires_grad = True
-        
-        # 解冻 Adapter
+        for param in self.image_encoder.parameters():
+            param.requires_grad = False
+        for param in self.prompt_encoder.parameters():
+            param.requires_grad = False
+        for param in self.mask_decoder.parameters():
+            param.requires_grad = True
+
         adapter_count = 0
         for name, param in self.image_encoder.named_parameters():
             if "Adapter" in name:
                 param.requires_grad = True
                 adapter_count += 1
-                
-        print(f"✅ Model Ready: Adapters({adapter_count}), DualLearner, PNuRL, Generator Unfrozen.")
+
+        print(
+            f"✅ Model Ready: Adapters({adapter_count}), "
+            f"DualLearner({'on' if use_coop else 'off'}), PNuRL({'on' if use_pnurl else 'off'}), "
+            f"SG-OT({'on' if use_sgot else 'off'}), Generator."
+        )
 
     def forward(self, batched_input, multimask_output=False):
         # === Step 1: 基础图像编码 ===
@@ -368,10 +393,6 @@ class TextSam(Sam):
         organ_indices = torch.tensor(organ_indices).to(device)
 
         # === Step 3: PNuRL (先获取密度特征) ===
-        if next(self.pnurl.parameters()).device != device:
-            self.pnurl = self.pnurl.to(device)
-        
-        # 准备属性标签 (Attribute Labels)
         attribute_labels_list = []
         for x in batched_input:
             attr_labels = x.get("attr_labels", None)
@@ -379,56 +400,73 @@ class TextSam(Sam):
                 attribute_labels_list.append(attr_labels)
             else:
                 attribute_labels_list.append(torch.tensor([0, 0, 0, 1, 1], dtype=torch.long))
-        
+
         if len(attribute_labels_list) > 0:
-            attr_labels_batch = torch.stack(attribute_labels_list).to(device)  # [B, 5]
-            # 拆分为 5 个 tensor list
+            attr_labels_batch = torch.stack(attribute_labels_list).to(device)
             attribute_labels = [attr_labels_batch[:, i] for i in range(5)]
         else:
             attribute_labels = None
-        
-        # PNuRL Forward - 获取密度特征（多任务：分类 + 回归）
-        refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits, density_features, density_map = self.pnurl(
-            image_features=image_embeddings,
-            attribute_labels=attribute_labels,
-            attribute_prompts=attribute_texts,
-            return_loss=True
-        )
-        # high_freq_guide: [B, 192, 64, 64] - PNuRL 浅层特征（用于边界细化）
-        high_freq_guide = density_features[0] if isinstance(density_features, (list, tuple)) and len(density_features) > 0 else None
-        
-        # === Step 4: Dual-Prompt Learner (Implicit Context with Density Modulation) ===
-        # Positive
+
+        if self.use_pnurl:
+            if next(self.pnurl.parameters()).device != device:
+                self.pnurl = self.pnurl.to(device)
+            refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits, density_features, density_map = self.pnurl(
+                image_features=image_embeddings,
+                attribute_labels=attribute_labels,
+                attribute_prompts=attribute_texts,
+                return_loss=True,
+            )
+            high_freq_guide = (
+                density_features[0]
+                if isinstance(density_features, (list, tuple)) and len(density_features) > 0
+                else None
+            )
+        else:
+            refined_image_embeddings = image_embeddings
+            pnurl_loss = torch.tensor(0.0, device=device)
+            attr_logits = {}
+            density_features = None
+            density_map = None
+            high_freq_guide = None
+
+        # === Step 4: CoOp 可学习提示 或 冻结 CLIP 文本编码 ===
         pos_tokens = clip.tokenize(base_texts, truncate=True).to(device)
-        pos_feats = self.prompt_learner(organ_indices, pos_tokens, density_features=density_features) # [B, 512]
-        
-        # Negative (Background)
         neg_tokens = clip.tokenize(["Background"] * len(base_texts), truncate=True).to(device)
-        neg_feats = self.prompt_learner(organ_indices, neg_tokens, density_features=density_features) # [B, 512]
+        if self.use_coop:
+            if next(self.prompt_learner.parameters()).device != device:
+                self.prompt_learner = self.prompt_learner.to(device)
+            pos_feats = self.prompt_learner(organ_indices, pos_tokens, density_features=density_features)
+            neg_feats = self.prompt_learner(organ_indices, neg_tokens, density_features=density_features)
+        else:
+            with torch.no_grad():
+                pos_feats = self.clip_model.encode_text(pos_tokens).float()
+                neg_feats = self.clip_model.encode_text(neg_tokens).float()
 
         pos_feats = pos_feats / pos_feats.norm(dim=-1, keepdim=True)
         neg_feats = neg_feats / neg_feats.norm(dim=-1, keepdim=True)
-        text_features = torch.stack([pos_feats, neg_feats], dim=1).float() # [B, 2, 512]
+        text_features = torch.stack([pos_feats, neg_feats], dim=1).float()
 
-        # === Step 5: SG-OT 语义引导的最优传输 ===
-        # 提取 Positive 文本特征 [B, 512]
+        # === Step 5: SG-OT 或 文本引导热力图（原 prompt_generator 路径）===
         pos_text_feats = text_features[:, 0, :]
-
-        # density_map 为 None 时使用均匀分布兜底
+        B, C, H, W = refined_image_embeddings.shape
         sg_ot_density = density_map
         if sg_ot_density is None:
-            B, C, H, W = refined_image_embeddings.shape
             sg_ot_density = torch.ones(B, 1, H, W, device=device) / (H * W)
 
-        # 🔥 执行 SG-OT 融合，取代传统的 prompt_generator 找点机制
-        fused_image_embeddings, heatmap_logits, hv_logits = self.sg_ot(
-            img_feat=refined_image_embeddings,
-            txt_feat=pos_text_feats,
-            density_map=sg_ot_density
-        )
+        if self.use_sgot:
+            if next(self.sg_ot.parameters()).device != device:
+                self.sg_ot = self.sg_ot.to(device)
+            fused_image_embeddings, heatmap_logits, hv_logits = self.sg_ot(
+                img_feat=refined_image_embeddings,
+                txt_feat=pos_text_feats,
+                density_map=sg_ot_density,
+            )
+        else:
+            fused_image_embeddings = refined_image_embeddings
+            heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
+            hv_logits = None
 
-        # 准备传给 Mask Decoder 空间门控的密度图
-        density_map_proxy = torch.sigmoid(heatmap_logits[:, 0:1, :, :])  # [B, 1, 64, 64]
+        density_map_proxy = torch.sigmoid(heatmap_logits[:, 0:1, :, :])
 
         # 动态阈值计算 (保留原本精妙的设计)
         size_logits = attr_logits.get('size', None)
@@ -440,13 +478,12 @@ class TextSam(Sam):
             batch_size = image_embeddings.shape[0]
             adaptive_thresh = torch.tensor(15.0, device=device).expand(batch_size)
 
-        # 沿用点配额截断逻辑提取点 (点依然需要传入 Mask Decoder)
         prompts_list = self.prompt_generator.generate_adaptive_prompts(
             heatmap_logits,
             threshold=0.3,
             k_neighbors=3,
             dense_dist_thresh=adaptive_thresh,
-            pred_density=density_map
+            pred_density=density_map if self.use_pnurl else None,
         )
         
         # 坐标映射 (Feature Grid -> Original Image)
@@ -487,12 +524,13 @@ class TextSam(Sam):
                 if density_map_i is not None:
                     density_map_i = density_map_i + dummy_connection
                 
+                hv_out = hv_logits[i].unsqueeze(0) if self.use_sgot and hv_logits is not None else None
                 outputs.append({
                     "masks": (torch.zeros((1, 1, target_h, target_w), device=device, dtype=torch.float32) - 100.0) + dummy_connection,
                     "iou_predictions": torch.zeros((1, 1), device=device) + dummy_connection,
                     "low_res_logits": (torch.zeros((1, 1, 256, 256), device=device) - 100.0) + dummy_connection,
                     "heatmap_logits": heatmap_logits[i].unsqueeze(0),
-                    "hv_logits": hv_logits[i].unsqueeze(0),
+                    "hv_logits": hv_out,
                     "attr_logits": attr_logits,
                     "density_map": density_map_i,
                     "pnurl_loss": pnurl_loss
@@ -524,13 +562,13 @@ class TextSam(Sam):
                 # 2. 局部扩展 Image Embedding (使用 OT 拓扑搬运后的特征)
                 sub_img_embed = fused_image_embeddings[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
                 
-                # 3. 局部扩展高频特征 (ASR Guide)
                 sub_high_freq = None
-                if high_freq_guide is not None:
+                if self.use_asr and high_freq_guide is not None:
                     sub_high_freq = high_freq_guide[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
-                
-                # 4. 局部扩展密度图 (Gating 用)
-                sub_density_map = density_map_proxy[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
+
+                sub_density_map = None
+                if self.use_asr:
+                    sub_density_map = density_map_proxy[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
                 sub_text_feat = pos_text_feats[i].unsqueeze(0).expand(current_batch, -1)
 
                 # 5. 编码 Prompt (针对当前 chunk)
@@ -571,12 +609,13 @@ class TextSam(Sam):
             
             # density_map_i 已经在上面处理过了，不需要再 interpolate mask_post 的尺寸
 
+            hv_out = hv_logits[i].unsqueeze(0) if self.use_sgot and hv_logits is not None else None
             outputs.append({
                 "masks": mask_post,
                 "iou_predictions": merged_iou,
                 "low_res_logits": merged_logits,
                 "heatmap_logits": heatmap_logits[i].unsqueeze(0),
-                "hv_logits": hv_logits[i].unsqueeze(0),
+                "hv_logits": hv_out,
                 "attr_logits": attr_logits,
                 "density_map": density_map_i,
                 "pnurl_loss": pnurl_loss

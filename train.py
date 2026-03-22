@@ -76,6 +76,16 @@ def parse_args():
     parser.add_argument("--hv_weight", type=float, default=1.0, help="Weight for HoVer HV supervision loss")
     parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads for multi-modal fusion")
 
+    # =========================================================================
+    # 核心消融实验开关 (Ablation Study Switches)
+    # =========================================================================
+    parser.add_argument("--use_pnurl", action='store_true', default=False, help="启用 PNuRL 属性预测分支")
+    parser.add_argument("--use_coop", action='store_true', default=False, help="启用 CoOp 可学习文本提示")
+    parser.add_argument("--use_sgot", action='store_true', default=False, help="启用 SG-OT 语义引导最优传输模块")
+    parser.add_argument("--use_asr", action='store_true', default=False, help="启用 ASR 自适应谱细化上采样模块")
+    parser.add_argument("--prompt_mode", type=str, default="dynamic", choices=["generic", "dynamic"], help="训练时的文本提示生成模式")
+    # =========================================================================
+
     parser.add_argument("--sg_epsilon", type=float, default=0.05, help="Sinkhorn熵正则化系数")
     parser.add_argument("--sg_iters", type=int, default=3, help="Sinkhorn迭代次数")
 
@@ -639,8 +649,22 @@ def main(args):
         writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
     else: logger = None; writer = None
 
-    train_dataset = UniversalDataset(data_root=args.data_path, knowledge_path=args.knowledge_path, image_size=args.image_size, crop_size=args.crop_size, mode='train', prompt_mode='dynamic')
-    val_dataset = UniversalDataset(data_root=args.data_path, knowledge_path=args.knowledge_path, image_size=args.image_size, crop_size=args.crop_size, mode='test', prompt_mode='generic')
+    train_dataset = UniversalDataset(
+        data_root=args.data_path,
+        knowledge_path=args.knowledge_path,
+        image_size=args.image_size,
+        crop_size=args.crop_size,
+        mode='train',
+        prompt_mode=args.prompt_mode,
+    )
+    val_dataset = UniversalDataset(
+        data_root=args.data_path,
+        knowledge_path=args.knowledge_path,
+        image_size=args.image_size,
+        crop_size=args.crop_size,
+        mode='test',
+        prompt_mode='generic',
+    )
     
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
     val_sampler = DistributedSampler(val_dataset, shuffle=True) if world_size > 1 else None
@@ -685,11 +709,20 @@ def main(args):
         except Exception as e:
             if rank == 0: logger.warning(f"⚠️ Checkpoint loading failed: {e}")
     
-    model = TextSam(image_encoder=vanilla_sam.image_encoder, prompt_encoder=vanilla_sam.prompt_encoder,
-                    mask_decoder=vanilla_sam.mask_decoder, clip_model_name=args.clip_model, num_organs=args.num_organs,
-                    num_heads=args.num_heads,
-                    sg_epsilon=args.sg_epsilon,
-                    sg_iters=args.sg_iters).to(args.device)
+    model = TextSam(
+        image_encoder=vanilla_sam.image_encoder,
+        prompt_encoder=vanilla_sam.prompt_encoder,
+        mask_decoder=vanilla_sam.mask_decoder,
+        clip_model_name=args.clip_model,
+        num_organs=args.num_organs,
+        num_heads=args.num_heads,
+        sg_epsilon=args.sg_epsilon,
+        sg_iters=args.sg_iters,
+        use_pnurl=args.use_pnurl,
+        use_coop=args.use_coop,
+        use_sgot=args.use_sgot,
+        use_asr=args.use_asr,
+    ).to(args.device)
     del vanilla_sam
 
     if world_size > 1:
@@ -715,9 +748,12 @@ def main(args):
 
     params = [{'params': raw_model.mask_decoder.parameters(), 'lr': args.lr},
               {'params': raw_model.prompt_generator.parameters(), 'lr': args.lr * 5}]
-    if hasattr(raw_model, 'prompt_learner'): params.append({'params': raw_model.prompt_learner.parameters(), 'lr': args.lr})
-    if hasattr(raw_model, 'pnurl'): params.append({'params': raw_model.pnurl.parameters(), 'lr': args.lr})
-    if hasattr(raw_model, 'sg_ot'): params.append({'params': raw_model.sg_ot.parameters(), 'lr': args.lr * 5})
+    if getattr(raw_model, 'use_coop', True) and hasattr(raw_model, 'prompt_learner'):
+        params.append({'params': raw_model.prompt_learner.parameters(), 'lr': args.lr})
+    if getattr(raw_model, 'use_pnurl', True) and hasattr(raw_model, 'pnurl'):
+        params.append({'params': raw_model.pnurl.parameters(), 'lr': args.lr})
+    if getattr(raw_model, 'use_sgot', True) and hasattr(raw_model, 'sg_ot'):
+        params.append({'params': raw_model.sg_ot.parameters(), 'lr': args.lr * 5})
     adapter_params = [p for n, p in raw_model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
     if adapter_params: params.append({'params': adapter_params, 'lr': args.lr})
 
