@@ -8,18 +8,16 @@ from skimage.morphology import remove_small_objects
 from skimage.measure import label as skimage_label
 import cv2
 
-# 导入你的模型和数据加载器
 from segment_anything import sam_model_registry
 from segment_anything.modeling.sam import TextSam 
 from DataLoader import UniversalDataset, stack_dict_batched
 from torch.utils.data import DataLoader
 from metrics import SegMetrics
-from scipy.ndimage.morphology import binary_fill_holes
 
 # ==================================================================================================
-# 1. 核心后处理：完全对齐 train.py 的基础版 HoVer-Watershed (np.gradient)
+# 1. 核心后处理：np.gradient
 # ==================================================================================================
-def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, min_marker_size=10):
+def hover_post_process(prob_map, hv_map, prob_thresh=0.35, marker_thresh=0.40, min_marker_size=10):
     mask = prob_map > prob_thresh
     if not np.any(mask):
         return np.zeros_like(mask, dtype=np.int32)
@@ -27,7 +25,6 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, mi
     v_map = hv_map[0].astype(np.float32)
     h_map = hv_map[1].astype(np.float32)
 
-    # 🚀 使用 train.py 中的基础梯度计算
     diff_v = np.gradient(v_map, axis=0) 
     diff_h = np.gradient(h_map, axis=1) 
     
@@ -36,6 +33,7 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, mi
     marker_map = prob_map - sobel_mag
     marker_map = (marker_map > marker_thresh) & mask
     
+    # 这里的 min_marker_size 是本次搜索的核心
     marker_map = remove_small_objects(marker_map, min_size=min_marker_size)
     markers = skimage_label(marker_map).astype(np.int32)
 
@@ -73,7 +71,7 @@ def main():
     model.load_state_dict(checkpoint, strict=False)
     model.eval()
 
-    print("📦 [Step 3] Pre-computing predictions for all validation images (This happens only ONCE)...")
+    print("📦 [Step 3] Pre-computing predictions for all validation images...")
     cache_data = []  
     
     with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -83,11 +81,10 @@ def main():
                 images = torch.nn.functional.interpolate(images, size=(args.image_size, args.image_size), mode='bilinear')
             
             inst_labels = batched_input.get('label_inst', batched_input['label']).numpy()
-            organ_ids = batched_input.get('organ_id', [20])
             
             model_input = [{
                 'image': images[0], 'original_size': (args.image_size, args.image_size),
-                'text_prompt': "Cell nuclei", 'organ_id': organ_ids[0], 'attribute_text': "Cell nuclei"
+                'text_prompt': "Cell nuclei", 'organ_id': 20, 'attribute_text': "Cell nuclei"
             }]
             
             out = model(model_input, multimask_output=True)
@@ -112,49 +109,43 @@ def main():
             
             cache_data.append((prob_np, hv_np, gt_valid))
 
-    print(f"✅ Cache complete for {len(cache_data)} images. Freeing GPU memory...")
     del model; torch.cuda.empty_cache()
 
-    print("🔍 [Step 4] Starting Grid Search on CPU (Using train.py original logic)...")
+    print("🔍 [Step 4] Probing min_marker_size...")
     
-    # 🚀 适应 np.gradient 的经典阈值网格
-    prob_thresholds = [0.40, 0.45, 0.50]
-    marker_thresholds = [0.35, 0.40, 0.45]
+    # 锁定之前搜索出的最优概率组合
+    fixed_prob = 0.35
+    fixed_marker = 0.40
     
-    best_aji = 0.0
-    best_params = (0, 0)
+    # 遍历不同尺度的最小种子点面积
+    # 将搜索区间推高至 512 分辨率下的真实小细胞核面积阈值
+    min_size_list = [150, 200, 250, 300, 400, 500, 600]
     
-    for p_thresh in prob_thresholds:
-        for m_thresh in marker_thresholds:
-            # 🔥 删除了那个坑人的 continue 限制，确保每个组合都被搜到！
+    for min_size in min_size_list:
+        current_ajis = []
+        current_pqs = []
+        
+        for prob_np, hv_np, gt_valid in cache_data:
+            pred_mask = hover_post_process(prob_np, hv_np, prob_thresh=fixed_prob, marker_thresh=fixed_marker, min_marker_size=min_size)
             
-            current_ajis = []
-            for prob_np, hv_np, gt_valid in cache_data:
-                pred_mask = hover_post_process(prob_np, hv_np, prob_thresh=p_thresh, marker_thresh=m_thresh)
-                
-                # fallback 保护
-                if pred_mask.max() == 0:
-                    pred_mask = skimage_label(prob_np > 0.5).astype(np.int32)
-                
-                if pred_mask.shape != gt_valid.shape:
-                    gt_valid = cv2.resize(gt_valid, (pred_mask.shape[1], pred_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+            # Fallback
+            if pred_mask.max() == 0:
+                pred_mask = skimage_label(prob_np > 0.5).astype(np.int32)
+            
+            if pred_mask.shape != gt_valid.shape:
+                gt_valid = cv2.resize(gt_valid, (pred_mask.shape[1], pred_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-                res = SegMetrics(pred_mask, gt_valid, ['mAJI'])
-                if 'mAJI' in res:
-                    current_ajis.append(res['mAJI'])
-            
-            mean_aji = np.mean(current_ajis) if len(current_ajis) > 0 else 0
-            print(f"Prob Thresh: {p_thresh:.2f} | Marker Thresh: {m_thresh:.2f} ---> AJI: {mean_aji:.4f}")
-            
-            if mean_aji > best_aji:
-                best_aji = mean_aji
-                best_params = (p_thresh, m_thresh)
+            res = SegMetrics(pred_mask, gt_valid, ['mAJI', 'mPQ'])
+            if 'mAJI' in res: current_ajis.append(res['mAJI'])
+            if 'mPQ' in res: current_pqs.append(res['mPQ'])
+        
+        mean_aji = np.mean(current_ajis) if len(current_ajis) > 0 else 0
+        mean_pq = np.mean(current_pqs) if len(current_pqs) > 0 else 0
+        
+        print(f"👉 min_marker_size: {min_size:2d} | AJI: {mean_aji:.4f} | PQ: {mean_pq:.4f}")
 
     print("=====================================================")
-    print("🏆 Grid Search Finished!")
-    print(f"🌟 Best AJI (Train.py Logic): {best_aji:.4f}")
-    print(f"👉 Best Parameters: prob_thresh = {best_params[0]:.2f}, marker_thresh = {best_params[1]:.2f}")
-    print("=====================================================")
+    print("🏆 min_marker_size Probing Finished!")
 
 if __name__ == "__main__":
     main()

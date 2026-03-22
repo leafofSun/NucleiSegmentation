@@ -18,7 +18,7 @@ import clip
 from skimage.segmentation import watershed
 from skimage.morphology import remove_small_objects
 from scipy.ndimage import binary_fill_holes
-from skimage.measure import label
+from skimage.measure import label as skimage_label
 
 # ==================================================================================================
 #  权重插值函数 
@@ -43,30 +43,29 @@ def resize_pos_embed(state_dict, model_state_dict):
     return new_state_dict
 
 # ==================================================================================================
-# 1. 核心后处理：官方 21x21 Sobel 版 HoVer-Watershed
+# 1. 核心后处理：完全对齐 train.py 的基础版 HoVer-Watershed (np.gradient)
 # ==================================================================================================
-def hover_post_process(prob_map, hv_map, prob_thresh=0.5, marker_thresh=0.4, min_marker_size=10):
+def hover_post_process(prob_map, hv_map, prob_thresh=0.35, marker_thresh=0.4, min_marker_size=10):
     mask = prob_map > prob_thresh
-    if not np.any(mask): return np.zeros_like(mask, dtype=np.int32)
+    if not np.any(mask):
+        return np.zeros_like(mask, dtype=np.int32)
 
-    h_dir = cv2.normalize(hv_map[1], None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
-    v_dir = cv2.normalize(hv_map[0], None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
+    v_map = hv_map[0].astype(np.float32)
+    h_map = hv_map[1].astype(np.float32)
+
+    diff_v = np.gradient(v_map, axis=0) 
+    diff_h = np.gradient(h_map, axis=1) 
     
-    sobelh = 1 - cv2.normalize(cv2.Sobel(h_dir, cv2.CV_64F, 1, 0, ksize=21), None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
-    sobelv = 1 - cv2.normalize(cv2.Sobel(v_dir, cv2.CV_64F, 0, 1, ksize=21), None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
+    sobel_mag = np.sqrt(diff_v**2 + diff_h**2)
+    
+    marker_map = prob_map - sobel_mag
+    marker_map = (marker_map > marker_thresh) & mask
+    
+    marker_map = remove_small_objects(marker_map, min_size=min_marker_size)
+    markers = skimage_label(marker_map).astype(np.int32)
 
-    overall = np.maximum(sobelh, sobelv)
-    overall = (overall - (1 - mask)).clip(0) 
-
-    dist = -cv2.GaussianBlur((1.0 - overall) * mask, (3, 3), 0)
-    marker = (overall >= marker_thresh) & mask
-    marker = binary_fill_holes(marker).astype("uint8")
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    marker = cv2.morphologyEx(marker, cv2.MORPH_OPEN, kernel)
-    markers = label(marker)
-    markers = remove_small_objects(markers, min_size=min_marker_size)
-
-    return watershed(dist, markers=markers, mask=mask).astype(np.int32)
+    inst_map = watershed(-prob_map, markers, mask=mask)
+    return inst_map.astype(np.int32)
 
 # ==================================================================================================
 # 2. 8-fold TTA 批量推理 (GPU 物理坐标对齐版)
@@ -74,13 +73,13 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.5, marker_thresh=0.4, min
 def tta_inference_8x_batch(model, image_rgb, organ_id, args):
     device = args.device
     input_size = (args.image_size, args.image_size)
-    transforms = [(None, 0)]
     
+    # 🚀 火力全开：8x TTA
     # transforms = [
     #     (None, 0), (1, 0), (0, 0), (-1, 0), 
     #     (None, 1), (1, 1), (0, 1), (-1, 1)  
     # ]
-    
+    transforms = [(None, 0)]
     img_list = []
     for f_code, r_k in transforms:
         img_t = image_rgb.copy()
@@ -177,11 +176,10 @@ def main(args):
     model = TextSam(image_encoder=vanilla_sam.image_encoder, prompt_encoder=vanilla_sam.prompt_encoder,
                     mask_decoder=vanilla_sam.mask_decoder, num_organs=21).to(args.device)
     
-    # 🌟 修复加载权重的逻辑
     ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     state_dict = ckpt.get('model', ckpt)
     state_dict = resize_pos_embed(state_dict, model.state_dict())
-    model.load_state_dict(state_dict, strict=False)  # <--- 修改了这里
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
 
     predictor = OrganPredictor(args.device)
@@ -195,12 +193,10 @@ def main(args):
         image_bgr = cv2.imread(img_path)
         if image_bgr is None: continue
         
-        # 🚀 修复 BGR 转 RGB
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         
         _, organ_id = predictor.predict(image_bgr)
         
-        # 传递 rgb 图像给模型
         prob, hv, attr_logits = tta_inference_8x_batch(model, image_rgb, organ_id, args)
         
         dynamic_min_size = 30
@@ -209,6 +205,10 @@ def main(args):
             dynamic_min_size = {0: 15, 1: 30, 2: 60}.get(pred_size_idx, 30)
             
         pred_mask = hover_post_process(prob, hv, args.prob_thresh, args.marker_thresh, min_marker_size=dynamic_min_size)
+        
+        # 🚀 Fallback 保护：如果什么都没切出来，退化为简单的连通域分割
+        if pred_mask.max() == 0:
+            pred_mask = skimage_label(prob > 0.5).astype(np.int32)
         
         gt_mask = load_filtered_gt(img_path)
         if gt_mask is not None:
@@ -219,7 +219,7 @@ def main(args):
         else:
             print(f"❌ Missing GT: {img_path}") 
 
-    print("\n" + "🌟" * 15 + "\n📊 Final Results (8x TTA):")
+    print("\n" + "🌟" * 15 + "\n📊 Final Results :")
     for k, v in all_metrics.items(): print(f"{k:>10}: {np.mean(v):.4f}")
 
 def parse_args():
@@ -230,8 +230,9 @@ def parse_args():
     parser.add_argument("--model_type", type=str, default="vit_b")
     parser.add_argument("--encoder_adapter", action='store_true', default=True)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument("--prob_thresh", type=float, default=0.50)
-    parser.add_argument("--marker_thresh", type=float, default=0.55)
+    # 🚀 替换为搜索出的最佳阈值
+    parser.add_argument("--prob_thresh", type=float, default=0.40)
+    parser.add_argument("--marker_thresh", type=float, default=0.35)
     parser.add_argument("--save_pred", action='store_true')
     parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'])
     return parser.parse_args()
