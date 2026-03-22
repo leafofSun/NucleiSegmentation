@@ -53,6 +53,11 @@ class ASRBlock(nn.Module):
                 nn.Conv2d(in_dim * 2, 1, kernel_size=1),
                 nn.Sigmoid()
             )
+            
+            # 🔧 [优化]: 零/负初始化 Gate 权重，初期关闭门控，保护 SAM 预训练结构特征免受高频噪声冲击
+            nn.init.zeros_(self.gate[0].weight)
+            # 偏置设为 -2.0，初始 sigmoid(-2) ≈ 0.11，门控处于近乎关闭状态
+            nn.init.constant_(self.gate[0].bias, -2.0) 
 
     def forward(self, x, guide=None, density_map=None):
         """
@@ -115,7 +120,7 @@ class MaskDecoder(nn.Module):
         iou_head_depth: int = 3,
         iou_head_hidden_dim: int = 256,
         use_asr: bool = True,  # 🔥 新增开关：是否使用 ASR 高频细化
-        guide_dim: int = None,  # 🔥 PNuRL fused_low 的维度，默认 192 (3 * 256 // 4)
+        guide_dim: int = 192,  # 🔥 PNuRL fused_low 的维度，默认 192 (3 * 256 // 4)
         text_feature_dim: int = 512,  # 文本特征维度（用于像素-文本对齐）
     ) -> None:
         """
@@ -287,7 +292,10 @@ class MaskDecoder(nn.Module):
 
             pixel_feat = F.normalize(upscaled_embedding, dim=1, eps=1e-6)
             score_map = torch.einsum("bchw,bc->bhw", pixel_feat, t_feat).unsqueeze(1)
-            upscaled_embedding = upscaled_embedding * (1.0 + torch.sigmoid(score_map))
+            
+            # 🔧 [优化]: 引入温度系数 (Temperature Scale)，扩大 logits 差异，使背景抑制效果更锐利
+            temperature = 10.0 
+            upscaled_embedding = upscaled_embedding * (1.0 + torch.sigmoid(score_map * temperature))
 
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
@@ -322,15 +330,15 @@ class MLP(nn.Module):
         )
         self.sigmoid_output = sigmoid_output
         self.relu = nn.ReLU(inplace=False)
+        
     def forward(self, x):
         for i, layer in enumerate(self.layers):
-            # x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-            # x = self.relu(layer(x)) if i < self.num_layers - 1 else layer(x) #源码
             if i < self.num_layers - 1:
                 x = F.relu(layer(x))
             else:
                 x = layer(x)
 
         if self.sigmoid_output:
-            x = F.sigmoid(x)
+            # 🔧 [修复]: 替换官方已废弃的 F.sigmoid，防止高版本 PyTorch 报错中断训练
+            x = torch.sigmoid(x)
         return x

@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import cv2
 import json
+from pycocotools import mask as mask_utils
 from tqdm import tqdm
 from collections import defaultdict
 from segment_anything import sam_model_registry
@@ -18,39 +19,10 @@ from skimage.segmentation import watershed
 from skimage.morphology import remove_small_objects
 from scipy.ndimage import binary_fill_holes
 from skimage.measure import label
-import scipy.ndimage as ndimage
 
 # ==================================================================================================
-# 1. 核心后处理：官方对齐版 HoVer-Watershed
+#  权重插值函数 
 # ==================================================================================================
-def hover_post_process(prob_map, hv_map, prob_thresh=0.5, marker_thresh=0.4, min_marker_size=10):
-    mask = prob_map > prob_thresh
-    if not np.any(mask): return np.zeros_like(mask, dtype=np.int32)
-
-    # 尺寸对齐保护
-    if hv_map.shape[1:] != prob_map.shape:
-        hv_map = np.array([cv2.resize(hv_map[i], (prob_map.shape[1], prob_map.shape[0])) for i in range(2)])
-
-    # 归一化与 21x21 大核梯度计算 (真正释放 HoVer 威力)
-    h_dir = cv2.normalize(hv_map[1], None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
-    v_dir = cv2.normalize(hv_map[0], None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
-    
-    sobelh = 1 - cv2.normalize(cv2.Sobel(h_dir, cv2.CV_64F, 1, 0, ksize=21), None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
-    sobelv = 1 - cv2.normalize(cv2.Sobel(v_dir, cv2.CV_64F, 0, 1, ksize=21), None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
-
-    overall = np.maximum(sobelh, sobelv)
-    overall = (overall - (1 - mask)).clip(0) 
-
-    dist = -cv2.GaussianBlur((1.0 - overall) * mask, (3, 3), 0)
-    marker = (overall >= marker_thresh) & mask
-    marker = binary_fill_holes(marker).astype("uint8")
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    marker = cv2.morphologyEx(marker, cv2.MORPH_OPEN, kernel)
-    markers = label(marker)
-    markers = remove_small_objects(markers, min_size=min_marker_size)
-
-    return watershed(dist, markers=markers, mask=mask).astype(np.int32)
-
 def resize_pos_embed(state_dict, model_state_dict):
     new_state_dict = {}
     for k, v in state_dict.items():
@@ -70,45 +42,185 @@ def resize_pos_embed(state_dict, model_state_dict):
             new_state_dict[k] = v
     return new_state_dict
 
-# 器官 ID 配置
-ID_TO_ORGAN = {
-    0: "Adrenal_gland", 1: "Bile-duct", 2: "Bladder", 3: "Breast", 
-    4: "Cervix", 5: "Colon", 6: "Esophagus", 7: "HeadNeck", 
-    8: "Kidney", 9: "Liver", 10: "Lung", 11: "Ovarian", 
-    12: "Pancreatic", 13: "Prostate", 14: "Skin", 15: "Stomach", 
-    16: "Testis", 17: "Thyroid", 18: "Uterus",
-    19: "Brain", 20: "Generic"
-}
+# ==================================================================================================
+# 1. 核心后处理：官方 21x21 Sobel 版 HoVer-Watershed
+# ==================================================================================================
+def hover_post_process(prob_map, hv_map, prob_thresh=0.5, marker_thresh=0.4, min_marker_size=10):
+    mask = prob_map > prob_thresh
+    if not np.any(mask): return np.zeros_like(mask, dtype=np.int32)
+
+    h_dir = cv2.normalize(hv_map[1], None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
+    v_dir = cv2.normalize(hv_map[0], None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
+    
+    sobelh = 1 - cv2.normalize(cv2.Sobel(h_dir, cv2.CV_64F, 1, 0, ksize=21), None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
+    sobelv = 1 - cv2.normalize(cv2.Sobel(v_dir, cv2.CV_64F, 0, 1, ksize=21), None, 0, 1, cv2.NORM_MINMAX, cv2.CV_32F)
+
+    overall = np.maximum(sobelh, sobelv)
+    overall = (overall - (1 - mask)).clip(0) 
+
+    dist = -cv2.GaussianBlur((1.0 - overall) * mask, (3, 3), 0)
+    marker = (overall >= marker_thresh) & mask
+    marker = binary_fill_holes(marker).astype("uint8")
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    marker = cv2.morphologyEx(marker, cv2.MORPH_OPEN, kernel)
+    markers = label(marker)
+    markers = remove_small_objects(markers, min_size=min_marker_size)
+
+    return watershed(dist, markers=markers, mask=mask).astype(np.int32)
+
+# ==================================================================================================
+# 2. 8-fold TTA 批量推理 (GPU 物理坐标对齐版)
+# ==================================================================================================
+def tta_inference_8x_batch(model, image_rgb, organ_id, args):
+    device = args.device
+    input_size = (args.image_size, args.image_size)
+    transforms = [(None, 0)]
+    
+    # transforms = [
+    #     (None, 0), (1, 0), (0, 0), (-1, 0), 
+    #     (None, 1), (1, 1), (0, 1), (-1, 1)  
+    # ]
+    
+    img_list = []
+    for f_code, r_k in transforms:
+        img_t = image_rgb.copy()
+        if f_code is not None: img_t = cv2.flip(img_t, f_code)
+        if r_k > 0: img_t = np.rot90(img_t, k=r_k)
+        img_t = cv2.resize(img_t, input_size)
+        img_list.append(torch.from_numpy(img_t).permute(2, 0, 1).float())
+    
+    batch_img = torch.stack(img_list).to(device)
+    all_probs = []
+    all_hvs = []
+    
+    with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        for i in range(len(transforms)):
+            input_sample = [{'image': batch_img[i], 'original_size': input_size, 'organ_id': organ_id, 'text_prompt': "Cell nuclei"}]
+            out = model(input_sample, multimask_output=True)[0]
+            best_idx = torch.argmax(out['iou_predictions']).item()
+            
+            prob = torch.sigmoid(out['masks'][0, best_idx]) 
+            hv_raw = out.get('hv_logits')
+            if hv_raw.dim() == 3: hv_raw = hv_raw.unsqueeze(0)
+            hv = F.interpolate(hv_raw.float(), size=input_size, mode='bilinear', align_corners=False).squeeze(0)
+            hv = torch.tanh(hv) 
+
+            f_code, r_k = transforms[i]
+            
+            if r_k == 1:
+                prob = torch.rot90(prob, k=-1, dims=[0, 1])
+                hv = torch.rot90(hv, k=-1, dims=[1, 2])
+                v_new, h_new = hv[1].clone(), -hv[0].clone()
+                hv[0], hv[1] = v_new, h_new
+
+            if f_code == 1: 
+                prob = torch.flip(prob, [1]); hv = torch.flip(hv, [2]); hv[1] = -hv[1]
+            elif f_code == 0: 
+                prob = torch.flip(prob, [0]); hv = torch.flip(hv, [1]); hv[0] = -hv[0]
+            elif f_code == -1: 
+                prob = torch.flip(prob, [0, 1]); hv = torch.flip(hv, [1, 2]); hv = -hv
+            
+            all_probs.append(prob)
+            all_hvs.append(hv)
+
+        avg_prob = torch.stack(all_probs).mean(0).cpu().float().numpy()
+        avg_hv = torch.stack(all_hvs).mean(0).cpu().float().numpy()
+        
+    return avg_prob, avg_hv, out.get('attr_logits', {})
+
+# ==================================================================================================
+# 3. 工具函数
+# ==================================================================================================
+def load_filtered_gt(img_path):
+    json_path = os.path.splitext(img_path)[0] + ".json"
+    if not os.path.exists(json_path): return None
+    try:
+        with open(json_path, 'r') as f: data = json.load(f)
+        if isinstance(data, list): data = data[0]
+        h, w = data.get('height', 512), data.get('width', 512)
+        instance_map = np.zeros((h, w), dtype=np.int32)
+        for idx, ann in enumerate(data.get('annotations', [])):
+            seg = ann.get('segmentation')
+            if isinstance(seg, list):
+                for poly in seg:
+                    poly_np = np.array(poly).reshape(-1, 2).astype(np.int32)
+                    cv2.fillPoly(instance_map, [poly_np], idx + 1)
+        return instance_map
+    except: return None
 
 class OrganPredictor:
     def __init__(self, device):
         self.device = device
         self.model, self.preprocess = clip.load("ViT-B/16", device=device)
-        self.model.eval()
         self.valid_ids = sorted(list(ID_TO_ORGAN.keys())) 
         self.organs = [ID_TO_ORGAN[i] for i in self.valid_ids]
-        self.templates = [f"A histology image of {org} tissue." for org in self.organs]
         with torch.no_grad():
-            text_inputs = clip.tokenize(self.templates).to(device)
-            self.text_features = self.model.encode_text(text_inputs)
+            self.text_features = self.model.encode_text(clip.tokenize([f"histology {org}" for org in self.organs]).to(device))
             self.text_features /= self.text_features.norm(dim=-1, keepdim=True)
 
     def predict(self, image_cv2):
-        img_rgb = cv2.cvtColor(image_cv2, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(img_rgb)
-        image_input = self.preprocess(img_pil).unsqueeze(0).to(self.device)
+        img_pil = Image.fromarray(cv2.cvtColor(image_cv2, cv2.COLOR_BGR2RGB))
+        img_in = self.preprocess(img_pil).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            image_features = self.model.encode_image(image_input)
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-            similarity = (100.0 * image_features @ self.text_features.T).softmax(dim=-1)
-            indices = similarity[0].argmax().item()
-        return self.organs[indices], self.valid_ids[indices]
+            feat = self.model.encode_image(img_in)
+            feat /= feat.norm(dim=-1, keepdim=True)
+            idx = (feat @ self.text_features.T).argmax().item()
+        return self.organs[idx], self.valid_ids[idx]
 
-def load_filtered_gt(img_path):
-    mask_path_png = img_path.replace('.tif', '_mask.png').replace('.png', '_mask.png')
-    if os.path.exists(mask_path_png):
-        return cv2.imread(mask_path_png, cv2.IMREAD_UNCHANGED).astype(np.int32)
-    return None
+ID_TO_ORGAN = {0: "Adrenal_gland", 1: "Bile-duct", 2: "Bladder", 3: "Breast", 4: "Cervix", 5: "Colon", 6: "Esophagus", 7: "HeadNeck", 8: "Kidney", 9: "Liver", 10: "Lung", 11: "Ovarian", 12: "Pancreatic", 13: "Prostate", 14: "Skin", 15: "Stomach", 16: "Testis", 17: "Thyroid", 18: "Uterus", 19: "Brain", 20: "Generic"}
+
+# ==================================================================================================
+# 4. Main
+# ==================================================================================================
+def main(args):
+    vanilla_sam = sam_model_registry[args.model_type](args)
+    model = TextSam(image_encoder=vanilla_sam.image_encoder, prompt_encoder=vanilla_sam.prompt_encoder,
+                    mask_decoder=vanilla_sam.mask_decoder, num_organs=21).to(args.device)
+    
+    # 🌟 修复加载权重的逻辑
+    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
+    state_dict = ckpt.get('model', ckpt)
+    state_dict = resize_pos_embed(state_dict, model.state_dict())
+    model.load_state_dict(state_dict, strict=False)  # <--- 修改了这里
+    model.eval()
+
+    predictor = OrganPredictor(args.device)
+    all_metrics = defaultdict(list)
+    image_files = [os.path.join(args.data_path, f) for f in os.listdir(args.data_path) if f.lower().endswith(('.png', '.tif'))]
+    
+    save_dir = os.path.join("workdir", "eval_tta8x", "inference_viz")
+    if args.save_pred: os.makedirs(save_dir, exist_ok=True)
+
+    for img_path in tqdm(image_files, desc="8x-TTA Inference"):
+        image_bgr = cv2.imread(img_path)
+        if image_bgr is None: continue
+        
+        # 🚀 修复 BGR 转 RGB
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        
+        _, organ_id = predictor.predict(image_bgr)
+        
+        # 传递 rgb 图像给模型
+        prob, hv, attr_logits = tta_inference_8x_batch(model, image_rgb, organ_id, args)
+        
+        dynamic_min_size = 30
+        if 'size' in attr_logits:
+            pred_size_idx = torch.argmax(attr_logits['size'], dim=1).item()
+            dynamic_min_size = {0: 15, 1: 30, 2: 60}.get(pred_size_idx, 30)
+            
+        pred_mask = hover_post_process(prob, hv, args.prob_thresh, args.marker_thresh, min_marker_size=dynamic_min_size)
+        
+        gt_mask = load_filtered_gt(img_path)
+        if gt_mask is not None:
+            if gt_mask.shape != pred_mask.shape:
+                gt_mask = cv2.resize(gt_mask.astype(np.int32), (pred_mask.shape[1], pred_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+            res = SegMetrics(pred_mask, gt_mask, args.metrics)
+            for k, v in res.items(): all_metrics[k].append(v)
+        else:
+            print(f"❌ Missing GT: {img_path}") 
+
+    print("\n" + "🌟" * 15 + "\n📊 Final Results (8x TTA):")
+    for k, v in all_metrics.items(): print(f"{k:>10}: {np.mean(v):.4f}")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -119,113 +231,10 @@ def parse_args():
     parser.add_argument("--encoder_adapter", action='store_true', default=True)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument("--prob_thresh", type=float, default=0.50)
-    parser.add_argument("--marker_thresh", type=float, default=0.54)
+    parser.add_argument("--marker_thresh", type=float, default=0.55)
     parser.add_argument("--save_pred", action='store_true')
     parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'])
     return parser.parse_args()
-
-# ==================================================================================================
-# 2. 8-fold TTA 全图推理
-# ==================================================================================================
-def tta_inference_8x(model, image_rgb, organ_id, args):
-    device = args.device
-    input_size = (args.image_size, args.image_size)
-    transforms = [(None, 0), (1, 0), (0, 0), (1, 2), (None, 1), (1, 1), (0, 1), (-1, 1)]
-    
-    accum_prob = None
-    accum_hv = None
-
-    for f_code, r_k in transforms:
-        img_trans = image_rgb.copy()
-        if f_code is not None: img_trans = cv2.flip(img_trans, f_code)
-        if r_k > 0: img_trans = np.rot90(img_trans, k=r_k)
-        
-        img_t = torch.from_numpy(cv2.resize(img_trans, input_size)).permute(2, 0, 1).float().to(device)
-        # 内部构造 input_sample，不再依赖外部 text_prompt
-        input_sample = [{'image': img_t, 'original_size': input_size, 'organ_id': organ_id, 'text_prompt': "Cell nuclei"}]
-        
-        with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            out = model(input_sample, multimask_output=True)[0]
-            best_idx = torch.argmax(out['iou_predictions']).item()
-            prob = torch.sigmoid(out['masks'][0, best_idx]).float().cpu().numpy()
-            
-            hv_logits = out.get('hv_logits')
-            if hv_logits.dim() == 3: hv_logits = hv_logits.unsqueeze(0)
-            hv_rescaled = F.interpolate(hv_logits.float(), size=input_size, mode='bilinear', align_corners=False)
-            hv = torch.tanh(hv_rescaled).squeeze(0).cpu().numpy()
-
-        # 逆变换还原 (物理矢量对齐)
-        if r_k > 0:
-            prob = np.rot90(prob, k=-r_k)
-            hv = np.rot90(hv, k=-r_k, axes=(1, 2))
-            if r_k % 2 != 0: hv[0], hv[1] = hv[1].copy(), hv[0].copy()
-        
-        if f_code is not None:
-            prob = cv2.flip(prob, f_code)
-            hv = np.array([cv2.flip(hv[0], f_code), cv2.flip(hv[1], f_code)])
-            if f_code == 1: hv[1] = -hv[1]
-            elif f_code == 0: hv[0] = -hv[0]
-            elif f_code == -1: hv = -hv
-
-        if accum_prob is None:
-            accum_prob, accum_hv = prob, hv
-        else:
-            accum_prob += prob
-            accum_hv += hv
-
-    return accum_prob / 8.0, accum_hv / 8.0, out.get('attr_logits', {})
-
-def main(args):
-    vanilla_sam = sam_model_registry[args.model_type](args)
-    model = TextSam(image_encoder=vanilla_sam.image_encoder, prompt_encoder=vanilla_sam.prompt_encoder,
-                    mask_decoder=vanilla_sam.mask_decoder, num_organs=21).to(args.device)
-    
-    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
-    model.load_state_dict(ckpt.get('model', ckpt), strict=False)
-    model.eval()
-
-    predictor = OrganPredictor(args.device)
-    all_metrics = defaultdict(list)
-    image_files = [os.path.join(args.data_path, f) for f in os.listdir(args.data_path) if f.lower().endswith(('.png', '.tif'))]
-    
-    save_dir = os.path.join("workdir", "eval_tta", "inference_viz")
-    if args.save_pred: os.makedirs(save_dir, exist_ok=True)
-
-    for img_path in tqdm(image_files, desc="Inference"):
-        image = cv2.imread(img_path)
-        if image is None: continue
-        
-        # 1. 自动识别器官
-        _, organ_id = predictor.predict(image)
-        
-        # 2. 8倍 TTA 推理
-        prob, hv, attr_logits = tta_inference_8x(model, image, organ_id, args)
-        
-        # 3. 动态属性自适应 (基于模型内部 PNuRL 分支)
-        dynamic_min_size = 30
-        if 'size' in attr_logits:
-            pred_size_idx = torch.argmax(attr_logits['size'], dim=1).item()
-            dynamic_min_size = {0: 15, 1: 30, 2: 60}.get(pred_size_idx, 30)
-            
-        # 4. 终极后处理
-        pred_mask = hover_post_process(prob, hv, args.prob_thresh, args.marker_thresh, min_marker_size=dynamic_min_size)
-        
-        # 5. 性能评估
-        gt_mask = load_filtered_gt(img_path)
-        if gt_mask is not None:
-            if gt_mask.shape != pred_mask.shape:
-                gt_mask = cv2.resize(gt_mask.astype(np.int32), (pred_mask.shape[1], pred_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
-            res = SegMetrics(pred_mask, gt_mask, args.metrics)
-            for k, v in res.items(): all_metrics[k].append(v)
-
-        if args.save_pred:
-            vis = image.copy()
-            cnts, _ = cv2.findContours((pred_mask>0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(vis, cnts, -1, (0, 255, 0), 2)
-            cv2.imwrite(os.path.join(save_dir, os.path.basename(img_path)), vis)
-
-    print("\n" + "="*40 + "\n📊 Final Results:")
-    for k, v in all_metrics.items(): print(f"{k:>10}: {np.mean(v):.4f}")
 
 if __name__ == '__main__':
     main(parse_args())
