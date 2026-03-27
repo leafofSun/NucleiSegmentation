@@ -1,112 +1,70 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import torch
 from torch import nn
 from torch.nn import functional as F
-
 from typing import List, Tuple, Type
-
 from .common import LayerNorm2d
-
 
 class ASRBlock(nn.Module):
     """
-    🔥 [核心改进] 基于 WeaveSeg ASR 思想的自适应谱细化上采样模块
-    替代普通的 ConvTranspose2d，用于恢复高频边界信息
-    
-    设计思路：
-    - 低频流 (Structure): 来自 SAM Transformer 的特征（语义强，边界糊）
-    - 高频流 (Detail): 来自 PNuRL 的 fused_low 特征（纹理强，边界清）
-    - 融合: 使用 PNuRL 的特征作为 Guide，去"指导" SAM 完成上采样
+    🔥 [纯视觉消融版] ASR上采样模块 (CNN + ViT Hybrid)
+    仅融合两种信息：
+    1. x_struct: 来自 SAM 的低频全局语义特征
+    2. cnn_feat: 来自 ResNet 的高频物理边缘特征 (Skip Connection)
     """
-    def __init__(self, in_dim, out_dim, guide_dim=None, activation: Type[nn.Module] = nn.GELU):
+    def __init__(self, in_dim, out_dim, cnn_dim=None, activation: Type[nn.Module] = nn.GELU):
         super().__init__()
-        # 1. 基础结构流 (Low-Frequency / Structure from SAM)
+        # 1. 基础结构上采样 (SAM 流)
         self.structure_upsample = nn.Sequential(
             nn.ConvTranspose2d(in_dim, out_dim, kernel_size=2, stride=2),
             LayerNorm2d(out_dim),
             activation(),
         )
         
-        # 2. 高频细节流 (High-Frequency / Boundary from PNuRL)
-        self.has_guide = guide_dim is not None
-        if self.has_guide:
-            # 对齐通道
-            self.guide_proj = nn.Sequential(
-                nn.Conv2d(guide_dim, in_dim, kernel_size=1),
+        # 2. 真实物理边缘流 (ResNet Skip Connection)
+        self.has_cnn = cnn_dim is not None
+        if self.has_cnn:
+            # 压缩 CNN 通道
+            self.cnn_proj = nn.Sequential(
+                nn.Conv2d(cnn_dim, out_dim, kernel_size=1, bias=False),
+                LayerNorm2d(out_dim),
                 activation(),
             )
-            # 细节细化：使用 PixelShuffle 模拟高频锐化
-            # WeaveSeg 使用了自适应滤波器，这里我们用更高效的 PixelShuffle 实现类似效果
-            self.detail_refine = nn.Sequential(
-                nn.Conv2d(in_dim, out_dim * 4, kernel_size=3, padding=1),
-                nn.PixelShuffle(2),  # 上采样 2x: [B, out_dim*4, H, W] -> [B, out_dim, H*2, W*2]
-                nn.Conv2d(out_dim, out_dim, kernel_size=1),  # 融合
+            # 特征融合
+            self.cnn_fusion = nn.Sequential(
+                nn.Conv2d(out_dim * 2, out_dim, kernel_size=3, padding=1, bias=False),
+                LayerNorm2d(out_dim),
+                activation()
             )
+            # 🔧 [零初始化]: 确保初期 CNN 增量为 0，防止破坏预训练流形，平滑过渡
+            nn.init.zeros_(self.cnn_fusion[0].weight)
             
-            # 门控机制：决定注入多少高频信息（关注 x 和 g 的差异区，即边界）
-            self.gate = nn.Sequential(
-                nn.Conv2d(in_dim * 2, 1, kernel_size=1),
-                nn.Sigmoid()
-            )
-            
-            # 🔧 [优化]: 零/负初始化 Gate 权重，初期关闭门控，保护 SAM 预训练结构特征免受高频噪声冲击
-            nn.init.zeros_(self.gate[0].weight)
-            # 偏置设为 -2.0，初始 sigmoid(-2) ≈ 0.11，门控处于近乎关闭状态
-            nn.init.constant_(self.gate[0].bias, -2.0) 
+            # 🔥 [防梯度爆炸优化]: 引入可学习的 Residual Scale 标量，初始化为 0.1
+            self.residual_scale = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, x, guide=None, density_map=None):
-        """
-        Args:
-            x: [B, C, H, W] (SAM Transformer 特征 - 模糊)
-            guide: [B, C_g, H, W] (PNuRL 融合特征 - Size+Shape+Density -> 形状稳定剂 🦴)
-            density_map: [B, 1, H, W] (AutoPoint 热力图 -> 空间门控 🔦)
-        
-        Returns:
-            [B, out_dim, H*2, W*2] 上采样后的特征
-        """
+    def forward(self, x, cnn_feat=None):
         # 1. 基础语义上采样
-        x_struct = self.structure_upsample(x)
+        x_up = self.structure_upsample(x)
         
-        if self.has_guide and guide is not None:
-            # 2. 处理向导特征（对齐空间尺寸）
-            # guide 可能来自 64x64，需要确保与 x 的空间尺寸一致
-            if guide.shape[-2:] != x.shape[-2:]:
-                guide = F.interpolate(guide, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        # 2. 注入真实物理边缘 (ResNet)
+        if self.has_cnn and cnn_feat is not None:
+            c = self.cnn_proj(cnn_feat)
+            # 空间尺寸对齐
+            if c.shape[-2:] != x_up.shape[-2:]:
+                c = F.interpolate(c, size=x_up.shape[-2:], mode='bilinear', align_corners=False)
             
-            g = self.guide_proj(guide)  # [B, C, H, W]
+            # 拼接并计算真实的边缘增量
+            detail = self.cnn_fusion(torch.cat([x_up, c], dim=1))
             
-            # 🔥 [核心创新: 空间-语义双重控制]
-            if density_map is not None:
-                # 对齐尺寸
-                if density_map.shape[-2:] != g.shape[-2:]:
-                    d_map = F.interpolate(density_map.float(), size=g.shape[-2:], mode='bilinear', align_corners=False)
-                else:
-                    d_map = density_map
-
-                # 仅把密度图作为先验门控，避免 mask loss 反向污染密度分支
-                d_map = d_map.detach()
-                # 约束到 [0, 1]，防止稀疏区域被削弱或密集区域特征放大
-                d_gate = torch.clamp(d_map, min=0.0, max=1.0).to(g.dtype)
-                g = g * d_gate  # [B, C, H, W] * [B, 1, H, W] -> [B, C, H, W]
+            # 🔥 获取动态缩放因子，并确保其设备和数据类型一致
+            scale = self.residual_scale.to(x_up.device, dtype=x_up.dtype)
             
-            # 3. 计算门控权重 (关注 x 和 g 的差异区，即边界)
-            combined = torch.cat([x, g], dim=1)
-            alpha = self.gate(combined)
+            # 残差融合 (引入动态缩放保护)
+            x_up = x_up + (detail * scale)
             
-            # 4. 注入高频细节
-            # 使用 guide 加权后的特征进行锐化上采样
-            x_detail_input = x + alpha * g
-            x_high_freq = self.detail_refine(x_detail_input)
-            
-            # 5. 最终融合：结构 + 细节
-            return x_struct + x_high_freq
-        else:
-            return x_struct
+        return x_up
 
 
 class MaskDecoder(nn.Module):
@@ -119,60 +77,29 @@ class MaskDecoder(nn.Module):
         activation: Type[nn.Module] = nn.GELU,
         iou_head_depth: int = 3,
         iou_head_hidden_dim: int = 256,
-        use_asr: bool = True,  # 🔥 新增开关：是否使用 ASR 高频细化
-        guide_dim: int = 192,  # 🔥 PNuRL fused_low 的维度，默认 192 (3 * 256 // 4)
-        text_feature_dim: int = 512,  # 文本特征维度（用于像素-文本对齐）
+        use_asr: bool = True,
     ) -> None:
-        """
-        Predicts masks given an image and prompt embeddings, using a
-        transformer architecture.
-
-        Arguments:
-          transformer_dim (int): the channel dimension of the transformer
-          transformer (nn.Module): the transformer used to predict masks
-          num_multimask_outputs (int): the number of masks to predict
-            when disambiguating masks
-          activation (nn.Module): the type of activation to use when
-            upscaling masks
-          iou_head_depth (int): the depth of the MLP used to predict
-            mask quality
-          iou_head_hidden_dim (int): the hidden dimension of the MLP
-            used to predict mask quality
-        """
         super().__init__()
         self.transformer_dim = transformer_dim
         self.transformer = transformer
-
         self.num_multimask_outputs = num_multimask_outputs
 
         self.iou_token = nn.Embedding(1, transformer_dim)
         self.num_mask_tokens = num_multimask_outputs + 1
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
 
-        # 🔥 [核心修改] 替换 output_upscaling 为 ASR 模块
         self.use_asr = use_asr
         
         if self.use_asr:
-            # 默认 guide_dim = 192 (3 * embed_dim // 4)，如果 embed_dim=256
-            if guide_dim is None:
-                guide_dim = 192  # 3 * (256 // 4)
-            
-            # 第一层：256 -> 64 (注入高频细节)
+            # 第一层上采样：1/16 -> 1/8 尺度，接收 ResNet Stage 2 (512通道)
             self.asr_upscale_1 = ASRBlock(
-                transformer_dim, 
-                transformer_dim // 4, 
-                guide_dim=guide_dim,
-                activation=activation
+                transformer_dim, transformer_dim // 4, cnn_dim=512, activation=activation
             )
-            # 第二层：64 -> 32 (常规上采样，不再需要 guide)
+            # 第二层上采样：1/8 -> 1/4 尺度，接收 ResNet Stage 1 (256通道)
             self.asr_upscale_2 = ASRBlock(
-                transformer_dim // 4, 
-                transformer_dim // 8, 
-                guide_dim=None,
-                activation=activation
+                transformer_dim // 4, transformer_dim // 8, cnn_dim=256, activation=activation
             )
         else:
-            # 原版 SAM 上采样
             self.output_upscaling = nn.Sequential(
                 nn.ConvTranspose2d(transformer_dim, transformer_dim // 4, kernel_size=2, stride=2),
                 LayerNorm2d(transformer_dim // 4),
@@ -180,6 +107,7 @@ class MaskDecoder(nn.Module):
                 nn.ConvTranspose2d(transformer_dim // 4, transformer_dim // 8, kernel_size=2, stride=2),
                 activation(),
             )
+            
         self.output_hypernetworks_mlps = nn.ModuleList(
             [
                 MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
@@ -189,47 +117,30 @@ class MaskDecoder(nn.Module):
 
         self.iou_prediction_head = MLP(
             transformer_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth
-        )  #256 256 4 3
-        self.text_to_pixel_proj = nn.Linear(text_feature_dim, transformer_dim // 8)
+        )
 
     def forward(
         self,
-        image_embeddings: torch.Tensor,   #[B, 256, 64, 64]
-        image_pe: torch.Tensor,           #[1, 256, 64, 64]
-        sparse_prompt_embeddings: torch.Tensor, #[B, 3, 256]
-        dense_prompt_embeddings: torch.Tensor,  #[B, 256, 64, 64]
+        image_embeddings: torch.Tensor,
+        image_pe: torch.Tensor,
+        sparse_prompt_embeddings: torch.Tensor,
+        dense_prompt_embeddings: torch.Tensor,
         multimask_output: bool,
-        high_freq_features: torch.Tensor = None,  # 🔥 新增：PNuRL 的 fused_low 特征 [B, 192, 64, 64]
-        density_map: torch.Tensor = None,  # 🔥 [New] AutoPoint 生成的密度图 [B, 1, 64, 64]
-        text_features: torch.Tensor = None,  # [B, D] 或 [B, K, D] 文本语义特征
+        cnn_feat_s1: torch.Tensor = None,  # 🔥 ResNet 1/4 特征
+        cnn_feat_s2: torch.Tensor = None,  # 🔥 ResNet 1/8 特征
+        # (屏蔽了所有与文本/密度相关的入参)
+        **kwargs 
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Predict masks given image and prompt embeddings.
-
-        Arguments:
-          image_embeddings (torch.Tensor): the embeddings from the image encoder
-          image_pe (torch.Tensor): positional encoding with the shape of image_embeddings
-          sparse_prompt_embeddings (torch.Tensor): the embeddings of the points and boxes
-          dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
-          multimask_output (bool): Whether to return multiple masks or a single
-            mask.
-
-        Returns:
-          torch.Tensor: batched predicted masks
-          torch.Tensor: batched predictions of mask quality
-        """
 
         masks, iou_pred = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
             dense_prompt_embeddings=dense_prompt_embeddings,
-            high_freq_features=high_freq_features,  # 🔥 传递高频特征
-            density_map=density_map,  # 🔥 [New] 传递密度图
-            text_features=text_features,
+            cnn_feat_s1=cnn_feat_s1,
+            cnn_feat_s2=cnn_feat_s2,
         )
 
-        # Select the correct mask or masks for output
         if multimask_output:
             mask_slice = slice(1, None)
         else:
@@ -237,7 +148,6 @@ class MaskDecoder(nn.Module):
         masks = masks[:, mask_slice, :, :]
         iou_pred = iou_pred[:, mask_slice]
 
-        # Prepare output
         return masks, iou_pred
 
     def predict_masks(
@@ -246,99 +156,54 @@ class MaskDecoder(nn.Module):
         image_pe: torch.Tensor,
         sparse_prompt_embeddings: torch.Tensor,
         dense_prompt_embeddings: torch.Tensor,
-        high_freq_features: torch.Tensor = None,  # 🔥 新增参数
-        density_map: torch.Tensor = None,  # 🔥 [New] 密度图参数
-        text_features: torch.Tensor = None,  # [B, D] 或 [B, K, D]
+        cnn_feat_s1: torch.Tensor = None,
+        cnn_feat_s2: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predicts masks. See 'forward' for more details."""
-        # Concatenate output tokens
-
-        output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)  #iou_token:[1,256]  mask_tokens:[4,256]
+        
+        output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
-        # Expand per-image data in batch direction to be per-mask
-        # src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
-        src = image_embeddings
-        src = src + dense_prompt_embeddings
+        src = image_embeddings + dense_prompt_embeddings
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
 
-        # Run the transformer
         hs, src = self.transformer(src, pos_src, tokens)
         iou_token_out = hs[:, 0, :]
         mask_tokens_out = hs[:, 1 : (1 + self.num_mask_tokens), :]
 
-        # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
         
-        # 🔥 [核心修改] 使用 ASR 或原版上采样
+        # 🔥 [核心修改] 仅注入物理边缘，剥离文本先验
         if self.use_asr:
-            # 第一层：注入高频细节（如果有 guide）和密度图
-            upscaled_embedding = self.asr_upscale_1(src, guide=high_freq_features, density_map=density_map)
-            # 第二层：常规上采样（不需要密度图）
-            upscaled_embedding = self.asr_upscale_2(upscaled_embedding)
+            upscaled_embedding = self.asr_upscale_1(src, cnn_feat=cnn_feat_s2)
+            upscaled_embedding = self.asr_upscale_2(upscaled_embedding, cnn_feat=cnn_feat_s1)
         else:
             upscaled_embedding = self.output_upscaling(src)
-
-        # 像素-文本分数对齐：仅放大语义匹配区域，抑制语义不一致像素
-        if text_features is not None:
-            if text_features.dim() == 3:
-                # 若传入 [B, K, D]，默认使用第一个文本向量（通常为正类）
-                text_features = text_features[:, 0, :]
-
-            t_feat = self.text_to_pixel_proj(text_features.to(upscaled_embedding.dtype))
-            t_feat = F.normalize(t_feat, dim=-1, eps=1e-6)
-
-            pixel_feat = F.normalize(upscaled_embedding, dim=1, eps=1e-6)
-            score_map = torch.einsum("bchw,bc->bhw", pixel_feat, t_feat).unsqueeze(1)
-            
-            # 🔧 [优化]: 引入温度系数 (Temperature Scale)，扩大 logits 差异，使背景抑制效果更锐利
-            temperature = 10.0 
-            upscaled_embedding = upscaled_embedding * (1.0 + torch.sigmoid(score_map * temperature))
 
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
-        hyper_in = torch.stack(hyper_in_list, dim=1)  #[1,4,32]
+        hyper_in = torch.stack(hyper_in_list, dim=1)
 
-        b, c, h, w = upscaled_embedding.shape  #[1, 32, 256, 256]
+        b, c, h, w = upscaled_embedding.shape
         masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
-
-        # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)
 
         return masks, iou_pred
 
-
-# Lightly adapted from
-# https://github.com/facebookresearch/MaskFormer/blob/main/mask_former/modeling/transformer/transformer_predictor.py # noqa
 class MLP(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        num_layers: int,
-        sigmoid_output: bool = False,
-    ) -> None:
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int, sigmoid_output: bool = False) -> None:
         super().__init__()
         self.num_layers = num_layers
         h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(
-            nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim])
-        )
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
         self.sigmoid_output = sigmoid_output
         self.relu = nn.ReLU(inplace=False)
         
     def forward(self, x):
         for i, layer in enumerate(self.layers):
-            if i < self.num_layers - 1:
-                x = F.relu(layer(x))
-            else:
-                x = layer(x)
-
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         if self.sigmoid_output:
-            # 🔧 [修复]: 替换官方已废弃的 F.sigmoid，防止高版本 PyTorch 报错中断训练
             x = torch.sigmoid(x)
         return x

@@ -9,7 +9,7 @@ from tqdm import tqdm
 import logging
 import math
 import cv2 
-import gc  # 垃圾回收
+import gc  
 
 import torch
 import torch.nn as nn
@@ -78,6 +78,7 @@ def parse_args():
 
     # =========================================================================
     # 核心消融实验开关 (Ablation Study Switches)
+    # 默认全部关闭以测试纯视觉基线，如需开启可在启动命令中增加 --use_xxx
     # =========================================================================
     parser.add_argument("--use_pnurl", action='store_true', default=False, help="启用 PNuRL 属性预测分支")
     parser.add_argument("--use_coop", action='store_true', default=False, help="启用 CoOp 可学习文本提示")
@@ -162,7 +163,7 @@ def get_gaussian_weight_map(patch_size, device):
     weight_map = weight_map / weight_map.max()
     return weight_map
 
-# 🔥 [新增] 训练集适用的 HoVer 后处理 (优化 ksize=5)
+# 🔥 训练集适用的 HoVer 后处理
 def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, min_marker_size=10):
     mask = prob_map > prob_thresh
     if not np.any(mask):
@@ -171,14 +172,11 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, mi
     v_map = hv_map[0].astype(np.float32)
     h_map = hv_map[1].astype(np.float32)
 
-    # 舍弃 cv2.Sobel，改用更直接、对 [-1, 1] 更敏感的 np.gradient
     diff_v = np.gradient(v_map, axis=0) 
     diff_h = np.gradient(h_map, axis=1) 
     
-    # 扩大梯度的响应范围，增强切断粘连的能力
     sobel_mag = np.sqrt(diff_v**2 + diff_h**2)
     
-    # 直接使用原始梯度幅值，避免在低边界场景中放大背景噪声
     marker_map = prob_map - sobel_mag
     marker_map = (marker_map > marker_thresh) & mask
     
@@ -187,12 +185,12 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, mi
 
     inst_map = watershed(-prob_map, markers, mask=mask)
     return inst_map.astype(np.int32)
-# 🔥 [修改] 返回概率图和 HV 图
+
 def sliding_window_inference(model, image, organ_id, patch_size=256, target_size=512, stride=None, device='cuda'):
     C, H, W = image.shape
     if stride is None: stride = patch_size // 2
     full_prob_map = torch.zeros((H, W), device=device)
-    full_hv_map = torch.zeros((2, H, W), device=device) # 新增 HV Map
+    full_hv_map = torch.zeros((2, H, W), device=device)
     count_map = torch.zeros((H, W), device=device)
     weight_map = get_gaussian_weight_map(patch_size, device)
 
@@ -223,7 +221,7 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
                     iou_preds = out[0]['iou_predictions']
                     best_idx = torch.argmax(iou_preds).item()
                     pred_logits_target = out[0]['masks'][0, best_idx]
-                    hv_logits_target = out[0].get('hv_logits', None)  # 提取 HV
+                    hv_logits_target = out[0].get('hv_logits', None) 
                     if hv_logits_target is not None:
                         hv_logits_target = torch.tanh(hv_logits_target)
             
@@ -244,7 +242,7 @@ def sliding_window_inference(model, image, organ_id, patch_size=256, target_size
     return full_prob_map, full_hv_map
 
 # ==================================================================================================
-# 3. Training Logic
+# 3. Training Logic (🔥 Ablation to Basics: Pure Visual Baseline)
 # ==================================================================================================
 def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank):
     model.train()
@@ -256,7 +254,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
     losses = []
     mask_losses = []
     heatmap_losses = []
-    attr_losses = []
     hv_losses = []
     
     optimizer.zero_grad(set_to_none=True)
@@ -272,11 +269,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         
         model_input = []
         organ_ids = batched_input.get('organ_id', None)
-        attr_texts = batched_input.get('attribute_text', ["Cell nuclei"] * len(images))
-        base_texts = batched_input.get('text_prompt', ["Cell nuclei"] * len(images))
-        # 与 TextSam 期望的 attribute_labels / attribute_prompts 对齐
-        attr_labels = batched_input.get('attribute_labels', batched_input.get('attr_labels', None))
-
+        
         for i in range(len(images)):
             curr_id = 20
             if organ_ids is not None:
@@ -287,9 +280,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 'image': images[i],
                 'original_size': (args.image_size, args.image_size),
                 'organ_id': curr_id,
-                'attribute_text': attr_texts[i],
-                'text_prompt': base_texts[i],
-                'attribute_labels': attr_labels[i] if attr_labels is not None else None,
+                # 🔥 [Ablation] 屏蔽动态生成的多模态文本输入
+                'attribute_text': "Cell nuclei",
+                'text_prompt': "Cell nuclei",
+                'attribute_labels': None, 
             })
 
         with autocast('cuda', enabled=args.use_amp):
@@ -297,12 +291,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             loss_batch = 0
             loss_m_accum = 0.0
             loss_h_accum = 0.0
-            loss_attr_accum = 0.0
             loss_hv_accum = 0.0
-            
-            # 🔥 [修复 1] 添加密度图标识位，防止空载计算假性 Loss
-            peak_counts_list = []; density_logits_list = []; density_map_list = []; pred_mask_list = []
-            has_valid_density = False 
             
             for i, out in enumerate(outputs):
                 iou_preds = out['iou_predictions']
@@ -316,7 +305,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 if pred_mask.shape != gt_mask.shape:
                       gt_mask = F.interpolate(gt_mask.unsqueeze(0).unsqueeze(0), size=pred_mask.shape, mode='nearest').squeeze()
 
+                # 1. Mask Loss
                 loss_m, _ = criterion(pred_mask.unsqueeze(0).unsqueeze(0), gt_mask.unsqueeze(0).unsqueeze(0), pred_iou.unsqueeze(0))
+                
+                # 2. Heatmap Loss (Point Guidance)
                 pred_heatmap = out['heatmap_logits'] 
                 with torch.no_grad():
                     target_mask = labels[i].float().unsqueeze(0)
@@ -324,24 +316,22 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                     gt_nuclei[gt_nuclei==255] = 0
                 loss_h = point_guidance_loss(pred_heatmap, gt_nuclei.unsqueeze(0))
 
+                # 3. HV Distance Map Loss
                 loss_hv = torch.tensor(0.0, device=loss_m.device)
                 pred_hv = out.get('hv_logits', None)
                 if pred_hv is not None:
                     if pred_hv.dim() == 3:
                         pred_hv = pred_hv.unsqueeze(0)
-                    # 约束到 [-1, 1] 空间，与 GT 一致
                     pred_hv = torch.tanh(pred_hv)
 
                     with torch.no_grad():
                         gt_hv_map_batch = batched_input.get("gt_hv_map", None)
                         if gt_hv_map_batch is not None:
                             gt_hv_full = gt_hv_map_batch[i].to(pred_hv.device)
-                            if gt_hv_full.dim() == 3:
-                                gt_hv_full = gt_hv_full.unsqueeze(0)
+                            if gt_hv_full.dim() == 3: gt_hv_full = gt_hv_full.unsqueeze(0)
                         else:
                             inst_batch = batched_input.get("label_inst", None)
-                            if inst_batch is None:
-                                gt_hv_full = None
+                            if inst_batch is None: gt_hv_full = None
                             else:
                                 inst_map = inst_batch[i].squeeze(0).long()
                                 inst_map = inst_map.clone()
@@ -349,13 +339,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                                 gt_hv_full = generate_hv_map_from_inst(inst_map).unsqueeze(0)
 
                         if gt_hv_full is not None:
-                            gt_hv = F.interpolate(
-                                gt_hv_full.float(),
-                                size=pred_hv.shape[-2:],
-                                mode='bilinear',
-                                align_corners=False,
-                            )
-
+                            gt_hv = F.interpolate(gt_hv_full.float(), size=pred_hv.shape[-2:], mode='bilinear', align_corners=False)
                             inst_batch = batched_input.get("label_inst", None)
                             if inst_batch is not None:
                                 focus_full = (inst_batch[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
@@ -370,72 +354,18 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                         loss_hv_grad = msge_loss(gt_hv, pred_hv, focus)
                         loss_hv = loss_hv_mse + 2.0 * loss_hv_grad
                 
-                loss_attr = out.get('pnurl_loss', torch.tensor(0.0, device=loss_m.device))
-                if loss_attr.dim() > 0: loss_attr = loss_attr.mean()
-                
-                attr_logits = out.get('attr_logits', None)
-                if attr_logits is not None and 'density' in attr_logits:
-                    all_density_logits = attr_logits['density'] 
-                    curr_density_logits = all_density_logits[i].unsqueeze(0) if all_density_logits.shape[0] == len(images) else all_density_logits
-                    density_logits_list.append(curr_density_logits)
-                    prompt_gen = model.module.prompt_generator if hasattr(model, 'module') else model.prompt_generator
-                    with torch.no_grad():
-                        peak_count = prompt_gen.count_peaks_from_heatmap(pred_heatmap, threshold=0.3)
-                        if isinstance(peak_count, torch.Tensor): 
-                            if peak_count.dim() == 0: peak_count = peak_count.unsqueeze(0)
-                        else: peak_count = torch.tensor([peak_count], device=curr_density_logits.device)
-                        peak_counts_list.append(peak_count)
-                
-                pred_mask_logits = pred_mask.unsqueeze(0).unsqueeze(0)
-                pred_mask_list.append(pred_mask_logits)
-                density_map_i = out.get('density_map', None)
-                
-                # 🔥 [修复 1] 仅在真的有 density map 输出时加入列表并置位
-                if density_map_i is not None: 
-                    density_map_list.append(density_map_i.unsqueeze(0))
-                    has_valid_density = True
+                # 🔥 [Ablation] 彻底剔除 PNuRL Attr Loss, Consistency Loss 和 Density Map Loss 的计算逻辑
                 
                 loss_i = (
                     args.mask_weight * loss_m
                     + args.heatmap_weight * loss_h
-                    + args.attr_weight * loss_attr
                     + getattr(args, "hv_weight", 1.0) * loss_hv
                 )
+                
                 loss_batch += loss_i
                 loss_m_accum += loss_m.item()
                 loss_h_accum += loss_h.item()
-                loss_attr_accum += loss_attr.item()
                 loss_hv_accum += loss_hv.item()
-            
-            loss_consistency = torch.tensor(0.0, device=loss_m.device)
-            loss_consistency_accum = 0.0
-            if epoch >= args.consistency_warmup_epochs and len(peak_counts_list) > 0:
-                loss_consistency = physical_semantic_consistency_loss(
-                    peak_counts=torch.cat(peak_counts_list, dim=0), density_logits=torch.cat(density_logits_list, dim=0),
-                    margin_low=10.0, margin_high=30.0, temperature=1.0)
-                loss_batch += args.consistency_weight * loss_consistency * len(images)
-                loss_consistency_accum = loss_consistency.item()
-            
-            loss_density_map = torch.tensor(0.0, device=loss_m.device)
-            loss_density_map_accum = 0.0
-            
-            # 🔥 [修复 1] 防止全 0 张量计算产生巨大误差项，只有确实获取到 map 才会算 MSE
-            if has_valid_density and len(density_map_list) > 0:
-                gt_mask_batch = []
-                for l in labels:
-                    binary_l = (l > 0).float()
-                    if binary_l.dim() == 2:
-                        binary_l = binary_l.unsqueeze(0).unsqueeze(0)
-                    elif binary_l.dim() == 3:
-                        binary_l = binary_l.unsqueeze(0)
-                    gt_mask_batch.append(binary_l)
-                gt_mask_batch = torch.cat(gt_mask_batch, dim=0)
-                loss_density_map, _, _ = density_map_loss(
-                    pred_density_map=torch.cat(density_map_list, dim=0), gt_mask=gt_mask_batch,
-                    pred_mask=torch.cat(pred_mask_list, dim=0), mse_weight=1.0, iou_weight=0.5,
-                    enable_iou=(epoch >= args.consistency_warmup_epochs))
-                loss_batch += args.density_map_weight * loss_density_map * len(images)
-                loss_density_map_accum = loss_density_map.item()
             
             final_loss = loss_batch / len(images)
             final_loss = final_loss / args.accumulation_steps
@@ -463,13 +393,11 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         current_loss_val = final_loss.item() * args.accumulation_steps
         mean_m = loss_m_accum / len(images)
         mean_h = loss_h_accum / len(images)
-        mean_attr = loss_attr_accum / len(images)
         mean_hv = loss_hv_accum / len(images)
 
         losses.append(current_loss_val)
         mask_losses.append(mean_m)
         heatmap_losses.append(mean_h)
-        attr_losses.append(mean_attr)
         hv_losses.append(mean_hv)
         
         if rank == 0 and writer is not None and batch_idx % 10 == 0:
@@ -478,26 +406,20 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             writer.add_scalar('Train/Loss_Mask', mean_m, global_step)
             writer.add_scalar('Train/Loss_Heatmap', mean_h, global_step)
             writer.add_scalar('Train/Loss_HV', mean_hv, global_step)
-            writer.add_scalar('Train/Loss_Attr', mean_attr, global_step)
             writer.add_scalar('Train/LR', optimizer.param_groups[0]['lr'], global_step)
         
         if rank == 0:
-            consistency_info = f"Cons={loss_consistency_accum:.3f}" if epoch >= args.consistency_warmup_epochs else "Cons=N/A"
-            dmap_info = f"DMap={loss_density_map_accum:.3f}"
             pbar.set_postfix(
                 L=f"{current_loss_val:.3f}",
                 M=f"{mean_m:.3f}",
                 H=f"{mean_h:.3f}",
-                HV=f"{mean_hv:.3f}",
-                A=f"{mean_attr:.3f}",
-                Cons=consistency_info,
-                DMap=dmap_info,
+                HV=f"{mean_hv:.3f}"
             )
 
-    return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses), np.mean(attr_losses)
+    return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses), 0.0
 
 # ==================================================================================================
-# 4. Validation Logic (🔥 接入 HoVer-Watershed)
+# 4. Validation Logic
 # ==================================================================================================
 @torch.no_grad()
 def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
@@ -536,7 +458,6 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                 curr_organ_id = val.item() if isinstance(val, torch.Tensor) else val
             
             with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                # Full-image inference keeps HoVer geometry intact.
                 model_input = [{
                     'image': images[i],
                     'original_size': (args.image_size, args.image_size),
@@ -555,22 +476,12 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                 hv_logits = out[0].get('hv_logits', None)
                 if hv_logits is not None:
                     hv_map = torch.tanh(hv_logits)
-
-                    # F.interpolate expects 4D input [B, C, H, W].
                     is_expanded = False
                     if hv_map.dim() == 3:
                         hv_map = hv_map.unsqueeze(0)
                         is_expanded = True
-
                     target_hw = prob_map.shape[-2:]
-                    hv_map = F.interpolate(
-                        hv_map.float(),
-                        size=target_hw,
-                        mode='bilinear',
-                        align_corners=False
-                    )
-
-                    # Keep output as [2, H, W] for hover_post_process.
+                    hv_map = F.interpolate(hv_map.float(), size=target_hw, mode='bilinear', align_corners=False)
                     if is_expanded:
                         hv_map = hv_map.squeeze(0)
                     elif hv_map.dim() == 4 and hv_map.shape[0] == 1:
@@ -582,10 +493,8 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
             prob_np = prob_map.float().cpu().numpy()
             hv_np = hv_map.float().cpu().numpy()
 
-            # 🔥 执行快速的神级分水岭
             pred_mask = hover_post_process(prob_np, hv_np, prob_thresh=0.45, marker_thresh=0.4, min_marker_size=10)
             
-            # Fallback 保护
             if pred_mask.max() == 0:
                 pred_mask = skimage_label(prob_np > 0.5).astype(np.int32)
 
@@ -604,7 +513,6 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                 img_vis = (img_vis - img_vis.min()) / (img_vis.max() - img_vis.min() + 1e-5)
                 writer.add_image(f'Val_Viz/Image', torch.tensor(img_vis.transpose(2, 0, 1)), epoch)
                 writer.add_image(f'Val_Viz/GT', torch.tensor(gt_valid * 255).unsqueeze(0).to(torch.uint8), epoch)
-                # 因为 watershed 输出的是实例图 (1,2,3...), 用于可视化时二值化
                 pred_binary = (pred_mask > 0).astype(np.uint8)
                 writer.add_image(f'Val_Viz/Pred', torch.tensor(pred_binary * 255).unsqueeze(0).to(torch.uint8), epoch)
                 visualize_done = True
@@ -651,7 +559,7 @@ def main(args):
         os.makedirs(run_log_dir, exist_ok=True); os.makedirs(text_log_dir, exist_ok=True); os.makedirs(model_save_dir, exist_ok=True)
         logger = get_logger(os.path.join(text_log_dir, f"{args.run_name}_{timestamp}.log"))
         logger.info(f"🚀 [Start] MP-SAM Stable (Size: {args.image_size})")
-        logger.info(f"    GPUs: {world_size}, Batch/GPU: {args.batch_size}, Resume: {args.resume if args.resume else 'No'}")
+        logger.info(f"   GPUs: {world_size}, Batch/GPU: {args.batch_size}, Resume: {args.resume if args.resume else 'No'}")
         writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
     else: logger = None; writer = None
 
@@ -693,7 +601,6 @@ def main(args):
             state_dict = ckpt.get("model", ckpt)
             state_dict = resize_pos_embed(state_dict, vanilla_sam.state_dict())
 
-            # Map original SAM upscaling weights into ASRBlock upscalers.
             key_mapping = {
                 "mask_decoder.output_upscaling.0.weight": "mask_decoder.asr_upscale_1.structure_upsample.0.weight",
                 "mask_decoder.output_upscaling.0.bias": "mask_decoder.asr_upscale_1.structure_upsample.0.bias",
@@ -725,7 +632,7 @@ def main(args):
         sg_epsilon=args.sg_epsilon,
         sg_iters=args.sg_iters,
         use_pnurl=args.use_pnurl,
-        use_coop=args.use_coop, # 🔥 [修复 2] 解决底层参数名不一致的问题 (use_coop -> use_coop_prompt)
+        use_coop=args.use_coop,
         use_sgot=args.use_sgot,
         use_asr=args.use_asr,
     ).to(args.device)
@@ -754,8 +661,13 @@ def main(args):
 
     params = [{'params': raw_model.mask_decoder.parameters(), 'lr': args.lr},
               {'params': raw_model.prompt_generator.parameters(), 'lr': args.lr * 5}]
-              
-    # 🔥 [修复 2] 在匹配参数组时兼容属性检查
+    if hasattr(raw_model, 'basic_hv_head'):
+        params.append({'params': raw_model.basic_hv_head.parameters(), 'lr': args.lr})
+    if getattr(raw_model, 'use_asr', False):
+        cnn_lr = args.lr * 0.1
+        params.append({'params': raw_model.cnn_stage0.parameters(), 'lr': cnn_lr})
+        params.append({'params': raw_model.cnn_stage1.parameters(), 'lr': cnn_lr})
+        params.append({'params': raw_model.cnn_stage2.parameters(), 'lr': cnn_lr})          
     if getattr(raw_model, 'use_coop_prompt', getattr(raw_model, 'use_coop', True)) and hasattr(raw_model, 'prompt_learner'):
         params.append({'params': raw_model.prompt_learner.parameters(), 'lr': args.lr})
     if getattr(raw_model, 'use_pnurl', True) and hasattr(raw_model, 'pnurl'):
@@ -794,15 +706,16 @@ def main(args):
         
         if rank == 0:
             dice = val_res.get('dice', 0.0); aji = val_res.get('mAJI', 0.0); pq = val_res.get('mPQ', 0.0)
-            logger.info(f"Ep {epoch+1}/{args.epochs} | Loss: {loss:.4f} (M:{m_loss:.3f}, H:{h_loss:.3f}, A:{a_loss:.3f}) | Dice: {dice:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}")
+            logger.info(f"Ep {epoch+1}/{args.epochs} | Loss: {loss:.4f} (M:{m_loss:.3f}, H:{h_loss:.3f}) | Dice: {dice:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}")
             latest_model_path = os.path.join(args.work_dir, "models", args.run_name, "latest_model.pth")
             torch.save(raw_model.state_dict(), latest_model_path)
             if aji > best_aji:
                 best_aji = aji; best_dice = max(best_dice, dice)
                 best_model_path = os.path.join(args.work_dir, "models", args.run_name, "best_model.pth")
                 torch.save(raw_model.state_dict(), best_model_path)
-                logger.info(f"⭐ New Best AJI! ({best_aji:.4f}) -> Model Saved")
-                
+                logger.info(f"New Best AJI! ({best_aji:.4f}) -> Model Saved")
+        if dist.is_initialized():
+            dist.barrier()
         scheduler.step()
 
     if rank == 0:

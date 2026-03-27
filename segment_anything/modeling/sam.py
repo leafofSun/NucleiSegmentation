@@ -1,10 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 from typing import Any, Dict, List, Tuple, Optional
+import torchvision.models as models  # 🔥 [新增] 导入 torchvision 模型
+
 from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
@@ -90,6 +95,8 @@ class Sam(nn.Module):
                 "iou_predictions": iou_predictions,
                 "low_res_logits": low_res_masks,
             })
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return outputs
 
     def postprocess_masks(self, masks: torch.Tensor, input_size: Tuple[int, ...], original_size: Tuple[int, ...]) -> torch.Tensor:
@@ -118,57 +125,36 @@ class PhysicalAdapter(nn.Module):
     物理特征适配器：将融合后的 Shape+Size+Density 特征转换为 FiLM 参数
     """
     def __init__(self, feat_dim_low: int, feat_dim_high: int, ctx_dim: int):
-        """
-        Args:
-            feat_dim_low: 浅层特征维度 (3 * in_dim // 4) - 拼接后的维度
-            feat_dim_high: 深层特征维度 (3 * in_dim // 2) - 拼接后的维度
-            ctx_dim: Prompt 的维度 (CLIP ctx_dim)
-        """
         super().__init__()
         
-        # 注意：这里的 feat_dim_low 和 high 已经是拼接后的维度 (x3)
-        
-        # 浅层特征适配器（用于调制浅层 Prompt）
+        # 浅层特征适配器
         self.adapter_low = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(feat_dim_low, ctx_dim),
             nn.ReLU(),
-            nn.Linear(ctx_dim, ctx_dim * 2)  # 输出 [γ, β]，每个维度为 ctx_dim
+            nn.Linear(ctx_dim, ctx_dim * 2) 
         )
         
-        # 深层特征适配器（用于调制深层 Prompt）
+        # 深层特征适配器
         self.adapter_high = nn.Sequential(
             nn.Linear(feat_dim_high, ctx_dim),
             nn.ReLU(),
-            nn.Linear(ctx_dim, ctx_dim * 2)  # 输出 [γ, β]，每个维度为 ctx_dim
+            nn.Linear(ctx_dim, ctx_dim * 2) 
         )
         
-        # Zero-initialization: 将最后一层权重设为0
+        # Zero-initialization
         nn.init.zeros_(self.adapter_low[-1].weight)
         nn.init.zeros_(self.adapter_low[-1].bias)
         nn.init.zeros_(self.adapter_high[-1].weight)
         nn.init.zeros_(self.adapter_high[-1].bias)
     
     def forward(self, feat_low: torch.Tensor, feat_high: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            feat_low: [B, feat_dim_low, H, W] 浅层特征（拼接后的）
-            feat_high: [B, feat_dim_high] 深层特征（拼接后的）
+        low_params = self.adapter_low(feat_low)  
+        gamma_low, beta_low = torch.chunk(low_params, 2, dim=1) 
         
-        Returns:
-            gamma_low: [B, ctx_dim] 浅层缩放参数
-            beta_low: [B, ctx_dim] 浅层偏置参数
-            gamma_high: [B, ctx_dim] 深层缩放参数
-            beta_high: [B, ctx_dim] 深层偏置参数
-        """
-        # 浅层适配器
-        low_params = self.adapter_low(feat_low)  # [B, ctx_dim * 2]
-        gamma_low, beta_low = torch.chunk(low_params, 2, dim=1)  # 各 [B, ctx_dim]
-        
-        # 深层适配器
-        high_params = self.adapter_high(feat_high)  # [B, ctx_dim * 2]
-        gamma_high, beta_high = torch.chunk(high_params, 2, dim=1)  # 各 [B, ctx_dim]
+        high_params = self.adapter_high(feat_high)  
+        gamma_high, beta_high = torch.chunk(high_params, 2, dim=1) 
         
         return gamma_low, beta_low, gamma_high, beta_high
 
@@ -201,10 +187,6 @@ class DualPromptLearner(nn.Module):
         self.total_ctx = n_ctx_gen + n_ctx_spec
         self.ctx_dim = ctx_dim
         
-        # 🔥 [关键修改] 计算输入维度
-        # PNuRL 拼接了 3 个头 (Shape, Size, Density)
-        # 每个头的 shallow_branch 输出 C/4 -> 拼接后 3 * C/4
-        # 每个头的 deep_branch 输出 C/2    -> 拼接后 3 * C/2
         num_fused_heads = 3 
         
         feat_dim_low = (embed_dim // 4) * num_fused_heads
@@ -214,14 +196,6 @@ class DualPromptLearner(nn.Module):
         print(f"✅ PhysicalAdapter initialized: in_low={feat_dim_low}, in_high={feat_dim_high} (Fused {num_fused_heads} heads)")
 
     def forward(self, organ_indices, tokenized_prompts, density_features: Optional[List[torch.Tensor]] = None):
-        """
-        Args:
-            organ_indices: [B] 器官索引
-            tokenized_prompts: [B, 77] tokenized prompts
-            density_features: Optional[List[torch.Tensor]] = [fused_low, fused_high]
-                - fused_low: [B, 3*C/4, H, W] 拼接后的浅层特征 (Shape+Size+Density)
-                - fused_high: [B, 3*C/2] 拼接后的深层特征 (Shape+Size+Density)
-        """
         batch_size = len(organ_indices)
         embedding = self.clip_token_embedding(tokenized_prompts).type(self.dtype)
         
@@ -231,35 +205,28 @@ class DualPromptLearner(nn.Module):
 
         # === FiLM 调制：使用物理特征调制 Prompt ===
         if density_features is not None:
-            # 这里 density_features 实际上是 [fused_low, fused_high]
             feat_low, feat_high = density_features
             gamma_low, beta_low, gamma_high, beta_high = self.physical_adapter(feat_low, feat_high)
             
-            # 多尺度策略：
-            # - 浅层特征调制浅层 Prompt (ctx_gen 的前半部分)
-            # - 深层特征调制深层 Prompt (ctx_gen 的后半部分 + ctx_spec)
             n_gen_low = self.n_ctx_gen // 2
             n_gen_high = self.n_ctx_gen - n_gen_low
             
-            # 调制浅层 Prompt (ctx_gen 的前半部分)
-            ctx_gen_low = ctx_gen[:, :n_gen_low, :]  # [B, n_gen_low, ctx_dim]
-            gamma_low_expanded = gamma_low.unsqueeze(1).expand(-1, n_gen_low, -1)  # [B, n_gen_low, ctx_dim]
-            beta_low_expanded = beta_low.unsqueeze(1).expand(-1, n_gen_low, -1)  # [B, n_gen_low, ctx_dim]
+            ctx_gen_low = ctx_gen[:, :n_gen_low, :]  
+            gamma_low_expanded = gamma_low.unsqueeze(1).expand(-1, n_gen_low, -1)  
+            beta_low_expanded = beta_low.unsqueeze(1).expand(-1, n_gen_low, -1)  
             ctx_gen_low_modulated = (1 + gamma_low_expanded) * ctx_gen_low + beta_low_expanded
             
-            # 调制深层 Prompt (ctx_gen 的后半部分 + ctx_spec)
-            ctx_gen_high = ctx_gen[:, n_gen_low:, :]  # [B, n_gen_high, ctx_dim]
-            ctx_spec_mod = ctx_spec  # [B, n_ctx_spec, ctx_dim]
+            ctx_gen_high = ctx_gen[:, n_gen_low:, :]  
+            ctx_spec_mod = ctx_spec  
             
-            gamma_high_expanded_gen = gamma_high.unsqueeze(1).expand(-1, n_gen_high, -1)  # [B, n_gen_high, ctx_dim]
-            beta_high_expanded_gen = beta_high.unsqueeze(1).expand(-1, n_gen_high, -1)  # [B, n_gen_high, ctx_dim]
+            gamma_high_expanded_gen = gamma_high.unsqueeze(1).expand(-1, n_gen_high, -1)  
+            beta_high_expanded_gen = beta_high.unsqueeze(1).expand(-1, n_gen_high, -1)  
             ctx_gen_high_modulated = (1 + gamma_high_expanded_gen) * ctx_gen_high + beta_high_expanded_gen
             
-            gamma_high_expanded_spec = gamma_high.unsqueeze(1).expand(-1, self.n_ctx_spec, -1)  # [B, n_ctx_spec, ctx_dim]
-            beta_high_expanded_spec = beta_high.unsqueeze(1).expand(-1, self.n_ctx_spec, -1)  # [B, n_ctx_spec, ctx_dim]
+            gamma_high_expanded_spec = gamma_high.unsqueeze(1).expand(-1, self.n_ctx_spec, -1)  
+            beta_high_expanded_spec = beta_high.unsqueeze(1).expand(-1, self.n_ctx_spec, -1)  
             ctx_spec_modulated = (1 + gamma_high_expanded_spec) * ctx_spec_mod + beta_high_expanded_spec
             
-            # 重新组合
             ctx_gen = torch.cat([ctx_gen_low_modulated, ctx_gen_high_modulated], dim=1)
             ctx_spec = ctx_spec_modulated
             ctx = torch.cat([ctx_gen, ctx_spec], dim=1)
@@ -341,15 +308,30 @@ class TextSam(Sam):
             num_heads=num_heads,
         )
 
-        # SG-OT（关闭时不更新）
-        self.sg_ot = SemanticGuidedOT(
-            img_dim=embed_dim,
-            txt_dim=text_dim,
-            epsilon=sg_epsilon,
-            sinkhorn_iters=sg_iters,
-        )
-        for param in self.sg_ot.parameters():
-            param.requires_grad = use_sgot
+        # SG-OT（关闭时不更新）或纯视觉独立 HV 头
+        if self.use_sgot:
+            self.sg_ot = SemanticGuidedOT(
+                img_dim=embed_dim,
+                txt_dim=text_dim,
+                epsilon=sg_epsilon,
+                sinkhorn_iters=sg_iters,
+            )
+            for param in self.sg_ot.parameters():
+                param.requires_grad = True
+        else:
+            # 🔥 [新增] 纯视觉基线的独立 HV 预测头
+            self.basic_hv_head = nn.Sequential(
+                nn.Conv2d(embed_dim, embed_dim // 2, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(embed_dim // 2, 2, kernel_size=1)
+            )
+
+        # 🔥 [新增] 引入纯视觉基线的高频特征提取器 (ResNet-50)
+        if self.use_asr:
+            resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+            self.cnn_stage0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+            self.cnn_stage1 = resnet.layer1 # 输出: [B, 256, H/4, W/4]
+            self.cnn_stage2 = resnet.layer2 # 输出: [B, 512, H/8, W/8]
 
         # 5. 冻结策略
         for param in self.image_encoder.parameters():
@@ -376,6 +358,14 @@ class TextSam(Sam):
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         image_embeddings = self.image_encoder(input_images) # [B, 256, 64, 64]
         device = image_embeddings.device
+
+        # 🔥 [新增] 同步提取 CNN 高频物理特征
+        feat_s1, feat_s2 = None, None
+        if self.use_asr:
+            with torch.autocast('cuda', enabled=True):
+                feat_s0 = self.cnn_stage0(input_images)
+                feat_s1 = self.cnn_stage1(feat_s0) # 1/4 尺度
+                feat_s2 = self.cnn_stage2(feat_s1) # 1/8 尺度
 
         if self.clip_model.visual.conv1.weight.device != device:
             self.clip_model = self.clip_model.to(device)
@@ -446,7 +436,7 @@ class TextSam(Sam):
         neg_feats = neg_feats / neg_feats.norm(dim=-1, keepdim=True)
         text_features = torch.stack([pos_feats, neg_feats], dim=1).float()
 
-        # === Step 5: SG-OT 或 文本引导热力图（原 prompt_generator 路径）===
+        # === Step 5: SG-OT 或 纯视觉独立头 ===
         pos_text_feats = text_features[:, 0, :]
         B, C, H, W = refined_image_embeddings.shape
         sg_ot_density = density_map
@@ -462,13 +452,14 @@ class TextSam(Sam):
                 density_map=sg_ot_density,
             )
         else:
+            # 🔥 [修复] 纯视觉通路：直接使用独立卷积头生成 HV 距离图
             fused_image_embeddings = refined_image_embeddings
             heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
-            hv_logits = None
+            hv_logits = self.basic_hv_head(refined_image_embeddings)
 
         density_map_proxy = torch.sigmoid(heatmap_logits[:, 0:1, :, :])
 
-        # 动态阈值计算 (保留原本精妙的设计)
+        # 动态阈值计算
         size_logits = attr_logits.get('size', None)
         if size_logits is not None and size_logits.numel() > 0:
             pred_size_class = torch.argmax(size_logits, dim=1)
@@ -495,36 +486,28 @@ class TextSam(Sam):
         outputs = []
         
         for i in range(len(batched_input)):
-            # 获取当前样本的 Prompt 数据
             prompt_data = prompts_list[i]
-            
-            # 获取正确的目标尺寸 (Original Size, e.g., 512x512)
             target_h, target_w = batched_input[i]["original_size"]
             
-            # 处理 density_map (PNuRL输出的像素级密度图，用于一致性Loss和输出)
             density_map_i = None
             if density_map is not None:
-                density_map_raw = density_map[i]  # [1, H', W']
-                # 如果尺寸不对，插值到 original_size
+                density_map_raw = density_map[i]
                 if density_map_raw.shape[-2:] != (target_h, target_w):
                     density_map_i = F.interpolate(
                         density_map_raw.unsqueeze(0), 
                         size=(target_h, target_w), 
                         mode='bilinear', 
                         align_corners=False
-                    ).squeeze(0)  # [1, target_h, target_w]
+                    ).squeeze(0)
                 else:
                     density_map_i = density_map_raw
 
-            # 处理无点情况
             if not prompt_data["has_points"]:
                 dummy_connection = fused_image_embeddings[i].sum() * 0.0
-                
-                # 加上 dummy_connection
                 if density_map_i is not None:
                     density_map_i = density_map_i + dummy_connection
                 
-                hv_out = hv_logits[i].unsqueeze(0) if self.use_sgot and hv_logits is not None else None
+                hv_out = hv_logits[i].unsqueeze(0) if hv_logits is not None else None
                 outputs.append({
                     "masks": (torch.zeros((1, 1, target_h, target_w), device=device, dtype=torch.float32) - 100.0) + dummy_connection,
                     "iou_predictions": torch.zeros((1, 1), device=device) + dummy_connection,
@@ -537,29 +520,34 @@ class TextSam(Sam):
                 })
                 continue
 
-            # 提取坐标和标签
             point_coords = prompt_data["point_coords"]
             point_labels = prompt_data["point_labels"]
             
-            # 缩放坐标到 1024
             point_coords = (point_coords * scale_factor) + (scale_factor * 0.5)
-            
-            # 🔥🔥🔥 [核心显存优化: Chunked Decoding (微批次解码)] 🔥🔥🔥
+            if self.training:
+                # 训练模式：随机采样最多 512 个点，既防爆显存，又当做数据增强 (Point Dropout)
+                MAX_POINTS = 512 
+                if point_coords.shape[0] > MAX_POINTS:
+                    indices = torch.randperm(point_coords.shape[0], device=device)[:MAX_POINTS]
+                    point_coords = point_coords[indices]
+                    point_labels = point_labels[indices]
+            else:
+                # 测试模式：绝对不截断！保留所有点，确保不会漏检任何一个细胞核
+                pass
+
+            # 🔥🔥🔥 [核心显存优化: Chunked Decoding] 🔥🔥🔥
             num_cells = point_coords.shape[0]
-            chunk_size = 16  # 每次处理 16 个点，确保 5090 显存不爆，但保持 50 点的总量
+            chunk_size = 16 
             chunk_masks = []
             chunk_ious = []
             
-            # 分批次循环
             for start_idx in range(0, num_cells, chunk_size):
                 end_idx = min(start_idx + chunk_size, num_cells)
                 
-                # 1. 切片点和标签
-                sub_coords = point_coords[start_idx:end_idx] # [chunk, 2]
-                sub_labels = point_labels[start_idx:end_idx] # [chunk]
+                sub_coords = point_coords[start_idx:end_idx] 
+                sub_labels = point_labels[start_idx:end_idx] 
                 current_batch = sub_coords.shape[0]
 
-                # 2. 局部扩展 Image Embedding (使用 OT 拓扑搬运后的特征)
                 sub_img_embed = fused_image_embeddings[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
                 
                 sub_high_freq = None
@@ -567,37 +555,36 @@ class TextSam(Sam):
                     sub_high_freq = high_freq_guide[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
 
                 sub_density_map = None
-                if self.use_asr:
+                if self.use_asr and density_map_proxy is not None:
                     sub_density_map = density_map_proxy[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
                 sub_text_feat = pos_text_feats[i].unsqueeze(0).expand(current_batch, -1)
 
-                # 5. 编码 Prompt (针对当前 chunk)
+                # 🔥 扩展 CNN 侧向特征匹配 Chunk Size
+                sub_cnn_s1 = feat_s1[i].unsqueeze(0).expand(current_batch, -1, -1, -1) if self.use_asr else None
+                sub_cnn_s2 = feat_s2[i].unsqueeze(0).expand(current_batch, -1, -1, -1) if self.use_asr else None
+
                 sparse, dense = self.prompt_encoder(
                     points=(sub_coords, sub_labels),
                     boxes=None,
                     masks=None,
                 )
 
-                # 6. 解码 (显存占用仅为 chunk_size=16 的量)
+                # 🔥 [核心注入] 仅传入物理边缘，纯视觉 ASR
                 sub_mask, sub_iou = self.mask_decoder(
                     image_embeddings=sub_img_embed,
                     image_pe=self.prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=sparse,
                     dense_prompt_embeddings=dense,
                     multimask_output=multimask_output,
-                    high_freq_features=sub_high_freq,
-                    density_map=sub_density_map,
-                    text_features=sub_text_feat,
+                    cnn_feat_s1=sub_cnn_s1,  
+                    cnn_feat_s2=sub_cnn_s2,  
                 )
                 chunk_masks.append(sub_mask)
                 chunk_ious.append(sub_iou)
             
-            # 7. 拼接回完整结果 (大小: [50, 1, 256, 256])
             low_res_masks = torch.cat(chunk_masks, dim=0) 
             iou_predictions = torch.cat(chunk_ious, dim=0) 
 
-            # === Step 7: 后处理 & 聚合 ===
-            # 合并成单图 [1, 1, 256, 256]
             merged_logits, _ = torch.max(low_res_masks, dim=0, keepdim=True) 
             merged_iou = torch.mean(iou_predictions, dim=0, keepdim=True)
 
@@ -607,9 +594,7 @@ class TextSam(Sam):
                 original_size=batched_input[i]["original_size"],
             )
             
-            # density_map_i 已经在上面处理过了，不需要再 interpolate mask_post 的尺寸
-
-            hv_out = hv_logits[i].unsqueeze(0) if self.use_sgot and hv_logits is not None else None
+            hv_out = hv_logits[i].unsqueeze(0) if hv_logits is not None else None
             outputs.append({
                 "masks": mask_post,
                 "iou_predictions": merged_iou,
