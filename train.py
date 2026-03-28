@@ -10,6 +10,7 @@ import logging
 import math
 import cv2 
 import gc  
+import traceback
 
 import torch
 import torch.nn as nn
@@ -76,16 +77,11 @@ def parse_args():
     parser.add_argument("--hv_weight", type=float, default=1.0, help="Weight for HoVer HV supervision loss")
     parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads for multi-modal fusion")
 
-    # =========================================================================
-    # 核心消融实验开关 (Ablation Study Switches)
-    # 默认全部关闭以测试纯视觉基线，如需开启可在启动命令中增加 --use_xxx
-    # =========================================================================
     parser.add_argument("--use_pnurl", action='store_true', default=False, help="启用 PNuRL 属性预测分支")
     parser.add_argument("--use_coop", action='store_true', default=False, help="启用 CoOp 可学习文本提示")
     parser.add_argument("--use_sgot", action='store_true', default=False, help="启用 SG-OT 语义引导最优传输模块")
     parser.add_argument("--use_asr", action='store_true', default=False, help="启用 ASR 自适应谱细化上采样模块")
     parser.add_argument("--prompt_mode", type=str, default="dynamic", choices=["generic", "dynamic"], help="训练时的文本提示生成模式")
-    # =========================================================================
 
     parser.add_argument("--sg_epsilon", type=float, default=0.05, help="Sinkhorn熵正则化系数")
     parser.add_argument("--sg_iters", type=int, default=3, help="Sinkhorn迭代次数")
@@ -163,7 +159,6 @@ def get_gaussian_weight_map(patch_size, device):
     weight_map = weight_map / weight_map.max()
     return weight_map
 
-# 🔥 训练集适用的 HoVer 后处理
 def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, min_marker_size=10):
     mask = prob_map > prob_thresh
     if not np.any(mask):
@@ -186,63 +181,8 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, mi
     inst_map = watershed(-prob_map, markers, mask=mask)
     return inst_map.astype(np.int32)
 
-def sliding_window_inference(model, image, organ_id, patch_size=256, target_size=512, stride=None, device='cuda'):
-    C, H, W = image.shape
-    if stride is None: stride = patch_size // 2
-    full_prob_map = torch.zeros((H, W), device=device)
-    full_hv_map = torch.zeros((2, H, W), device=device)
-    count_map = torch.zeros((H, W), device=device)
-    weight_map = get_gaussian_weight_map(patch_size, device)
-
-    h_steps = math.ceil((H - patch_size) / stride) + 1
-    w_steps = math.ceil((W - patch_size) / stride) + 1
-
-    for h_idx in range(h_steps):
-        for w_idx in range(w_steps):
-            y1 = h_idx * stride
-            x1 = w_idx * stride
-            y2 = min(y1 + patch_size, H)
-            x2 = min(x1 + patch_size, W)
-            if y2 - y1 < patch_size: y1 = max(0, y2 - patch_size)
-            if x2 - x1 < patch_size: x1 = max(0, x2 - patch_size)
-            
-            patch = image[:, y1:y1+patch_size, x1:x1+patch_size]
-            
-            if patch.shape[-1] != target_size:
-                patch_resized = F.interpolate(patch.unsqueeze(0), size=(target_size, target_size), mode='bilinear', align_corners=False)
-            else:
-                patch_resized = patch.unsqueeze(0)
-            
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                model_input = [{'image': patch_resized.squeeze(0), 'original_size': (target_size, target_size),
-                                'text_prompt': "Cell nuclei", 'organ_id': organ_id, 'attribute_text': "Cell nuclei"}]
-                with torch.no_grad():
-                    out = model(model_input, multimask_output=True)
-                    iou_preds = out[0]['iou_predictions']
-                    best_idx = torch.argmax(iou_preds).item()
-                    pred_logits_target = out[0]['masks'][0, best_idx]
-                    hv_logits_target = out[0].get('hv_logits', None) 
-                    if hv_logits_target is not None:
-                        hv_logits_target = torch.tanh(hv_logits_target)
-            
-            pred_logits_256 = F.interpolate(pred_logits_target.unsqueeze(0).unsqueeze(0), size=(patch_size, patch_size), mode='bilinear', align_corners=False).squeeze()
-            pred_prob_256 = torch.sigmoid(pred_logits_256)
-            full_prob_map[y1:y1+patch_size, x1:x1+patch_size] += pred_prob_256 * weight_map
-            
-            if hv_logits_target is not None:
-                hv_logits_target = hv_logits_target.squeeze(0) if hv_logits_target.dim() == 4 else hv_logits_target
-                hv_256 = F.interpolate(hv_logits_target.unsqueeze(0), size=(patch_size, patch_size), mode='bilinear', align_corners=False).squeeze(0)
-                full_hv_map[:, y1:y1+patch_size, x1:x1+patch_size] += hv_256 * weight_map
-
-            count_map[y1:y1+patch_size, x1:x1+patch_size] += weight_map
-
-    count_map = torch.clamp(count_map, min=1e-5)
-    full_prob_map /= count_map
-    full_hv_map /= count_map
-    return full_prob_map, full_hv_map
-
 # ==================================================================================================
-# 3. Training Logic (🔥 Ablation to Basics: Pure Visual Baseline)
+# 3. Training Logic (🔥 PNuRL + PNuDP Full Restoration)
 # ==================================================================================================
 def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank):
     model.train()
@@ -255,6 +195,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
     mask_losses = []
     heatmap_losses = []
     hv_losses = []
+    attr_losses = []  # 🔥 记录 PNuRL 属性损失
     
     optimizer.zero_grad(set_to_none=True)
     
@@ -270,6 +211,11 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         model_input = []
         organ_ids = batched_input.get('organ_id', None)
         
+        # 🔥🔥🔥 修复1: 完美匹配 DataLoader 输出的 key 'attr_labels'
+        attr_labels = batched_input.get('attr_labels', None)
+        dynamic_text = batched_input.get('text_prompt', ["Cell nuclei"] * len(images))
+        dynamic_attr_text = batched_input.get('attribute_text', ["Cell nuclei"] * len(images))
+        
         for i in range(len(images)):
             curr_id = 20
             if organ_ids is not None:
@@ -280,10 +226,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 'image': images[i],
                 'original_size': (args.image_size, args.image_size),
                 'organ_id': curr_id,
-                # 🔥 [Ablation] 屏蔽动态生成的多模态文本输入
-                'attribute_text': "Cell nuclei",
-                'text_prompt': "Cell nuclei",
-                'attribute_labels': None, 
+                'attribute_text': dynamic_attr_text[i],
+                'text_prompt': dynamic_text[i],
+                # 🔥🔥🔥 修复2: 确保传给 sam.py 的是 'attr_labels'
+                'attr_labels': attr_labels[i] if attr_labels is not None else None, 
             })
 
         with autocast('cuda', enabled=args.use_amp):
@@ -292,6 +238,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             loss_m_accum = 0.0
             loss_h_accum = 0.0
             loss_hv_accum = 0.0
+            loss_attr_accum = 0.0
             
             for i, out in enumerate(outputs):
                 iou_preds = out['iou_predictions']
@@ -308,7 +255,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 # 1. Mask Loss
                 loss_m, _ = criterion(pred_mask.unsqueeze(0).unsqueeze(0), gt_mask.unsqueeze(0).unsqueeze(0), pred_iou.unsqueeze(0))
                 
-                # 2. Heatmap Loss (Point Guidance)
+                # 2. Heatmap Loss
                 pred_heatmap = out['heatmap_logits'] 
                 with torch.no_grad():
                     target_mask = labels[i].float().unsqueeze(0)
@@ -320,8 +267,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 loss_hv = torch.tensor(0.0, device=loss_m.device)
                 pred_hv = out.get('hv_logits', None)
                 if pred_hv is not None:
-                    if pred_hv.dim() == 3:
-                        pred_hv = pred_hv.unsqueeze(0)
+                    if pred_hv.dim() == 3: pred_hv = pred_hv.unsqueeze(0)
                     pred_hv = torch.tanh(pred_hv)
 
                     with torch.no_grad():
@@ -353,31 +299,39 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                         loss_hv_mse = (mse_map * focus_exp).sum() / (focus_exp.sum() * pred_hv.shape[1] + 1e-8)
                         loss_hv_grad = msge_loss(gt_hv, pred_hv, focus)
                         loss_hv = loss_hv_mse + 2.0 * loss_hv_grad
+                        
+                # 🔥🔥🔥 修复3: 彻底获取 PNuRL 的自带损失，并删除冗余代码 🔥🔥🔥
+                loss_attr = out.get('pnurl_loss', torch.tensor(0.0, device=loss_m.device))
+                        
+                loss_c = out.get('consistency_loss', torch.tensor(0.0, device=loss_m.device))
+                loss_d = out.get('density_loss', torch.tensor(0.0, device=loss_m.device))
                 
-                # 🔥 [Ablation] 彻底剔除 PNuRL Attr Loss, Consistency Loss 和 Density Map Loss 的计算逻辑
-                
+                # 🔥 终极 Loss 大一统融合
                 loss_i = (
                     args.mask_weight * loss_m
                     + args.heatmap_weight * loss_h
                     + getattr(args, "hv_weight", 1.0) * loss_hv
+                    + getattr(args, "attr_weight", 0.1) * loss_attr
+                    + getattr(args, "consistency_weight", 0.1) * loss_c
+                    + getattr(args, "density_map_weight", 0.5) * loss_d
                 )
                 
                 loss_batch += loss_i
                 loss_m_accum += loss_m.item()
                 loss_h_accum += loss_h.item()
                 loss_hv_accum += loss_hv.item()
+                loss_attr_accum += loss_attr.item()
             
             final_loss = loss_batch / len(images)
             final_loss = final_loss / args.accumulation_steps
 
+        # 🔥 安全多卡通信区
         is_accumulating = (batch_idx + 1) % args.accumulation_steps != 0 and (batch_idx + 1) != len(train_loader)
-        sync_context = model.no_sync() if (is_accumulating and hasattr(model, 'no_sync')) else nullcontext()
 
-        with sync_context:
-            if scaler:
-                scaler.scale(final_loss).backward()
-            else:
-                final_loss.backward()
+        if scaler:
+            scaler.scale(final_loss).backward()
+        else:
+            final_loss.backward()
 
         if not is_accumulating:
             if scaler:
@@ -394,11 +348,13 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         mean_m = loss_m_accum / len(images)
         mean_h = loss_h_accum / len(images)
         mean_hv = loss_hv_accum / len(images)
+        mean_a = loss_attr_accum / len(images)  # PNuRL 监控
 
         losses.append(current_loss_val)
         mask_losses.append(mean_m)
         heatmap_losses.append(mean_h)
         hv_losses.append(mean_hv)
+        attr_losses.append(mean_a)
         
         if rank == 0 and writer is not None and batch_idx % 10 == 0:
             global_step = epoch * len(train_loader) + batch_idx
@@ -406,6 +362,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             writer.add_scalar('Train/Loss_Mask', mean_m, global_step)
             writer.add_scalar('Train/Loss_Heatmap', mean_h, global_step)
             writer.add_scalar('Train/Loss_HV', mean_hv, global_step)
+            writer.add_scalar('Train/Loss_Attr', mean_a, global_step) # 写入 TensorBoard
             writer.add_scalar('Train/LR', optimizer.param_groups[0]['lr'], global_step)
         
         if rank == 0:
@@ -413,7 +370,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 L=f"{current_loss_val:.3f}",
                 M=f"{mean_m:.3f}",
                 H=f"{mean_h:.3f}",
-                HV=f"{mean_hv:.3f}"
+                A=f"{mean_a:.3f}" # 终端增加 A(AttrLoss) 的显示
             )
 
     return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses), 0.0
@@ -482,10 +439,8 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                         is_expanded = True
                     target_hw = prob_map.shape[-2:]
                     hv_map = F.interpolate(hv_map.float(), size=target_hw, mode='bilinear', align_corners=False)
-                    if is_expanded:
-                        hv_map = hv_map.squeeze(0)
-                    elif hv_map.dim() == 4 and hv_map.shape[0] == 1:
-                        hv_map = hv_map.squeeze(0)
+                    if is_expanded: hv_map = hv_map.squeeze(0)
+                    elif hv_map.dim() == 4 and hv_map.shape[0] == 1: hv_map = hv_map.squeeze(0)
                 else:
                     target_hw = prob_map.shape[-2:]
                     hv_map = torch.zeros((2, target_hw[0], target_hw[1]), device=args.device)
@@ -563,164 +518,210 @@ def main(args):
         writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
     else: logger = None; writer = None
 
-    train_dataset = UniversalDataset(
-        data_root=args.data_path,
-        knowledge_path=args.knowledge_path,
-        image_size=args.image_size,
-        crop_size=args.crop_size,
-        mode='train',
-        prompt_mode=args.prompt_mode,
-    )
-    val_dataset = UniversalDataset(
-        data_root=args.data_path,
-        knowledge_path=args.knowledge_path,
-        image_size=args.image_size,
-        crop_size=args.crop_size,
-        mode='test',
-        prompt_mode='generic',
-    )
-    
-    train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=True) if world_size > 1 else None
-    
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), 
-                              num_workers=8, collate_fn=stack_dict_batched, pin_memory=True, sampler=train_sampler,
-                              persistent_workers=True, prefetch_factor=2)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=(val_sampler is None), 
-                            num_workers=4, collate_fn=stack_dict_batched, pin_memory=True, sampler=val_sampler,
-                            persistent_workers=True, prefetch_factor=2)
-    
-    if rank == 0: logger.info(f"📊 Train Size: {len(train_dataset)} | Val Size: {len(val_dataset)}")
+    try:
+        train_dataset = UniversalDataset(
+            data_root=args.data_path,
+            knowledge_path=args.knowledge_path,
+            image_size=args.image_size,
+            crop_size=args.crop_size,
+            mode='train',
+            prompt_mode=args.prompt_mode,
+        )
+        val_dataset = UniversalDataset(
+            data_root=args.data_path,
+            knowledge_path=args.knowledge_path,
+            image_size=args.image_size,
+            crop_size=args.crop_size,
+            mode='test',
+            prompt_mode='generic',
+        )
+        
+        train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=True) if world_size > 1 else None
+        
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), 
+                                  num_workers=8, collate_fn=stack_dict_batched, pin_memory=True, sampler=train_sampler,
+                                  persistent_workers=True, prefetch_factor=2)
+        val_loader = DataLoader(val_dataset, batch_size=1, shuffle=(val_sampler is None), 
+                                num_workers=4, collate_fn=stack_dict_batched, pin_memory=True, sampler=val_sampler,
+                                persistent_workers=True, prefetch_factor=2)
+        
+        if rank == 0: logger.info(f"📊 Train Size: {len(train_dataset)} | Val Size: {len(val_dataset)}")
 
-    args.checkpoint = args.sam_checkpoint
-    vanilla_sam = sam_model_registry[args.model_type](args)
-    if os.path.exists(args.sam_checkpoint):
-        if rank == 0: logger.info(f"📥 Loading checkpoint: {args.sam_checkpoint}")
-        try:
-            ckpt = torch.load(args.sam_checkpoint, map_location='cpu', weights_only=False)
-            state_dict = ckpt.get("model", ckpt)
-            state_dict = resize_pos_embed(state_dict, vanilla_sam.state_dict())
+        args.checkpoint = args.sam_checkpoint
+        vanilla_sam = sam_model_registry[args.model_type](args)
+        if os.path.exists(args.sam_checkpoint):
+            if rank == 0: logger.info(f"📥 Loading checkpoint: {args.sam_checkpoint}")
+            try:
+                ckpt = torch.load(args.sam_checkpoint, map_location='cpu', weights_only=False)
+                state_dict = ckpt.get("model", ckpt)
+                state_dict = resize_pos_embed(state_dict, vanilla_sam.state_dict())
 
-            key_mapping = {
-                "mask_decoder.output_upscaling.0.weight": "mask_decoder.asr_upscale_1.structure_upsample.0.weight",
-                "mask_decoder.output_upscaling.0.bias": "mask_decoder.asr_upscale_1.structure_upsample.0.bias",
-                "mask_decoder.output_upscaling.1.weight": "mask_decoder.asr_upscale_1.structure_upsample.1.weight",
-                "mask_decoder.output_upscaling.1.bias": "mask_decoder.asr_upscale_1.structure_upsample.1.bias",
-                "mask_decoder.output_upscaling.3.weight": "mask_decoder.asr_upscale_2.structure_upsample.0.weight",
-                "mask_decoder.output_upscaling.3.bias": "mask_decoder.asr_upscale_2.structure_upsample.0.bias",
-            }
-            mapped_state_dict = dict(state_dict)
-            mapped_count = 0
-            for old_key, new_key in key_mapping.items():
-                if old_key in state_dict:
-                    mapped_state_dict[new_key] = state_dict[old_key]
-                    mapped_count += 1
+                key_mapping = {
+                    "mask_decoder.output_upscaling.0.weight": "mask_decoder.asr_upscale_1.structure_upsample.0.weight",
+                    "mask_decoder.output_upscaling.0.bias": "mask_decoder.asr_upscale_1.structure_upsample.0.bias",
+                    "mask_decoder.output_upscaling.1.weight": "mask_decoder.asr_upscale_1.structure_upsample.1.weight",
+                    "mask_decoder.output_upscaling.1.bias": "mask_decoder.asr_upscale_1.structure_upsample.1.bias",
+                    "mask_decoder.output_upscaling.3.weight": "mask_decoder.asr_upscale_2.structure_upsample.0.weight",
+                    "mask_decoder.output_upscaling.3.bias": "mask_decoder.asr_upscale_2.structure_upsample.0.bias",
+                }
+                mapped_state_dict = dict(state_dict)
+                mapped_count = 0
+                for old_key, new_key in key_mapping.items():
+                    if old_key in state_dict:
+                        mapped_state_dict[new_key] = state_dict[old_key]
+                        mapped_count += 1
 
-            vanilla_sam.load_state_dict(mapped_state_dict, strict=False)
+                vanilla_sam.load_state_dict(mapped_state_dict, strict=False)
+                if rank == 0:
+                    logger.info(f"✅ ASRBlock upscaling weights mapped: {mapped_count}/{len(key_mapping)}")
+            except Exception as e:
+                if rank == 0: logger.warning(f"⚠️ Checkpoint loading failed: {e}")
+        
+        model = TextSam(
+            image_encoder=vanilla_sam.image_encoder,
+            prompt_encoder=vanilla_sam.prompt_encoder,
+            mask_decoder=vanilla_sam.mask_decoder,
+            clip_model_name=args.clip_model,
+            num_organs=args.num_organs,
+            num_heads=args.num_heads,
+            sg_epsilon=args.sg_epsilon,
+            sg_iters=args.sg_iters,
+            use_pnurl=args.use_pnurl,
+            use_coop=args.use_coop,
+            use_sgot=args.use_sgot,
+            use_asr=args.use_asr,
+        ).to(args.device)
+        del vanilla_sam
+
+        if world_size > 1:
+            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True, bucket_cap_mb=2000)
+
+        raw_model = model.module if world_size > 1 else model
+
+        if args.encoder_adapter:
+            for n, p in raw_model.image_encoder.named_parameters():
+                if "Adapter" in n and "weight" in n: torch.nn.init.zeros_(p)
+
+        params = [{'params': raw_model.mask_decoder.parameters(), 'lr': args.lr},
+                  {'params': raw_model.prompt_generator.parameters(), 'lr': args.lr * 5}]
+        if hasattr(raw_model, 'basic_hv_head'):
+            params.append({'params': raw_model.basic_hv_head.parameters(), 'lr': args.lr})
+        if getattr(raw_model, 'use_asr', False):
+            cnn_lr = args.lr * 0.1
+            params.append({'params': raw_model.cnn_stage0.parameters(), 'lr': cnn_lr})
+            params.append({'params': raw_model.cnn_stage1.parameters(), 'lr': cnn_lr})
+            params.append({'params': raw_model.cnn_stage2.parameters(), 'lr': cnn_lr})          
+        if getattr(raw_model, 'use_coop_prompt', getattr(raw_model, 'use_coop', True)) and hasattr(raw_model, 'prompt_learner'):
+            params.append({'params': raw_model.prompt_learner.parameters(), 'lr': args.lr})
+        if getattr(raw_model, 'use_pnurl', True) and hasattr(raw_model, 'pnurl'):
+            params.append({'params': raw_model.pnurl.parameters(), 'lr': args.lr})
+        if getattr(raw_model, 'use_sgot', True) and hasattr(raw_model, 'sg_ot'):
+            params.append({'params': raw_model.sg_ot.parameters(), 'lr': args.lr * 5})
+            
+        adapter_params = [p for n, p in raw_model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
+        if adapter_params: params.append({'params': adapter_params, 'lr': args.lr})
+
+        optimizer = optim.AdamW(params, weight_decay=args.weight_decay)
+        criterion = FocalDiceloss_IoULoss(weight=20.0, iou_scale=1.0, ignore_index=255)
+        scaler = GradScaler() if args.use_amp else None
+        
+        warmup_epochs = 15 # 🔥 [调优]：给复杂多模态组件更多的预热磨合时间！
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, args.epochs - warmup_epochs),
+            eta_min=getattr(args, "min_lr", 1e-6),
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+
+        best_aji = 0.0; best_dice = 0.0
+        
+        if args.resume and os.path.exists(args.resume):
+            if rank == 0: logger.info(f"🔄 Resuming checkpoint from: {args.resume}")
+            try:
+                checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+                
+                state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+                state_dict = resize_pos_embed(state_dict, raw_model.state_dict())
+                raw_model.load_state_dict(state_dict, strict=False)
+                
+                if 'model' in checkpoint:
+                    if 'optimizer' in checkpoint:
+                        optimizer.load_state_dict(checkpoint['optimizer'])
+                    if 'scheduler' in checkpoint:
+                        scheduler.load_state_dict(checkpoint['scheduler'])
+                    if 'scaler' in checkpoint and scaler is not None and checkpoint['scaler'] is not None:
+                        scaler.load_state_dict(checkpoint['scaler'])
+                    if 'epoch' in checkpoint:
+                        args.start_epoch = checkpoint['epoch'] + 1  
+                    if 'best_aji' in checkpoint:
+                        best_aji = checkpoint['best_aji']
+                    if 'best_dice' in checkpoint:
+                        best_dice = checkpoint['best_dice']
+                        
+                if rank == 0: logger.info(f"✅ Resume success! Auto-resuming from Epoch {args.start_epoch} (Best AJI was {best_aji:.4f}).")
+            except Exception as e:
+                if rank == 0: logger.warning(f"⚠️ Resume failed: {e}")
+
+        for epoch in range(args.start_epoch, args.epochs):
+            if train_sampler: train_sampler.set_epoch(epoch)
+            if val_sampler: val_sampler.set_epoch(epoch)
+            
+            loss, m_loss, h_loss, a_loss = train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank)
+            val_res = validate_one_epoch(args, model, val_loader, epoch, writer, rank)
+            
             if rank == 0:
-                logger.info(f"✅ ASRBlock upscaling weights mapped: {mapped_count}/{len(key_mapping)}")
-        except Exception as e:
-            if rank == 0: logger.warning(f"⚠️ Checkpoint loading failed: {e}")
-    
-    model = TextSam(
-        image_encoder=vanilla_sam.image_encoder,
-        prompt_encoder=vanilla_sam.prompt_encoder,
-        mask_decoder=vanilla_sam.mask_decoder,
-        clip_model_name=args.clip_model,
-        num_organs=args.num_organs,
-        num_heads=args.num_heads,
-        sg_epsilon=args.sg_epsilon,
-        sg_iters=args.sg_iters,
-        use_pnurl=args.use_pnurl,
-        use_coop=args.use_coop,
-        use_sgot=args.use_sgot,
-        use_asr=args.use_asr,
-    ).to(args.device)
-    del vanilla_sam
+                dice = val_res.get('dice', 0.0); aji = val_res.get('mAJI', 0.0); pq = val_res.get('mPQ', 0.0)
+                logger.info(f"Ep {epoch+1}/{args.epochs} | Loss: {loss:.4f} (M:{m_loss:.3f}, H:{h_loss:.3f}, A:{a_loss:.3f}) | Dice: {dice:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}")
+                
+                checkpoint_dict = {
+                    'epoch': epoch,
+                    'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'scaler': scaler.state_dict() if scaler else None,
+                    'best_aji': best_aji,
+                    'best_dice': best_dice
+                }
+                
+                latest_model_path = os.path.join(args.work_dir, "models", args.run_name, "latest_model.pth")
+                torch.save(checkpoint_dict, latest_model_path)
+                
+                if aji > best_aji:
+                    best_aji = aji; best_dice = max(best_dice, dice)
+                    checkpoint_dict['best_aji'] = best_aji
+                    checkpoint_dict['best_dice'] = best_dice
+                    best_model_path = os.path.join(args.work_dir, "models", args.run_name, "best_model.pth")
+                    torch.save(checkpoint_dict, best_model_path)
+                    logger.info(f"New Best AJI! ({best_aji:.4f}) -> Model Saved")
+                    
+            if dist.is_initialized():
+                dist.barrier()
+            scheduler.step()
 
-    if world_size > 1:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
-
-    raw_model = model.module if world_size > 1 else model
-
-    if args.resume and os.path.exists(args.resume):
-        if rank == 0: logger.info(f"🔄 Resuming from: {args.resume} (Start Epoch: {args.start_epoch})")
-        try:
-            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-            state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-            state_dict = resize_pos_embed(state_dict, raw_model.state_dict())
-            raw_model.load_state_dict(state_dict, strict=False)
-            if rank == 0: logger.info("✅ Resume weights loaded successfully.")
-        except Exception as e:
-            if rank == 0: logger.warning(f"⚠️ Resume failed: {e}")
-
-    if args.encoder_adapter:
-        for n, p in raw_model.image_encoder.named_parameters():
-            if "Adapter" in n and "weight" in n: torch.nn.init.zeros_(p)
-
-    params = [{'params': raw_model.mask_decoder.parameters(), 'lr': args.lr},
-              {'params': raw_model.prompt_generator.parameters(), 'lr': args.lr * 5}]
-    if hasattr(raw_model, 'basic_hv_head'):
-        params.append({'params': raw_model.basic_hv_head.parameters(), 'lr': args.lr})
-    if getattr(raw_model, 'use_asr', False):
-        cnn_lr = args.lr * 0.1
-        params.append({'params': raw_model.cnn_stage0.parameters(), 'lr': cnn_lr})
-        params.append({'params': raw_model.cnn_stage1.parameters(), 'lr': cnn_lr})
-        params.append({'params': raw_model.cnn_stage2.parameters(), 'lr': cnn_lr})          
-    if getattr(raw_model, 'use_coop_prompt', getattr(raw_model, 'use_coop', True)) and hasattr(raw_model, 'prompt_learner'):
-        params.append({'params': raw_model.prompt_learner.parameters(), 'lr': args.lr})
-    if getattr(raw_model, 'use_pnurl', True) and hasattr(raw_model, 'pnurl'):
-        params.append({'params': raw_model.pnurl.parameters(), 'lr': args.lr})
-    if getattr(raw_model, 'use_sgot', True) and hasattr(raw_model, 'sg_ot'):
-        params.append({'params': raw_model.sg_ot.parameters(), 'lr': args.lr * 5})
-        
-    adapter_params = [p for n, p in raw_model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
-    if adapter_params: params.append({'params': adapter_params, 'lr': args.lr})
-
-    optimizer = optim.AdamW(params, weight_decay=args.weight_decay)
-    criterion = FocalDiceloss_IoULoss(weight=20.0, iou_scale=1.0, ignore_index=255)
-    scaler = GradScaler() if args.use_amp else None
-    
-    warmup_epochs = 5
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-    cosine_scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, args.epochs - warmup_epochs),
-        eta_min=getattr(args, "min_lr", 1e-6),
-    )
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_epochs],
-    )
-
-    best_aji = 0.0; best_dice = 0.0
-    
-    for epoch in range(args.start_epoch, args.epochs):
-        if train_sampler: train_sampler.set_epoch(epoch)
-        if val_sampler: val_sampler.set_epoch(epoch)
-        
-        loss, m_loss, h_loss, a_loss = train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank)
-        val_res = validate_one_epoch(args, model, val_loader, epoch, writer, rank)
-        
         if rank == 0:
-            dice = val_res.get('dice', 0.0); aji = val_res.get('mAJI', 0.0); pq = val_res.get('mPQ', 0.0)
-            logger.info(f"Ep {epoch+1}/{args.epochs} | Loss: {loss:.4f} (M:{m_loss:.3f}, H:{h_loss:.3f}) | Dice: {dice:.4f} | AJI: {aji:.4f} | PQ: {pq:.4f}")
-            latest_model_path = os.path.join(args.work_dir, "models", args.run_name, "latest_model.pth")
-            torch.save(raw_model.state_dict(), latest_model_path)
-            if aji > best_aji:
-                best_aji = aji; best_dice = max(best_dice, dice)
-                best_model_path = os.path.join(args.work_dir, "models", args.run_name, "best_model.pth")
-                torch.save(raw_model.state_dict(), best_model_path)
-                logger.info(f"New Best AJI! ({best_aji:.4f}) -> Model Saved")
+            logger.info(f"🏁 Training Finished. Best AJI: {best_aji:.4f}")
+            if writer is not None: writer.close()
+            
+    except Exception as e:
+        if rank == 0 and logger is not None:
+            logger.error("\n" + "="*50)
+            logger.error(f"❌ 训练发生致命错误中止 (Fatal Error): {str(e)}")
+            logger.error(f"🔍 完整错误堆栈 (Traceback):\n{traceback.format_exc()}")
+            logger.error("="*50 + "\n")
+        raise e  
+        
+    finally:
+        if rank == 0 and writer is not None: 
+            writer.close()
         if dist.is_initialized():
-            dist.barrier()
-        scheduler.step()
-
-    if rank == 0:
-        logger.info(f"🏁 Training Finished. Best AJI: {best_aji:.4f}")
-        if writer is not None: writer.close()
+            dist.destroy_process_group()
 
 if __name__ == '__main__':
     args = parse_args()
