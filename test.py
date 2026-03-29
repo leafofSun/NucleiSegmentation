@@ -1,17 +1,28 @@
 import argparse
 import os
-import torch
+import time
+import datetime
+import random
+from contextlib import nullcontext
 import numpy as np
-import cv2
+from tqdm import tqdm
+import logging
+import math
+import cv2 
 import json
 from pycocotools import mask as mask_utils
-from tqdm import tqdm
 from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn import functional as F
+from PIL import Image
+
+# === Project Module Imports ===
 from segment_anything import sam_model_registry
 from segment_anything.modeling.sam import TextSam 
 from metrics import SegMetrics
-import torch.nn.functional as F
-from PIL import Image
 
 # 后处理库
 from skimage.segmentation import watershed
@@ -53,7 +64,7 @@ def resize_pos_embed(state_dict, model_state_dict):
     return new_state_dict
 
 # ==================================================================================================
-# 1. 核心后处理：np.gradient
+# 1. 核心后处理
 # ==================================================================================================
 def hover_post_process(prob_map, hv_map, prob_thresh=0.35, marker_thresh=0.4, min_marker_size=250):
     mask = prob_map > prob_thresh
@@ -71,106 +82,159 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.35, marker_thresh=0.4, mi
     marker_map = prob_map - sobel_mag
     marker_map = (marker_map > marker_thresh) & mask
     
-    marker_map = remove_small_objects(marker_map, min_size=min_marker_size)
+    # 修复 Warning: min_size -> max_size 兼容 skimage 新版本
+    try:
+        marker_map = remove_small_objects(marker_map, min_size=min_marker_size)
+    except TypeError:
+        marker_map = remove_small_objects(marker_map, max_size=min_marker_size)
+        
     markers = skimage_label(marker_map).astype(np.int32)
 
     inst_map = watershed(-prob_map, markers, mask=mask)
     return inst_map.astype(np.int32)
 
 # ==================================================================================================
-# 2. 单次批量推理 (关闭 TTA，保留原函数名防止报错)
+# 2. 单次批量推理
+# ==================================================================================================
+# def tta_inference_1x_batch(model, image_rgb, organ_id, args):
+#     device = args.device
+#     input_size = (args.image_size, args.image_size)
+    
+#     img_t = cv2.resize(image_rgb, input_size)
+#     img_tensor = torch.from_numpy(img_t).permute(2, 0, 1).float().to(device)
+    
+#     with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+#         # 🔥🔥🔥 修复致命 Bug 2：补充 'attribute_text' 以及 'attr_labels' 兜底！
+#         input_sample = [{
+#             'image': img_tensor, 
+#             'original_size': input_size, 
+#             'organ_id': organ_id, 
+#             'text_prompt': "Cell nuclei",
+#             'attribute_text': "Cell nuclei",  # 必须传入，否则 CLIP 抽空字符
+#             'attr_labels': None
+#         }]
+        
+#         out = model(input_sample, multimask_output=True)[0]
+#         best_idx = torch.argmax(out['iou_predictions']).item()
+        
+#         prob = torch.sigmoid(out['masks'][0, best_idx]) 
+#         hv_raw = out.get('hv_logits')
+        
+#         if hv_raw is not None:
+#             if hv_raw.dim() == 3: hv_raw = hv_raw.unsqueeze(0)
+#             hv = F.interpolate(hv_raw.float(), size=input_size, mode='bilinear', align_corners=False).squeeze(0)
+#             hv = torch.tanh(hv) 
+#         else:
+#             hv = torch.zeros((2, input_size[0], input_size[1]), device=device)
+
+#         prob_np = prob.cpu().float().numpy()
+#         hv_np = hv.cpu().float().numpy()
+        
+#     return prob_np, hv_np, out.get('attr_logits', {})
+# ==================================================================================================
+# 2. 8-fold TTA 批量推理 (包含完整的空间还原与 HoVer 向量逆转)
 # ==================================================================================================
 def tta_inference_8x_batch(model, image_rgb, organ_id, args):
     device = args.device
     input_size = (args.image_size, args.image_size)
     
-    # 1. 仅仅做 Resize，没有任何翻转和旋转
-    img_t = cv2.resize(image_rgb, input_size)
-    img_tensor = torch.from_numpy(img_t).permute(2, 0, 1).float().to(device)
+    # 定义 8 种空间变换: (flip_code, rot_k)
+    # flip_code: None(不翻转), 1(水平), 0(垂直), -1(水平+垂直)
+    # rot_k: 0(不旋转), 1(逆时针旋转90度)
+    transforms = [
+        (None, 0), (1, 0), (0, 0), (-1, 0), 
+        (None, 1), (1, 1), (0, 1), (-1, 1)  
+    ]
     
+    # 1. 准备 8 张增强后的图像
+    img_list = []
+    for f_code, r_k in transforms:
+        img_t = image_rgb.copy()
+        # 翻转
+        if f_code is not None: 
+            img_t = cv2.flip(img_t, f_code)
+        # 旋转
+        if r_k > 0: 
+            img_t = np.rot90(img_t, k=r_k)
+        
+        img_t = cv2.resize(img_t, input_size)
+        img_list.append(torch.from_numpy(img_t).permute(2, 0, 1).float())
+    
+    batch_img = torch.stack(img_list).to(device)
+    
+    all_probs = []
+    all_hvs = []
+    first_attr_logits = {}
+
     with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        input_sample = [{'image': img_tensor, 'original_size': input_size, 'organ_id': organ_id, 'text_prompt': "Cell nuclei"}]
-        
-        # 2. 只做这一次前向传播
-        out = model(input_sample, multimask_output=True)[0]
-        best_idx = torch.argmax(out['iou_predictions']).item()
-        
-        prob = torch.sigmoid(out['masks'][0, best_idx]) 
-        hv_raw = out.get('hv_logits')
-        
-        if hv_raw is not None:
-            if hv_raw.dim() == 3: hv_raw = hv_raw.unsqueeze(0)
-            hv = F.interpolate(hv_raw.float(), size=input_size, mode='bilinear', align_corners=False).squeeze(0)
-            hv = torch.tanh(hv) 
-        else:
-            hv = torch.zeros((2, input_size[0], input_size[1]), device=device)
-
-        # 3. 直接转为 numpy 返回，不需要求平均了
-        prob_np = prob.cpu().float().numpy()
-        hv_np = hv.cpu().float().numpy()
-        
-    return prob_np, hv_np, out.get('attr_logits', {})
-# ==================================================================================================
-# 2. 8-fold TTA 批量推理 (GPU 物理坐标对齐版)
-# ==================================================================================================
-# def tta_inference_8x_batch(model, image_rgb, organ_id, args):
-#     device = args.device
-#     input_size = (args.image_size, args.image_size)
-    
-#     transforms = [
-#         (None, 0), (1, 0), (0, 0), (-1, 0), 
-#         (None, 1), (1, 1), (0, 1), (-1, 1)  
-#     ]
-    
-#     img_list = []
-#     for f_code, r_k in transforms:
-#         img_t = image_rgb.copy()
-#         if f_code is not None: img_t = cv2.flip(img_t, f_code)
-#         if r_k > 0: img_t = np.rot90(img_t, k=r_k)
-#         img_t = cv2.resize(img_t, input_size)
-#         img_list.append(torch.from_numpy(img_t).permute(2, 0, 1).float())
-    
-#     batch_img = torch.stack(img_list).to(device)
-#     all_probs = []
-#     all_hvs = []
-    
-#     with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-#         for i in range(len(transforms)):
-#             input_sample = [{'image': batch_img[i], 'original_size': input_size, 'organ_id': organ_id, 'text_prompt': "Cell nuclei"}]
-#             out = model(input_sample, multimask_output=True)[0]
-#             best_idx = torch.argmax(out['iou_predictions']).item()
+        # 逐个推理以防 OOM，你也可以改成一次性 batch 推理
+        for i in range(len(transforms)):
+            # 🔥 必须带上 PNuRL 需要的医学语义文本
+            input_sample = [{
+                'image': batch_img[i], 
+                'original_size': input_size, 
+                'organ_id': organ_id, 
+                'text_prompt': "Cell nuclei",
+                'attribute_text': "Cell nuclei",  
+                'attr_labels': None
+            }]
             
-#             prob = torch.sigmoid(out['masks'][0, best_idx]) 
-#             hv_raw = out.get('hv_logits')
-#             if hv_raw.dim() == 3: hv_raw = hv_raw.unsqueeze(0)
-#             hv = F.interpolate(hv_raw.float(), size=input_size, mode='bilinear', align_corners=False).squeeze(0)
-#             hv = torch.tanh(hv) 
-
-#             f_code, r_k = transforms[i]
+            out = model(input_sample, multimask_output=True)[0]
+            best_idx = torch.argmax(out['iou_predictions']).item()
             
-#             if r_k == 1:
-#                 prob = torch.rot90(prob, k=-1, dims=[0, 1])
-#                 hv = torch.rot90(hv, k=-1, dims=[1, 2])
-#                 v_new, h_new = hv[1].clone(), -hv[0].clone()
-#                 hv[0], hv[1] = v_new, h_new
-
-#             if f_code == 1: 
-#                 prob = torch.flip(prob, [1]); hv = torch.flip(hv, [2]); hv[1] = -hv[1]
-#             elif f_code == 0: 
-#                 prob = torch.flip(prob, [0]); hv = torch.flip(hv, [1]); hv[0] = -hv[0]
-#             elif f_code == -1: 
-#                 prob = torch.flip(prob, [0, 1]); hv = torch.flip(hv, [1, 2]); hv = -hv
+            # 提取概率图和 HoVer 图
+            prob = torch.sigmoid(out['masks'][0, best_idx]) 
+            hv_raw = out.get('hv_logits')
             
-#             all_probs.append(prob)
-#             all_hvs.append(hv)
+            if hv_raw is not None:
+                if hv_raw.dim() == 3: hv_raw = hv_raw.unsqueeze(0)
+                hv = F.interpolate(hv_raw.float(), size=input_size, mode='bilinear', align_corners=False).squeeze(0)
+                hv = torch.tanh(hv) 
+            else:
+                hv = torch.zeros((2, input_size[0], input_size[1]), device=device)
 
-#         avg_prob = torch.stack(all_probs).mean(0).cpu().float().numpy()
-#         avg_hv = torch.stack(all_hvs).mean(0).cpu().float().numpy()
-        
-#     return avg_prob, avg_hv, out.get('attr_logits', {})
+            # 保留第一张图（原图）的属性预测，用于动态 min_size 计算
+            if i == 0:
+                first_attr_logits = out.get('attr_logits', {})
 
+            # 2. 空间逆变换 (恢复到原始视角)
+            f_code, r_k = transforms[i]
+            
+            # 逆向旋转 90 度
+            if r_k == 1:
+                prob = torch.rot90(prob, k=-1, dims=[0, 1])
+                hv = torch.rot90(hv, k=-1, dims=[1, 2])
+                # 🔥 旋转后，HoVer 的 X/Y 轴方向发生改变
+                v_new, h_new = hv[1].clone(), -hv[0].clone()
+                hv[0], hv[1] = v_new, h_new
+
+            # 逆向翻转
+            if f_code == 1: 
+                # 水平翻转：X 轴反向
+                prob = torch.flip(prob, [1])
+                hv = torch.flip(hv, [2])
+                hv[1] = -hv[1] 
+            elif f_code == 0: 
+                # 垂直翻转：Y 轴反向
+                prob = torch.flip(prob, [0])
+                hv = torch.flip(hv, [1])
+                hv[0] = -hv[0] 
+            elif f_code == -1: 
+                # 水平+垂直翻转
+                prob = torch.flip(prob, [0, 1])
+                hv = torch.flip(hv, [1, 2])
+                hv = -hv
+
+            all_probs.append(prob)
+            all_hvs.append(hv)
+
+    # 3. 对 8 次预测结果求平均
+    avg_prob = torch.stack(all_probs).mean(0).cpu().float().numpy()
+    avg_hv = torch.stack(all_hvs).mean(0).cpu().float().numpy()
+    
+    return avg_prob, avg_hv, first_attr_logits
 # ==================================================================================================
-# 3. 滑动窗口推理 (Sliding Window Inference + Gaussian Weighting)
+# 3. 滑动窗口推理
 # ==================================================================================================
 def get_gaussian_kernel(size, sigma=1.0):
     x = np.linspace(-1, 1, size)
@@ -179,11 +243,10 @@ def get_gaussian_kernel(size, sigma=1.0):
     kernel = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
     return kernel.astype(np.float32)
 
-def sliding_window_inference(model, image_rgb, organ_id, args, patch_size=256, overlap=0.5):
+def sliding_window_inference(model, image_rgb, organ_id, args, patch_size=256, overlap=0.75):
     h, w = image_rgb.shape[:2]
     stride = int(patch_size * (1 - overlap))
     
-    # 1. 计算 Padding (确保能被完整切割)
     pad_h = 0 if h % stride == 0 else stride - (h % stride)
     pad_w = 0 if w % stride == 0 else stride - (w % stride)
     pad_h = max(pad_h, patch_size - h) if h < patch_size else pad_h
@@ -192,7 +255,6 @@ def sliding_window_inference(model, image_rgb, organ_id, args, patch_size=256, o
     padded_img = np.pad(image_rgb, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
     pad_h_full, pad_w_full = padded_img.shape[:2]
     
-    # 2. 初始化拼接画布
     canvas_prob = np.zeros((pad_h_full, pad_w_full), dtype=np.float32)
     canvas_hv = np.zeros((2, pad_h_full, pad_w_full), dtype=np.float32)
     canvas_weight = np.zeros((pad_h_full, pad_w_full), dtype=np.float32)
@@ -200,15 +262,12 @@ def sliding_window_inference(model, image_rgb, organ_id, args, patch_size=256, o
     weight_mask = get_gaussian_kernel(patch_size, sigma=0.5)
     accumulated_size_logits = None
     
-    # 3. 滑动推理
     for y in range(0, pad_h_full - patch_size + 1, stride):
         for x in range(0, pad_w_full - patch_size + 1, stride):
             patch = padded_img[y:y+patch_size, x:x+patch_size, :]
             
-            # patch 本身是 256x256，送入 tta 会被 resize 到 args.image_size (512x512) 推理
             prob_512, hv_512, attr_logits = tta_inference_8x_batch(model, patch, organ_id, args)
             
-            # 将 512x512 的输出放缩回 256x256 以拼接到画布
             prob_256 = cv2.resize(prob_512, (patch_size, patch_size), interpolation=cv2.INTER_LINEAR)
             hv_v_256 = cv2.resize(hv_512[0], (patch_size, patch_size), interpolation=cv2.INTER_LINEAR)
             hv_h_256 = cv2.resize(hv_512[1], (patch_size, patch_size), interpolation=cv2.INTER_LINEAR)
@@ -218,14 +277,12 @@ def sliding_window_inference(model, image_rgb, organ_id, args, patch_size=256, o
             canvas_hv[1, y:y+patch_size, x:x+patch_size] += hv_h_256 * weight_mask
             canvas_weight[y:y+patch_size, x:x+patch_size] += weight_mask
             
-            # 累加属性 logit，用于整图的自适应阈值
             if 'size' in attr_logits:
                 if accumulated_size_logits is None:
                     accumulated_size_logits = attr_logits['size'].detach().cpu().clone()
                 else:
                     accumulated_size_logits += attr_logits['size'].detach().cpu()
                     
-    # 4. 加权归一化与裁剪
     canvas_prob /= (canvas_weight + 1e-8)
     canvas_hv /= (canvas_weight + 1e-8)
     
@@ -257,7 +314,6 @@ def load_filtered_gt(img_path):
         annotations = data.get('annotations', []) if isinstance(data, dict) else data
         
         if not annotations:
-            print(f"⚠️ 解析警告: {json_path} 中未找到 annotations 列表。")
             return None
 
         h, w = None, None
@@ -286,32 +342,71 @@ def load_filtered_gt(img_path):
                 binary_mask = mask_utils.decode(seg)
                 instance_map[binary_mask > 0] = idx + 1
                 
-        if instance_map.max() == 0:
-            print(f"⚠️ 解析警告: {json_path} 已读取，但实例全为空。")
-            
         return instance_map
     except Exception as e:
-        print(f"❌ 解析错误 {json_path}: {str(e)}")
         return None
 
 # ==================================================================================================
-# 5. Main
+# 5. Main & Args
 # ==================================================================================================
-def main(args):
-    vanilla_sam = sam_model_registry[args.model_type](args)
+def parse_args():
+    parser = argparse.ArgumentParser(description="MP-SAM Inference & Testing")
     
-    # 🔥 [修复] 显式传入消融开关状态，防止默认开启随机权重的模块
+    # 基础路径
+    parser.add_argument("--data_path", type=str, required=True, help="Path to testing data")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint")
+    parser.add_argument("--save_pred", action='store_true', help="Whether to save prediction images")
+    
+    # 模型架构维度与开关 (必须与 train.py 严格对齐)
+    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--model_type", type=str, default="vit_b")
+    parser.add_argument("--clip_model", type=str, default="ViT-B/16")
+    parser.add_argument("--num_organs", type=int, default=21)
+    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--sg_epsilon", type=float, default=0.05)
+    parser.add_argument("--sg_iters", type=int, default=3)
+    parser.add_argument('--device', type=str, default='cuda')
+    
+    # 🔥 修复：补回漏掉的 encoder_adapter 架构参数
+    parser.add_argument("--encoder_adapter", action='store_true', default=True)
+    
+    # 消融实验开关
+    parser.add_argument("--use_pnurl", action='store_true', default=False)
+    parser.add_argument("--use_coop", action='store_true', default=False)
+    parser.add_argument("--use_sgot", action='store_true', default=False)
+    parser.add_argument("--use_asr", action='store_true', default=False)
+    
+    # 推理阈值
+    parser.add_argument("--prob_thresh", type=float, default=0.35)
+    parser.add_argument("--marker_thresh", type=float, default=0.40)
+    parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'])
+    
+    return parser.parse_args()
+
+def main(args):
+    # 🔥🔥🔥 修复致命 Bug 4：防止 build_sam.py 在加载纯净网络时误吃微调后的权重崩溃
+    fine_tuned_ckpt = args.checkpoint
+    args.checkpoint = None 
+    vanilla_sam = sam_model_registry[args.model_type](args)
+    args.checkpoint = fine_tuned_ckpt # 恢复
+    
+    # 🔥🔥🔥 修复致命 Bug 3：向 TextSam 完整传入所有的必要参数，防止使用默认值导致维度不匹配
     model = TextSam(
         image_encoder=vanilla_sam.image_encoder, 
         prompt_encoder=vanilla_sam.prompt_encoder,
         mask_decoder=vanilla_sam.mask_decoder, 
-        num_organs=21,
+        clip_model_name=args.clip_model,
+        num_organs=args.num_organs,
+        num_heads=args.num_heads,
+        sg_epsilon=args.sg_epsilon,
+        sg_iters=args.sg_iters,
         use_pnurl=args.use_pnurl,
         use_coop=args.use_coop,
         use_sgot=args.use_sgot,
         use_asr=args.use_asr
     ).to(args.device)
     
+    print(f"📥 Loading Checkpoint from {args.checkpoint}...")
     ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     state_dict = ckpt.get('model', ckpt)
     state_dict = resize_pos_embed(state_dict, model.state_dict())
@@ -324,7 +419,7 @@ def main(args):
     save_dir = os.path.join("workdir", "eval_tta8x", "inference_viz")
     if args.save_pred: os.makedirs(save_dir, exist_ok=True)
 
-    for img_path in tqdm(image_files, desc="Sliding Window 8x-TTA Inference"):
+    for img_path in tqdm(image_files, desc="Sliding Window Inference"):
         image_bgr = cv2.imread(img_path)
         if image_bgr is None: continue
         
@@ -353,7 +448,6 @@ def main(args):
         
         gt_mask = load_filtered_gt(img_path)
         if gt_mask is not None:
-            # 🔥 不再破坏 Ground Truth 结构！只确保预测图的维度与 GT 严格对齐
             if gt_mask.shape != pred_mask.shape:
                 pred_mask = cv2.resize(pred_mask.astype(np.uint8), (gt_mask.shape[1], gt_mask.shape[0]), interpolation=cv2.INTER_NEAREST).astype(np.int32)
             
@@ -362,29 +456,8 @@ def main(args):
         else:
             print(f"❌ Missing GT: {img_path}") 
 
-    print("\n" + "🌟" * 15 + "\n📊 Final Results (Sliding Window + Oracle Organ ID + 8x TTA):")
+    print("\n" + "🌟" * 15 + "\n📊 Final Results (Sliding Window + Oracle Organ ID):")
     for k, v in all_metrics.items(): print(f"{k:>10}: {np.mean(v):.4f}")
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--image_size", type=int, default=512)
-    parser.add_argument("--model_type", type=str, default="vit_b")
-    parser.add_argument("--encoder_adapter", action='store_true', default=True)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument("--prob_thresh", type=float, default=0.35)
-    parser.add_argument("--marker_thresh", type=float, default=0.40)
-    parser.add_argument("--save_pred", action='store_true')
-    parser.add_argument("--metrics", nargs='+', default=['dice', 'iou', 'mAJI', 'mPQ'])
-    
-    # 消融开关，默认关闭，与纯视觉基线对齐
-    parser.add_argument("--use_pnurl", action='store_true', default=False)
-    parser.add_argument("--use_coop", action='store_true', default=False)
-    parser.add_argument("--use_sgot", action='store_true', default=False)
-    parser.add_argument("--use_asr", action='store_true', default=False)
-    
-    return parser.parse_args()
 
 if __name__ == '__main__':
     main(parse_args())

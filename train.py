@@ -182,7 +182,7 @@ def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, mi
     return inst_map.astype(np.int32)
 
 # ==================================================================================================
-# 3. Training Logic (🔥 PNuRL + PNuDP Full Restoration)
+# 3. Training Logic
 # ==================================================================================================
 def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank):
     model.train()
@@ -195,7 +195,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
     mask_losses = []
     heatmap_losses = []
     hv_losses = []
-    attr_losses = []  # 🔥 记录 PNuRL 属性损失
+    attr_losses = []  
     
     optimizer.zero_grad(set_to_none=True)
     
@@ -211,7 +211,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         model_input = []
         organ_ids = batched_input.get('organ_id', None)
         
-        # 🔥🔥🔥 修复1: 完美匹配 DataLoader 输出的 key 'attr_labels'
         attr_labels = batched_input.get('attr_labels', None)
         dynamic_text = batched_input.get('text_prompt', ["Cell nuclei"] * len(images))
         dynamic_attr_text = batched_input.get('attribute_text', ["Cell nuclei"] * len(images))
@@ -228,7 +227,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 'organ_id': curr_id,
                 'attribute_text': dynamic_attr_text[i],
                 'text_prompt': dynamic_text[i],
-                # 🔥🔥🔥 修复2: 确保传给 sam.py 的是 'attr_labels'
                 'attr_labels': attr_labels[i] if attr_labels is not None else None, 
             })
 
@@ -300,13 +298,12 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                         loss_hv_grad = msge_loss(gt_hv, pred_hv, focus)
                         loss_hv = loss_hv_mse + 2.0 * loss_hv_grad
                         
-                # 🔥🔥🔥 修复3: 彻底获取 PNuRL 的自带损失，并删除冗余代码 🔥🔥🔥
+                # 4. PNuRL 属性预测损失与拓展损失
                 loss_attr = out.get('pnurl_loss', torch.tensor(0.0, device=loss_m.device))
-                        
                 loss_c = out.get('consistency_loss', torch.tensor(0.0, device=loss_m.device))
                 loss_d = out.get('density_loss', torch.tensor(0.0, device=loss_m.device))
                 
-                # 🔥 终极 Loss 大一统融合
+                # 终极 Loss 大一统融合
                 loss_i = (
                     args.mask_weight * loss_m
                     + args.heatmap_weight * loss_h
@@ -325,9 +322,16 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             final_loss = loss_batch / len(images)
             final_loss = final_loss / args.accumulation_steps
 
-        # 🔥 安全多卡通信区
         is_accumulating = (batch_idx + 1) % args.accumulation_steps != 0 and (batch_idx + 1) != len(train_loader)
 
+        # 🔥🔥🔥 终极全覆盖防死锁补丁：绑定计算图中所有可学习的参数，保证反向传播路径 100% 对称 🔥🔥🔥
+        dummy_loss = 0.0
+        for p in model.parameters():
+            if p.requires_grad:
+                dummy_loss = dummy_loss + p.sum() * 0.0
+        final_loss = final_loss + dummy_loss
+
+        # 正常回传，由于有 dummy_loss 兜底，绝不会出现未激活参数卡死的问题
         if scaler:
             scaler.scale(final_loss).backward()
         else:
@@ -348,7 +352,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         mean_m = loss_m_accum / len(images)
         mean_h = loss_h_accum / len(images)
         mean_hv = loss_hv_accum / len(images)
-        mean_a = loss_attr_accum / len(images)  # PNuRL 监控
+        mean_a = loss_attr_accum / len(images)  
 
         losses.append(current_loss_val)
         mask_losses.append(mean_m)
@@ -362,7 +366,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             writer.add_scalar('Train/Loss_Mask', mean_m, global_step)
             writer.add_scalar('Train/Loss_Heatmap', mean_h, global_step)
             writer.add_scalar('Train/Loss_HV', mean_hv, global_step)
-            writer.add_scalar('Train/Loss_Attr', mean_a, global_step) # 写入 TensorBoard
+            writer.add_scalar('Train/Loss_Attr', mean_a, global_step) 
             writer.add_scalar('Train/LR', optimizer.param_groups[0]['lr'], global_step)
         
         if rank == 0:
@@ -370,10 +374,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 L=f"{current_loss_val:.3f}",
                 M=f"{mean_m:.3f}",
                 H=f"{mean_h:.3f}",
-                A=f"{mean_a:.3f}" # 终端增加 A(AttrLoss) 的显示
+                A=f"{mean_a:.3f}" 
             )
 
-    return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses), 0.0
+    return np.mean(losses), np.mean(mask_losses), np.mean(heatmap_losses), np.mean(attr_losses)
 
 # ==================================================================================================
 # 4. Validation Logic
@@ -596,7 +600,8 @@ def main(args):
 
         if world_size > 1:
             model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True, bucket_cap_mb=2000)
+            # 🔥🔥🔥 终极修复：因为 dummy_loss 绑定了所有参数，DDP 不再需要耗时的 find_unused_parameters 扫描，直接关闭即可！
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
         raw_model = model.module if world_size > 1 else model
 
