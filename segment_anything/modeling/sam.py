@@ -14,7 +14,7 @@ from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
 from .pnurl import PNuRL
-from .sg_ot import SemanticGuidedOT
+from .sg_ot import DensityGuidedOT # 🔥 替换为 DensityGuidedOT
 import sys
 import os
 
@@ -308,32 +308,32 @@ class TextSam(Sam):
             num_heads=num_heads,
         )
 
-        # SG-OT（关闭时不更新）或纯视觉独立 HV 头
+        # 🔥 DG-OT（关闭时不更新）或纯视觉独立 HV 头
         if self.use_sgot:
-            self.sg_ot = SemanticGuidedOT(
+            print("🚀 Switched to Density-Guided Optimal Transport (DG-OT) for pure spatial alignment!")
+            self.sg_ot = DensityGuidedOT(
                 img_dim=embed_dim,
-                txt_dim=text_dim,
                 epsilon=sg_epsilon,
                 sinkhorn_iters=sg_iters,
             )
             for param in self.sg_ot.parameters():
                 param.requires_grad = True
         else:
-            # 🔥 [新增] 纯视觉基线的独立 HV 预测头
+            # 🔥 纯视觉基线的独立 HV 预测头
             self.basic_hv_head = nn.Sequential(
                 nn.Conv2d(embed_dim, embed_dim // 2, kernel_size=3, padding=1),
                 nn.GELU(),
                 nn.Conv2d(embed_dim // 2, 2, kernel_size=1)
             )
 
-        # 🔥 [新增] 引入纯视觉基线的高频特征提取器 (ResNet-50)
+        # 🔥 引入纯视觉基线的高频特征提取器 (ResNet-50)
         if self.use_asr:
             resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
             self.cnn_stage0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
             self.cnn_stage1 = resnet.layer1 # 输出: [B, 256, H/4, W/4]
             self.cnn_stage2 = resnet.layer2 # 输出: [B, 512, H/8, W/8]
 
-        # 5. 冻结策略
+        #5. 冻结策略
         for param in self.image_encoder.parameters():
             param.requires_grad = False
         for param in self.prompt_encoder.parameters():
@@ -352,6 +352,40 @@ class TextSam(Sam):
             f"DualLearner({'on' if use_coop else 'off'}), PNuRL({'on' if use_pnurl else 'off'}), "
             f"SG-OT({'on' if use_sgot else 'off'}), Generator."
         )
+        # === 5. 临时冻结策略 (Stage 1: 仅单独预热 DG-OT) ===
+        # print("⚠️ [Stage 1 策略生效]: 冻结 Mask Decoder 及所有主干参数，仅训练 DG-OT 模块！")
+
+        # # 1. 绝对冻结基础组件
+        # for param in self.image_encoder.parameters():
+        #     param.requires_grad = False
+        # for param in self.prompt_encoder.parameters():
+        #     param.requires_grad = False
+        # for param in self.mask_decoder.parameters():
+        #     param.requires_grad = False  # 🔥 之前是 True，现在改为 False
+
+        # # 2. 绝对冻结 Adapters
+        # adapter_count = 0
+        # for name, param in self.image_encoder.named_parameters():
+        #     if "Adapter" in name:
+        #         param.requires_grad = False # 🔥 之前是 True，现在改为 False
+        #         adapter_count += 1
+                
+        # # 3. 绝对冻结其他辅助分支 (PNuRL, CoOp, Generator, CNN)
+        # if hasattr(self, 'pnurl'):
+        #     for param in self.pnurl.parameters(): param.requires_grad = False
+        # if hasattr(self, 'prompt_learner'):
+        #     for param in self.prompt_learner.parameters(): param.requires_grad = False
+        # if hasattr(self, 'prompt_generator'):
+        #     for param in self.prompt_generator.parameters(): param.requires_grad = False
+        # if self.use_asr:
+        #     for param in self.cnn_stage0.parameters(): param.requires_grad = False
+        #     for param in self.cnn_stage1.parameters(): param.requires_grad = False
+        #     for param in self.cnn_stage2.parameters(): param.requires_grad = False
+
+        # # 4. 🔥 唯一放开 SG-OT (DG-OT) 的梯度
+        # if self.use_sgot:
+        #     for param in self.sg_ot.parameters():
+        #         param.requires_grad = True
 
     def forward(self, batched_input, multimask_output=False):
         # === Step 1: 基础图像编码 ===
@@ -359,7 +393,7 @@ class TextSam(Sam):
         image_embeddings = self.image_encoder(input_images) # [B, 256, 64, 64]
         device = image_embeddings.device
 
-        # 🔥 [新增] 同步提取 CNN 高频物理特征
+        # 🔥 同步提取 CNN 高频物理特征
         feat_s1, feat_s2 = None, None
         if self.use_asr:
             with torch.autocast('cuda', enabled=True):
@@ -446,13 +480,14 @@ class TextSam(Sam):
         if self.use_sgot:
             if next(self.sg_ot.parameters()).device != device:
                 self.sg_ot = self.sg_ot.to(device)
+            
+            # 🔥 彻底切断文本特征，仅使用图像特征和密度图进行空间对齐
             fused_image_embeddings, heatmap_logits, hv_logits = self.sg_ot(
                 img_feat=refined_image_embeddings,
-                txt_feat=pos_text_feats,
                 density_map=sg_ot_density,
             )
         else:
-            # 🔥 [修复] 纯视觉通路：直接使用独立卷积头生成 HV 距离图
+            # 🔥 纯视觉通路：直接使用独立卷积头生成 HV 距离图
             fused_image_embeddings = refined_image_embeddings
             heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
             hv_logits = self.basic_hv_head(refined_image_embeddings)
@@ -569,7 +604,7 @@ class TextSam(Sam):
                     masks=None,
                 )
 
-                # 🔥 [核心注入] 仅传入物理边缘，纯视觉 ASR
+                # 🔥 仅传入物理边缘，纯视觉 ASR
                 sub_mask, sub_iou = self.mask_decoder(
                     image_embeddings=sub_img_embed,
                     image_pe=self.prompt_encoder.get_dense_pe(),

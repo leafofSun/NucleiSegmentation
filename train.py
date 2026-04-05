@@ -74,7 +74,7 @@ def parse_args():
     parser.add_argument("--clip_model", type=str, default="ViT-B/16", help="CLIP model version")
     parser.add_argument("--num_organs", type=int, default=21, help="Number of organ categories")
     parser.add_argument("--encoder_adapter", action='store_true', default=True, help="Use Adapters")
-    parser.add_argument("--hv_weight", type=float, default=1.0, help="Weight for HoVer HV supervision loss")
+    parser.add_argument("--hv_weight", type=float, default=10.0, help="Weight for HoVer HV supervision loss")
     parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads for multi-modal fusion")
 
     parser.add_argument("--use_pnurl", action='store_true', default=False, help="启用 PNuRL 属性预测分支")
@@ -230,7 +230,8 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 'attr_labels': attr_labels[i] if attr_labels is not None else None, 
             })
 
-        with autocast('cuda', enabled=args.use_amp):
+        # 🔥 [修复] 强制开启 BF16 完美适配 RTX 30/40/50 系列，彻底解决 FP16 溢出导致 NaN 问题
+        with autocast('cuda', enabled=args.use_amp, dtype=torch.bfloat16):
             outputs = model(model_input, multimask_output=True)
             loss_batch = 0
             loss_m_accum = 0.0
@@ -273,25 +274,34 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                         if gt_hv_map_batch is not None:
                             gt_hv_full = gt_hv_map_batch[i].to(pred_hv.device)
                             if gt_hv_full.dim() == 3: gt_hv_full = gt_hv_full.unsqueeze(0)
+                            # 🔥 修复：如果 DataLoader 已经提供了非 512 的 HV Map，绝对不能用 bilinear 破坏边界
+                            gt_hv = F.interpolate(gt_hv_full.float(), size=pred_hv.shape[-2:], mode='nearest')
                         else:
                             inst_batch = batched_input.get("label_inst", None)
-                            if inst_batch is None: gt_hv_full = None
+                            if inst_batch is None: 
+                                gt_hv = None
                             else:
-                                inst_map = inst_batch[i].squeeze(0).long()
-                                inst_map = inst_map.clone()
-                                inst_map[inst_map == 255] = 0
-                                gt_hv_full = generate_hv_map_from_inst(inst_map).unsqueeze(0)
+                                # 🔥 致命 Bug 1 修复：先用 nearest 无损缩放实例图，然后再去生成 HV Map！
+                                inst_map = inst_batch[i].float()
+                                if inst_map.dim() == 2:
+                                    inst_map = inst_map.unsqueeze(0).unsqueeze(0)
+                                elif inst_map.dim() == 3:
+                                    inst_map = inst_map.unsqueeze(0)
+                                    
+                                inst_map_resized = F.interpolate(inst_map, size=pred_hv.shape[-2:], mode='nearest').squeeze().long()
+                                inst_map_resized[inst_map_resized == 255] = 0
+                                
+                                # 在纯净的 512x512 实例图上直接生成绝对准确的物理向量场，彻底避免插值污染
+                                gt_hv = generate_hv_map_from_inst(inst_map_resized).unsqueeze(0)
 
-                        if gt_hv_full is not None:
-                            gt_hv = F.interpolate(gt_hv_full.float(), size=pred_hv.shape[-2:], mode='bilinear', align_corners=False)
-                            inst_batch = batched_input.get("label_inst", None)
+                        if gt_hv is not None:
                             if inst_batch is not None:
                                 focus_full = (inst_batch[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
                             else:
                                 focus_full = (labels[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
                             focus = F.interpolate(focus_full, size=pred_hv.shape[-2:], mode='nearest').squeeze(1)
 
-                    if pred_hv is not None and gt_hv_full is not None:
+                    if pred_hv is not None and gt_hv is not None:
                         focus_exp = focus.unsqueeze(1)
                         mse_map = F.mse_loss(pred_hv.float(), gt_hv.float(), reduction='none')
                         loss_hv_mse = (mse_map * focus_exp).sum() / (focus_exp.sum() * pred_hv.shape[1] + 1e-8)
@@ -303,7 +313,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 loss_c = out.get('consistency_loss', torch.tensor(0.0, device=loss_m.device))
                 loss_d = out.get('density_loss', torch.tensor(0.0, device=loss_m.device))
                 
-                # 终极 Loss 大一统融合
+                # 终极 Loss 大一统融合 (HV weight 已在参数中提为 10.0)
                 loss_i = (
                     args.mask_weight * loss_m
                     + args.heatmap_weight * loss_h
@@ -331,7 +341,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 dummy_loss = dummy_loss + p.sum() * 0.0
         final_loss = final_loss + dummy_loss
 
-        # 正常回传，由于有 dummy_loss 兜底，绝不会出现未激活参数卡死的问题
         if scaler:
             scaler.scale(final_loss).backward()
         else:
@@ -599,40 +608,49 @@ def main(args):
         del vanilla_sam
 
         if world_size > 1:
-            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            # 🔥🔥🔥 终极修复：因为 dummy_loss 绑定了所有参数，DDP 不再需要耗时的 find_unused_parameters 扫描，直接关闭即可！
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         raw_model = model.module if world_size > 1 else model
 
         if args.encoder_adapter:
             for n, p in raw_model.image_encoder.named_parameters():
                 if "Adapter" in n and "weight" in n: torch.nn.init.zeros_(p)
 
-        params = [{'params': raw_model.mask_decoder.parameters(), 'lr': args.lr},
-                  {'params': raw_model.prompt_generator.parameters(), 'lr': args.lr * 5}]
+        params = []
+        def add_to_params(module, lr):
+            grad_params = [p for p in module.parameters() if p.requires_grad]
+            if grad_params:
+                params.append({'params': grad_params, 'lr': lr})
+
+        add_to_params(raw_model.mask_decoder, args.lr)
+        add_to_params(raw_model.prompt_generator, args.lr * 5)
+        
         if hasattr(raw_model, 'basic_hv_head'):
-            params.append({'params': raw_model.basic_hv_head.parameters(), 'lr': args.lr})
+            add_to_params(raw_model.basic_hv_head, args.lr)
+            
         if getattr(raw_model, 'use_asr', False):
             cnn_lr = args.lr * 0.1
-            params.append({'params': raw_model.cnn_stage0.parameters(), 'lr': cnn_lr})
-            params.append({'params': raw_model.cnn_stage1.parameters(), 'lr': cnn_lr})
-            params.append({'params': raw_model.cnn_stage2.parameters(), 'lr': cnn_lr})          
+            add_to_params(raw_model.cnn_stage0, cnn_lr)
+            add_to_params(raw_model.cnn_stage1, cnn_lr)
+            add_to_params(raw_model.cnn_stage2, cnn_lr)
+            
         if getattr(raw_model, 'use_coop_prompt', getattr(raw_model, 'use_coop', True)) and hasattr(raw_model, 'prompt_learner'):
-            params.append({'params': raw_model.prompt_learner.parameters(), 'lr': args.lr})
+            add_to_params(raw_model.prompt_learner, args.lr)
+            
         if getattr(raw_model, 'use_pnurl', True) and hasattr(raw_model, 'pnurl'):
-            params.append({'params': raw_model.pnurl.parameters(), 'lr': args.lr})
+            add_to_params(raw_model.pnurl, args.lr)
+            
         if getattr(raw_model, 'use_sgot', True) and hasattr(raw_model, 'sg_ot'):
-            params.append({'params': raw_model.sg_ot.parameters(), 'lr': args.lr * 5})
+            add_to_params(raw_model.sg_ot, args.lr * 5)
             
         adapter_params = [p for n, p in raw_model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
         if adapter_params: params.append({'params': adapter_params, 'lr': args.lr})
 
         optimizer = optim.AdamW(params, weight_decay=args.weight_decay)
         criterion = FocalDiceloss_IoULoss(weight=20.0, iou_scale=1.0, ignore_index=255)
-        scaler = GradScaler() if args.use_amp else None
         
-        warmup_epochs = 15 # 🔥 [调优]：给复杂多模态组件更多的预热磨合时间！
+        scaler = None 
+        
+        warmup_epochs = 15 
         warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
         cosine_scheduler = CosineAnnealingLR(
             optimizer,
@@ -648,29 +666,19 @@ def main(args):
         best_aji = 0.0; best_dice = 0.0
         
         if args.resume and os.path.exists(args.resume):
-            if rank == 0: logger.info(f"🔄 Resuming checkpoint from: {args.resume}")
+            if rank == 0: logger.info(f"🔄 渐进式微调：仅加载模型权重 from: {args.resume}")
             try:
                 checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
                 
                 state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
                 state_dict = resize_pos_embed(state_dict, raw_model.state_dict())
+                
                 raw_model.load_state_dict(state_dict, strict=False)
                 
-                if 'model' in checkpoint:
-                    if 'optimizer' in checkpoint:
-                        optimizer.load_state_dict(checkpoint['optimizer'])
-                    if 'scheduler' in checkpoint:
-                        scheduler.load_state_dict(checkpoint['scheduler'])
-                    if 'scaler' in checkpoint and scaler is not None and checkpoint['scaler'] is not None:
-                        scaler.load_state_dict(checkpoint['scaler'])
-                    if 'epoch' in checkpoint:
-                        args.start_epoch = checkpoint['epoch'] + 1  
-                    if 'best_aji' in checkpoint:
-                        best_aji = checkpoint['best_aji']
-                    if 'best_dice' in checkpoint:
-                        best_dice = checkpoint['best_dice']
+                best_aji = 0.0
+                best_dice = 0.0
                         
-                if rank == 0: logger.info(f"✅ Resume success! Auto-resuming from Epoch {args.start_epoch} (Best AJI was {best_aji:.4f}).")
+                if rank == 0: logger.info(f"✅ 预训练权重加载成功！开始 SG-OT 渐进式微调。")
             except Exception as e:
                 if rank == 0: logger.warning(f"⚠️ Resume failed: {e}")
 
