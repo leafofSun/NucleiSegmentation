@@ -230,7 +230,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 'attr_labels': attr_labels[i] if attr_labels is not None else None, 
             })
 
-        # 🔥 [修复] 强制开启 BF16 完美适配 RTX 30/40/50 系列，彻底解决 FP16 溢出导致 NaN 问题
         with autocast('cuda', enabled=args.use_amp, dtype=torch.bfloat16):
             outputs = model(model_input, multimask_output=True)
             loss_batch = 0
@@ -270,18 +269,19 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                     pred_hv = torch.tanh(pred_hv)
 
                     with torch.no_grad():
+                        inst_batch = batched_input.get("label_inst", None)
                         gt_hv_map_batch = batched_input.get("gt_hv_map", None)
+                        
+                        # 🔥 终极防弹校验：显式赋初值，彻底杜绝 UnboundLocalError
+                        gt_hv = None
+                        focus = None
+                        
                         if gt_hv_map_batch is not None:
                             gt_hv_full = gt_hv_map_batch[i].to(pred_hv.device)
                             if gt_hv_full.dim() == 3: gt_hv_full = gt_hv_full.unsqueeze(0)
-                            # 🔥 修复：如果 DataLoader 已经提供了非 512 的 HV Map，绝对不能用 bilinear 破坏边界
                             gt_hv = F.interpolate(gt_hv_full.float(), size=pred_hv.shape[-2:], mode='nearest')
                         else:
-                            inst_batch = batched_input.get("label_inst", None)
-                            if inst_batch is None: 
-                                gt_hv = None
-                            else:
-                                # 🔥 致命 Bug 1 修复：先用 nearest 无损缩放实例图，然后再去生成 HV Map！
+                            if inst_batch is not None: 
                                 inst_map = inst_batch[i].float()
                                 if inst_map.dim() == 2:
                                     inst_map = inst_map.unsqueeze(0).unsqueeze(0)
@@ -290,8 +290,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                                     
                                 inst_map_resized = F.interpolate(inst_map, size=pred_hv.shape[-2:], mode='nearest').squeeze().long()
                                 inst_map_resized[inst_map_resized == 255] = 0
-                                
-                                # 在纯净的 512x512 实例图上直接生成绝对准确的物理向量场，彻底避免插值污染
                                 gt_hv = generate_hv_map_from_inst(inst_map_resized).unsqueeze(0)
 
                         if gt_hv is not None:
@@ -301,7 +299,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                                 focus_full = (labels[i].squeeze(0) > 0).float().unsqueeze(0).unsqueeze(0)
                             focus = F.interpolate(focus_full, size=pred_hv.shape[-2:], mode='nearest').squeeze(1)
 
-                    if pred_hv is not None and gt_hv is not None:
+                    if gt_hv is not None and focus is not None:
                         focus_exp = focus.unsqueeze(1)
                         mse_map = F.mse_loss(pred_hv.float(), gt_hv.float(), reduction='none')
                         loss_hv_mse = (mse_map * focus_exp).sum() / (focus_exp.sum() * pred_hv.shape[1] + 1e-8)
@@ -313,7 +311,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 loss_c = out.get('consistency_loss', torch.tensor(0.0, device=loss_m.device))
                 loss_d = out.get('density_loss', torch.tensor(0.0, device=loss_m.device))
                 
-                # 终极 Loss 大一统融合 (HV weight 已在参数中提为 10.0)
+                # 终极 Loss 大一统融合
                 loss_i = (
                     args.mask_weight * loss_m
                     + args.heatmap_weight * loss_h
@@ -334,7 +332,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
 
         is_accumulating = (batch_idx + 1) % args.accumulation_steps != 0 and (batch_idx + 1) != len(train_loader)
 
-        # 🔥🔥🔥 终极全覆盖防死锁补丁：绑定计算图中所有可学习的参数，保证反向传播路径 100% 对称 🔥🔥🔥
+        # 防死锁补丁
         dummy_loss = 0.0
         for p in model.parameters():
             if p.requires_grad:
@@ -608,7 +606,8 @@ def main(args):
         del vanilla_sam
 
         if world_size > 1:
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+            # 🔥 极速 DDP 优化：因为有 dummy_loss 兜底，安全关闭 find_unused_parameters
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
         raw_model = model.module if world_size > 1 else model
 
         if args.encoder_adapter:

@@ -138,7 +138,7 @@ def tta_inference_8x_batch(model, image_rgb, organ_id, args):
             if hv_raw is not None:
                 if hv_raw.dim() == 3: hv_raw = hv_raw.unsqueeze(0)
                 hv = F.interpolate(hv_raw.float(), size=input_size, mode='bilinear', align_corners=False).squeeze(0)
-                hv = torch.tanh(hv * 0) 
+                # hv = torch.tanh(hv*0.6) 
             else:
                 hv = torch.zeros((2, input_size[0], input_size[1]), device=device)
 
