@@ -631,6 +631,8 @@ def main(args):
             add_to_params(raw_model.cnn_stage0, cnn_lr)
             add_to_params(raw_model.cnn_stage1, cnn_lr)
             add_to_params(raw_model.cnn_stage2, cnn_lr)
+            if hasattr(raw_model, 'global_asr_upsampler'):
+                add_to_params(raw_model.global_asr_upsampler, args.lr)
             
         if getattr(raw_model, 'use_coop_prompt', getattr(raw_model, 'use_coop', True)) and hasattr(raw_model, 'prompt_learner'):
             add_to_params(raw_model.prompt_learner, args.lr)

@@ -37,6 +37,71 @@ except ImportError:
     except ImportError:
         print("⚠️ Warning: prompt_generator.py not found.")
 
+
+# === 🔥 [新增核心模块] 全局高分辨率特征上采样器 (ASR-HV) ===
+class GlobalASRUpsampler(nn.Module):
+    """
+    专门负责将全局特征 (HV/Heatmap) 在 ASR 引导下恢复至原生高清分辨率 (512x512)
+    """
+    def __init__(self, embed_dim=256, use_asr=True):
+        super().__init__()
+        self.use_asr = use_asr
+        
+        # 输入: SAM特征(256) + 粗略HV(2) + 粗略HM(1) = 259
+        self.init_conv = nn.Conv2d(embed_dim + 2 + 1, 256, kernel_size=3, padding=1)
+        
+        # 第一层上采样: 64x64 -> 128x128 (融合 feat_s2: 512)
+        self.up1 = nn.ConvTranspose2d(256 + (512 if use_asr else 0), 128, kernel_size=2, stride=2)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(128 + (256 if use_asr else 0), 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 第二层上采样: 128x128 -> 256x256 (融合 feat_half: 64) -> 注：原resnet layer1是feat_s1(256)
+        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64 + (64 if use_asr else 0), 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 第三层上采样: 256x256 -> 512x512 (直接解压，不需要额外高频，已足够锐利)
+        self.up3 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 最终输出头: 直接输出 512x512 的物理场和热力图
+        self.hv_out = nn.Conv2d(32, 2, kernel_size=1)
+        self.hm_out = nn.Conv2d(32, 1, kernel_size=1)
+
+    def forward(self, sam_feat, hv_logits, hm_logits, feat_s2=None, feat_s1=None, feat_half=None):
+        x = torch.cat([sam_feat, hv_logits, hm_logits], dim=1)
+        x = self.init_conv(x)
+        
+        if self.use_asr and feat_s2 is not None:
+            x = torch.cat([x, feat_s2], dim=1)
+        x = self.up1(x) # 128x128
+        
+        if self.use_asr and feat_s1 is not None:
+            x = torch.cat([x, feat_s1], dim=1)
+        x = self.conv1(x)
+        
+        x = self.up2(x) # 256x256
+        
+        if self.use_asr and feat_half is not None:
+            x = torch.cat([x, feat_half], dim=1)
+        x = self.conv2(x)
+        
+        x = self.up3(x) # 512x512
+        x = self.conv3(x)
+        
+        return self.hv_out(x), self.hm_out(x)
+
+
 # === 基础 SAM 类 ===
 class Sam(nn.Module):
     mask_threshold: float = 0.0
@@ -285,7 +350,7 @@ class TextSam(Sam):
         for param in self.clip_model.parameters():
             param.requires_grad = False
 
-        # 2. Dual-Prompt Learner (Trainable; 关闭 CoOp 时不更新)
+        # 2. Dual-Prompt Learner
         self.prompt_learner = DualPromptLearner(
             self.clip_model,
             num_organs=num_organs,
@@ -296,19 +361,19 @@ class TextSam(Sam):
         for param in self.prompt_learner.parameters():
             param.requires_grad = use_coop
 
-        # 3. PNuRL (Trainable; 关闭时不更新)
+        # 3. PNuRL
         self.pnurl = PNuRL(embed_dim=embed_dim)
         for param in self.pnurl.parameters():
             param.requires_grad = use_pnurl
 
-        # 4. Auto-Prompt Generator (Trainable)
+        # 4. Auto-Prompt Generator
         self.prompt_generator = TextGuidedPointGenerator(
             embed_dim=embed_dim,
             text_dim=text_dim,
             num_heads=num_heads,
         )
 
-        # 🔥 DG-OT（关闭时不更新）或纯视觉独立 HV 头
+        # 🔥 DG-OT（DensityGuidedOT）或纯视觉独立 HV 头
         if self.use_sgot:
             print("🚀 Switched to Density-Guided Optimal Transport (DG-OT) for pure spatial alignment!")
             self.sg_ot = DensityGuidedOT(
@@ -319,21 +384,23 @@ class TextSam(Sam):
             for param in self.sg_ot.parameters():
                 param.requires_grad = True
         else:
-            # 🔥 纯视觉基线的独立 HV 预测头
             self.basic_hv_head = nn.Sequential(
                 nn.Conv2d(embed_dim, embed_dim // 2, kernel_size=3, padding=1),
                 nn.GELU(),
                 nn.Conv2d(embed_dim // 2, 2, kernel_size=1)
             )
 
-        # 🔥 引入纯视觉基线的高频特征提取器 (ResNet-50)
+        # 🔥 引入纯视觉基线的高频特征提取器 (ResNet-50) 及全局上采样
         if self.use_asr:
             resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
             self.cnn_stage0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
             self.cnn_stage1 = resnet.layer1 # 输出: [B, 256, H/4, W/4]
             self.cnn_stage2 = resnet.layer2 # 输出: [B, 512, H/8, W/8]
+            
+            # 🔥 注册全局高清上采样模块
+            self.global_asr_upsampler = GlobalASRUpsampler(embed_dim, use_asr=True)
 
-        #5. 冻结策略
+        # 5. 冻结策略
         for param in self.image_encoder.parameters():
             param.requires_grad = False
         for param in self.prompt_encoder.parameters():
@@ -352,40 +419,6 @@ class TextSam(Sam):
             f"DualLearner({'on' if use_coop else 'off'}), PNuRL({'on' if use_pnurl else 'off'}), "
             f"SG-OT({'on' if use_sgot else 'off'}), Generator."
         )
-        # === 5. 临时冻结策略 (Stage 1: 仅单独预热 DG-OT) ===
-        # print("⚠️ [Stage 1 策略生效]: 冻结 Mask Decoder 及所有主干参数，仅训练 DG-OT 模块！")
-
-        # # 1. 绝对冻结基础组件
-        # for param in self.image_encoder.parameters():
-        #     param.requires_grad = False
-        # for param in self.prompt_encoder.parameters():
-        #     param.requires_grad = False
-        # for param in self.mask_decoder.parameters():
-        #     param.requires_grad = False  # 🔥 之前是 True，现在改为 False
-
-        # # 2. 绝对冻结 Adapters
-        # adapter_count = 0
-        # for name, param in self.image_encoder.named_parameters():
-        #     if "Adapter" in name:
-        #         param.requires_grad = False # 🔥 之前是 True，现在改为 False
-        #         adapter_count += 1
-                
-        # # 3. 绝对冻结其他辅助分支 (PNuRL, CoOp, Generator, CNN)
-        # if hasattr(self, 'pnurl'):
-        #     for param in self.pnurl.parameters(): param.requires_grad = False
-        # if hasattr(self, 'prompt_learner'):
-        #     for param in self.prompt_learner.parameters(): param.requires_grad = False
-        # if hasattr(self, 'prompt_generator'):
-        #     for param in self.prompt_generator.parameters(): param.requires_grad = False
-        # if self.use_asr:
-        #     for param in self.cnn_stage0.parameters(): param.requires_grad = False
-        #     for param in self.cnn_stage1.parameters(): param.requires_grad = False
-        #     for param in self.cnn_stage2.parameters(): param.requires_grad = False
-
-        # # 4. 🔥 唯一放开 SG-OT (DG-OT) 的梯度
-        # if self.use_sgot:
-        #     for param in self.sg_ot.parameters():
-        #         param.requires_grad = True
 
     def forward(self, batched_input, multimask_output=False):
         # === Step 1: 基础图像编码 ===
@@ -394,12 +427,18 @@ class TextSam(Sam):
         device = image_embeddings.device
 
         # 🔥 同步提取 CNN 高频物理特征
-        feat_s1, feat_s2 = None, None
+        feat_half, feat_s1, feat_s2 = None, None, None
         if self.use_asr:
             with torch.autocast('cuda', enabled=True):
-                feat_s0 = self.cnn_stage0(input_images)
-                feat_s1 = self.cnn_stage1(feat_s0) # 1/4 尺度
-                feat_s2 = self.cnn_stage2(feat_s1) # 1/8 尺度
+                # 优雅地手动提取 1/2 尺度特征，绝对不破坏原本的 cnn_stage0
+                x_cnn = input_images
+                for i in range(3): # conv1, bn1, relu
+                    x_cnn = self.cnn_stage0[i](x_cnn)
+                feat_half = x_cnn # [B, 64, 256, 256]
+                
+                feat_s0 = self.cnn_stage0[3](feat_half) # maxpool -> [B, 64, 128, 128]
+                feat_s1 = self.cnn_stage1(feat_s0)      # [B, 256, 128, 128]
+                feat_s2 = self.cnn_stage2(feat_s1)      # [B, 512, 64, 64]
 
         if self.clip_model.visual.conv1.weight.device != device:
             self.clip_model = self.clip_model.to(device)
@@ -470,7 +509,7 @@ class TextSam(Sam):
         neg_feats = neg_feats / neg_feats.norm(dim=-1, keepdim=True)
         text_features = torch.stack([pos_feats, neg_feats], dim=1).float()
 
-        # === Step 5: SG-OT 或 纯视觉独立头 ===
+        # === Step 5: SG-OT (DG-OT) 或 纯视觉独立头 ===
         pos_text_feats = text_features[:, 0, :]
         B, C, H, W = refined_image_embeddings.shape
         sg_ot_density = density_map
@@ -481,18 +520,30 @@ class TextSam(Sam):
             if next(self.sg_ot.parameters()).device != device:
                 self.sg_ot = self.sg_ot.to(device)
             
-            # 🔥 彻底切断文本特征，仅使用图像特征和密度图进行空间对齐
-            fused_image_embeddings, heatmap_logits, hv_logits = self.sg_ot(
+            # 🔥 获取粗糙空间输出 (64x64)
+            fused_image_embeddings, heatmap_logits_coarse, hv_logits_coarse = self.sg_ot(
                 img_feat=refined_image_embeddings,
                 density_map=sg_ot_density,
             )
         else:
-            # 🔥 纯视觉通路：直接使用独立卷积头生成 HV 距离图
             fused_image_embeddings = refined_image_embeddings
-            heatmap_logits = self.prompt_generator(refined_image_embeddings, text_features)
-            hv_logits = self.basic_hv_head(refined_image_embeddings)
+            heatmap_logits_coarse = self.prompt_generator(refined_image_embeddings, text_features)
+            hv_logits_coarse = self.basic_hv_head(refined_image_embeddings)
 
-        density_map_proxy = torch.sigmoid(heatmap_logits[:, 0:1, :, :])
+        # 🔥🔥🔥 核心：开启原生 512x512 高分辨率场重构 🔥🔥🔥
+        if self.use_asr:
+            hv_logits_out, heatmap_logits_out = self.global_asr_upsampler(
+                fused_image_embeddings, 
+                hv_logits_coarse, 
+                heatmap_logits_coarse, 
+                feat_s2, feat_s1, feat_half
+            )
+        else:
+            hv_logits_out = hv_logits_coarse
+            heatmap_logits_out = heatmap_logits_coarse
+
+        # 密度图 Proxy 仍然基于 coarse 保持特征匹配
+        density_map_proxy = torch.sigmoid(heatmap_logits_coarse[:, 0:1, :, :])
 
         # 动态阈值计算
         size_logits = attr_logits.get('size', None)
@@ -504,8 +555,9 @@ class TextSam(Sam):
             batch_size = image_embeddings.shape[0]
             adaptive_thresh = torch.tensor(15.0, device=device).expand(batch_size)
 
+        # 提示点生成使用 coarse heatmap (省计算量且符合语义尺度)
         prompts_list = self.prompt_generator.generate_adaptive_prompts(
-            heatmap_logits,
+            heatmap_logits_coarse,
             threshold=0.3,
             k_neighbors=3,
             dense_dist_thresh=adaptive_thresh,
@@ -542,12 +594,13 @@ class TextSam(Sam):
                 if density_map_i is not None:
                     density_map_i = density_map_i + dummy_connection
                 
-                hv_out = hv_logits[i].unsqueeze(0) if hv_logits is not None else None
+                # 使用高分辨率输出
+                hv_out = hv_logits_out[i].unsqueeze(0) if hv_logits_out is not None else None
                 outputs.append({
                     "masks": (torch.zeros((1, 1, target_h, target_w), device=device, dtype=torch.float32) - 100.0) + dummy_connection,
                     "iou_predictions": torch.zeros((1, 1), device=device) + dummy_connection,
                     "low_res_logits": (torch.zeros((1, 1, 256, 256), device=device) - 100.0) + dummy_connection,
-                    "heatmap_logits": heatmap_logits[i].unsqueeze(0),
+                    "heatmap_logits": heatmap_logits_out[i].unsqueeze(0),
                     "hv_logits": hv_out,
                     "attr_logits": attr_logits,
                     "density_map": density_map_i,
@@ -567,7 +620,6 @@ class TextSam(Sam):
                     point_coords = point_coords[indices]
                     point_labels = point_labels[indices]
             else:
-                # 测试模式：绝对不截断！保留所有点，确保不会漏检任何一个细胞核
                 pass
 
             # 🔥🔥🔥 [核心显存优化: Chunked Decoding] 🔥🔥🔥
@@ -594,7 +646,6 @@ class TextSam(Sam):
                     sub_density_map = density_map_proxy[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
                 sub_text_feat = pos_text_feats[i].unsqueeze(0).expand(current_batch, -1)
 
-                # 🔥 扩展 CNN 侧向特征匹配 Chunk Size
                 sub_cnn_s1 = feat_s1[i].unsqueeze(0).expand(current_batch, -1, -1, -1) if self.use_asr else None
                 sub_cnn_s2 = feat_s2[i].unsqueeze(0).expand(current_batch, -1, -1, -1) if self.use_asr else None
 
@@ -604,7 +655,6 @@ class TextSam(Sam):
                     masks=None,
                 )
 
-                # 🔥 仅传入物理边缘，纯视觉 ASR
                 sub_mask, sub_iou = self.mask_decoder(
                     image_embeddings=sub_img_embed,
                     image_pe=self.prompt_encoder.get_dense_pe(),
@@ -629,12 +679,12 @@ class TextSam(Sam):
                 original_size=batched_input[i]["original_size"],
             )
             
-            hv_out = hv_logits[i].unsqueeze(0) if hv_logits is not None else None
+            hv_out = hv_logits_out[i].unsqueeze(0) if hv_logits_out is not None else None
             outputs.append({
                 "masks": mask_post,
                 "iou_predictions": merged_iou,
                 "low_res_logits": merged_logits,
-                "heatmap_logits": heatmap_logits[i].unsqueeze(0),
+                "heatmap_logits": heatmap_logits_out[i].unsqueeze(0),
                 "hv_logits": hv_out,
                 "attr_logits": attr_logits,
                 "density_map": density_map_i,
