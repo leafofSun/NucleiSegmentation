@@ -606,7 +606,7 @@ def main(args):
         del vanilla_sam
 
         if world_size > 1:
-            # 🔥 极速 DDP 优化：因为有 dummy_loss 兜底，安全关闭 find_unused_parameters
+            # DDP 优化：因为有 dummy_loss 兜底，安全关闭 find_unused_parameters
             model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
         raw_model = model.module if world_size > 1 else model
 
@@ -619,15 +619,15 @@ def main(args):
             grad_params = [p for p in module.parameters() if p.requires_grad]
             if grad_params:
                 params.append({'params': grad_params, 'lr': lr})
-
-        add_to_params(raw_model.mask_decoder, args.lr)
-        add_to_params(raw_model.prompt_generator, args.lr * 5)
+        vision_lr = args.lr*0.1
+        add_to_params(raw_model.mask_decoder, vision_lr)
+        add_to_params(raw_model.prompt_generator, vision_lr * 5)
         
         if hasattr(raw_model, 'basic_hv_head'):
             add_to_params(raw_model.basic_hv_head, args.lr)
             
         if getattr(raw_model, 'use_asr', False):
-            cnn_lr = args.lr * 0.1
+            cnn_lr = args.lr * 0.05
             add_to_params(raw_model.cnn_stage0, cnn_lr)
             add_to_params(raw_model.cnn_stage1, cnn_lr)
             add_to_params(raw_model.cnn_stage2, cnn_lr)

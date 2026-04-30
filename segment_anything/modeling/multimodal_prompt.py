@@ -1,5 +1,5 @@
 """
-多模态提示模块 - 集成CLIP用于SAM-Med2D的多模态提示
+多模态提示模块 - 集成 CONCH/CLIP 用于 SAM-Med2D 的多模态提示
 Modified from vqdang code at https://github.com/vqdang/hover_net/blob/conic/models/hovernet/net_desc.py
 """
 
@@ -9,12 +9,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# 优先尝试导入 CONCH
+try:
+    from conch.open_clip_custom import tokenize
+    CONCH_AVAILABLE = True
+except ImportError:
+    CONCH_AVAILABLE = False
+    print("Warning: CONCH package not available. Falling back to CLIP if available.")
+
+# 其次尝试导入原生 CLIP
 try:
     import clip
     CLIP_AVAILABLE = True
 except ImportError:
     CLIP_AVAILABLE = False
-    print("Warning: clip package not available. Install with: pip install git+https://github.com/openai/CLIP.git")
+    if not CONCH_AVAILABLE:
+        print("Warning: Neither CONCH nor CLIP package is available.")
 
 
 class AttentionPool2d(nn.Module):
@@ -54,13 +64,11 @@ class AttentionPool2d(nn.Module):
         return x.squeeze(0)
 
 
-# 移除Bottleneck类，因为不再需要ResNet结构
-
-
 class CLIPViT(nn.Module):
     """
-    基于SAM ImageEncoderViT的CLIP ViT特征提取器
-    直接使用SAM的ViT编码器，更强大且与SAM架构一致
+    基于SAM ImageEncoderViT的特征提取器。
+    在解耦架构中，这个提取器专门为宏观语义分类和全局 prompt 提供特征。
+    不要直接将其输出用于 ASR 的高频指导。
     """
     def __init__(
         self,
@@ -68,62 +76,38 @@ class CLIPViT(nn.Module):
         output_dim: int = 256,
         use_sam_encoder: bool = True,
     ):
-        """
-        Args:
-            image_encoder: SAM的ImageEncoderViT实例，如果为None则创建新的
-            output_dim: 输出特征维度
-            use_sam_encoder: 是否直接使用SAM的编码器
-        """
         super().__init__()
         self.use_sam_encoder = use_sam_encoder
         self.output_dim = output_dim
         
         if image_encoder is not None:
-            # 直接使用SAM的image_encoder
             self.image_encoder = image_encoder
             # 冻结SAM编码器参数（可选）
             for param in self.image_encoder.parameters():
                 param.requires_grad = False
         else:
-            # 如果没有提供，将在forward中从外部获取
             self.image_encoder = None
         
-        # 特征投影层（如果需要调整维度）
         self.feature_proj = None
 
     def set_image_encoder(self, image_encoder: nn.Module):
         """设置SAM的image_encoder"""
         self.image_encoder = image_encoder
-        # 冻结参数
         for param in self.image_encoder.parameters():
             param.requires_grad = False
 
     def forward(self, x: torch.Tensor, image_encoder: Optional[nn.Module] = None) -> torch.Tensor:
-        """
-        使用SAM的ViT编码器提取特征
-        
-        Args:
-            x: 输入图像 [B, 3, H, W]
-            image_encoder: 可选的SAM image_encoder（如果self.image_encoder为None）
-        
-        Returns:
-            features: ViT特征 [B, C, H', W']
-        """
-        # 优先使用传入的encoder，然后是self.image_encoder
         encoder = image_encoder if image_encoder is not None else self.image_encoder
         
         if encoder is None:
             raise ValueError("image_encoder must be provided either in __init__ or forward()")
         
-        # 使用SAM的ViT编码器提取特征
         with torch.set_grad_enabled(False):
             features = encoder(x)  # [B, out_chans, H', W']
         
-        # 如果需要调整维度
         if self.feature_proj is not None:
             features = self.feature_proj(features)
         elif features.shape[1] != self.output_dim:
-            # 动态创建投影层
             if self.feature_proj is None:
                 self.feature_proj = nn.Conv2d(
                     features.shape[1], 
@@ -136,7 +120,7 @@ class CLIPViT(nn.Module):
 
 
 class GlobalClassifier(nn.Module):
-    """全局分类器，用于多任务分类"""
+    """全局分类器，用于多任务分类 (例如器官分类)"""
     def __init__(self, in_c, out_c):
         super(GlobalClassifier, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -161,9 +145,9 @@ class GlobalFeatureFusion(nn.Module):
     """全局特征融合模块"""
     def __init__(self, in_c, out_c):
         super().__init__()
-        total_in_c = in_c[0] + in_c[1] + in_c[2] + in_c[3] + in_c[4]
+        total_in_c = sum(in_c[:-1])  # 修正: 动态计算前面所有通道的总和
         self.fc = nn.Sequential(
-            nn.Conv2d(total_in_c * in_c[5], out_c, 1, bias=False),
+            nn.Conv2d(total_in_c * in_c[-1], out_c, 1, bias=False), # 修正: in_c[-1] 通常是 embed_dim
             nn.ReLU(),
             nn.Conv2d(out_c, out_c, 1, bias=False),
             nn.ReLU()
@@ -206,8 +190,8 @@ class LabelAttention(nn.Module):
 class MultimodalPromptEncoder(nn.Module):
     """
     多模态提示编码器
-    集成CLIP文本提示和SAM ViT图像特征，生成用于SAM的提示嵌入
-    使用SAM的ImageEncoderViT而不是ResNet，更强大且架构一致
+    集成 CONCH/CLIP 文本提示和 SAM ViT 图像特征，生成用于 SAM 的提示嵌入。
+    注意：在解耦架构中，此模块专司“宏观语义引导”，不再为 ASR 提供高频细节。
     """
     def __init__(
         self,
@@ -216,22 +200,29 @@ class MultimodalPromptEncoder(nn.Module):
         use_global_features: bool = True,
         num_classes: int = 8,
         image_encoder: Optional[nn.Module] = None,
+        is_conch: bool = False # 新增标识，用于区分是否使用 CONCH
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.use_global_features = use_global_features
+        self.is_conch = is_conch
         
-        # CLIP模型初始化（仅用于文本编码）
-        if CLIP_AVAILABLE:
+        self.clip_model = None
+        self.tokenizer = None
+        
+        # 文本模型初始化 (支持 CONCH 和 CLIP)
+        if self.is_conch and CONCH_AVAILABLE:
+             # 注意：在实际应用中，由于 CONCH 加载需要 auth token，
+             # 建议从外部传入已经加载好的 conch_model 和 tokenizer，或者保留为 None 并通过外部注入
+             print("MultimodalPromptEncoder initialized in CONCH mode.")
+             pass # CONCH model 应该在顶层加载并通过 forward 或 setter 传入
+        elif CLIP_AVAILABLE and not self.is_conch:
             try:
-                # 加载CLIP模型用于文本编码
                 if clip_model_path:
                     self.clip_model, _ = clip.load("ViT-B/16", device="cpu", jit=False)
                     try:
-                        # 尝试加载预训练权重
                         checkpoint = torch.jit.load(clip_model_path, map_location='cpu')
                         state_dict = checkpoint.state_dict()
-                        # 只加载文本编码器部分
                         text_state_dict = {}
                         for k, v in state_dict.items():
                             if k.startswith('transformer.') or k.startswith('token_embedding') or k.startswith('text_projection'):
@@ -245,27 +236,24 @@ class MultimodalPromptEncoder(nn.Module):
             except Exception as e:
                 print(f"Warning: Failed to load CLIP model: {e}")
                 self.clip_model = None
-        else:
-            self.clip_model = None
         
-        # SAM ViT特征提取器（使用SAM的ImageEncoderViT）
+        # SAM ViT特征提取器
         self.clip_vit = CLIPViT(
             image_encoder=image_encoder,
             output_dim=embed_dim,
             use_sam_encoder=True,
         )
         
-        # 文本特征投影层
-        if self.clip_model is not None:
+        # 文本特征投影层 (CONCH 和 CLIP ViT-B/16 的文本特征维度默认都是 512)
+        if self.clip_model is not None and not self.is_conch:
             text_dim = self.clip_model.text_projection.shape[1] if hasattr(self.clip_model, 'text_projection') else 512
             self.text_proj = nn.Linear(text_dim, embed_dim)
         else:
-            # 如果没有CLIP，使用简单的文本嵌入
+            # 默认给 512 维的投影
             self.text_proj = nn.Linear(512, embed_dim)
         
-        # 全局特征相关模块（使用SAM ViT的embed_dim，通常是256）
+        # 全局特征相关模块
         if use_global_features:
-            # SAM ViT的输出维度是embed_dim（通常是256），而不是1024
             self.global_classifier = GlobalClassifier(embed_dim, [1, 3, 3, 6, 5])
             self.global_fc = GlobalFeatureFusion([1, 3, 3, 6, 5, embed_dim], embed_dim)
             self.label_attention = LabelAttention([embed_dim, embed_dim])
@@ -277,23 +265,40 @@ class MultimodalPromptEncoder(nn.Module):
             nn.Linear(embed_dim, embed_dim)
         )
         
-        # 图像特征投影层（用于维度对齐，当不使用全局特征时）
-        # 注意：实际维度会在forward中动态确定，这里先设为None
         self.image_proj = None
         self._image_feat_dim = None
 
-    def encode_text(self, text_prompts: List[str]) -> torch.Tensor:
-        """编码文本提示"""
-        if self.clip_model is not None and CLIP_AVAILABLE:
-            with torch.no_grad():
-                text_tokens = clip.tokenize(text_prompts).to(next(self.parameters()).device)
-                text_features = self.clip_model.encode_text(text_tokens)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    def encode_text(self, text_prompts: List[str], vlm_model=None, tokenizer=None) -> torch.Tensor:
+        """编码文本提示 (适配 CONCH 或 原生 CLIP)"""
+        
+        # 优先使用传入的模型
+        active_model = vlm_model if vlm_model is not None else self.clip_model
+        
+        if active_model is not None:
+            if self.is_conch and CONCH_AVAILABLE:
+                if tokenizer is None:
+                     raise ValueError("A tokenizer must be provided for CONCH text encoding.")
+                with torch.no_grad():
+                    # 1. 使用 CONCH 的 tokenize
+                    text_tokens = tokenize(texts=text_prompts, tokenizer=tokenizer).to(next(self.parameters()).device)
+                    # 2. 提取文本特征
+                    text_features = active_model.encode_text(text_tokens)
+                    # 3. CONCH 必需的归一化 (用于空间对齐)
+                    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            elif CLIP_AVAILABLE:
+                with torch.no_grad():
+                    # 使用原生 CLIP
+                    text_tokens = clip.tokenize(text_prompts).to(next(self.parameters()).device)
+                    text_features = active_model.encode_text(text_tokens)
+                    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            else:
+                 raise RuntimeError("VLM Model provided but neither CONCH nor CLIP is available.")
         else:
-            # 如果没有CLIP，使用随机特征（实际应用中应该使用其他文本编码器）
+            # Fallback：如果没有 VLM 模型，生成随机特征
             batch_size = len(text_prompts)
             text_features = torch.randn(batch_size, 512, device=next(self.parameters()).device)
         
+        # 投影到 256 维 (SAM 的嵌入维度)
         text_embed = self.text_proj(text_features)
         return text_embed
 
@@ -304,63 +309,44 @@ class MultimodalPromptEncoder(nn.Module):
         global_labels: Optional[torch.Tensor] = None,
         raw_image: Optional[torch.Tensor] = None,
         image_encoder: Optional[nn.Module] = None,
+        vlm_model: Optional[nn.Module] = None,     # 新增：允许从外部传入加载好的 CONCH 模型
+        vlm_tokenizer: Optional[Any] = None,       # 新增：允许从外部传入 CONCH 分词器
     ) -> torch.Tensor:
         """
         生成多模态提示嵌入
-        
-        Args:
-            image_features: 图像特征 [B, C, H, W]（来自SAM的image_encoder，已经是ViT特征）
-            text_prompts: 文本提示列表
-            global_labels: 全局标签 [B, num_classes]
-            raw_image: 原始图像 [B, 3, H, W]（可选，如果需要重新提取特征）
-            image_encoder: SAM的image_encoder（可选，如果需要在forward中提取特征）
-        
-        Returns:
-            prompt_embedding: 提示嵌入 [B, embed_dim]
         """
         batch_size = image_features.shape[0]
         device = image_features.device
         
-        # 如果提供了原始图像和编码器，可以使用CLIPViT重新提取特征
-        # 否则直接使用传入的image_features（已经是SAM ViT特征）
         if raw_image is not None and image_encoder is not None:
-            # 使用SAM ViT重新提取特征
             vit_features = self.clip_vit(raw_image, image_encoder=image_encoder)
         else:
-            # 直接使用传入的ViT特征
             vit_features = image_features
         
-        # 文本特征
-        if text_prompts is not None and self.clip_model is not None:
-            text_embed = self.encode_text(text_prompts)  # [B, embed_dim]
+        # 文本特征编码
+        if text_prompts is not None:
+            text_embed = self.encode_text(text_prompts, vlm_model=vlm_model, tokenizer=vlm_tokenizer)
         else:
             text_embed = torch.zeros(batch_size, self.embed_dim, device=device)
         
-        # 全局特征处理（使用SAM ViT特征）
+        # 全局特征处理 (宏观语义分类)
         if self.use_global_features and global_labels is not None:
-            # 使用全局分类器处理ViT特征
             global_logit = self.global_classifier(vit_features)
-            # 使用全局特征融合
             global_features = self.global_fc(global_logit, global_labels)
-            # 应用标签注意力
             _, enhanced_features = self.label_attention(vit_features, global_features)
-            # 池化图像特征
             image_pooled = F.adaptive_avg_pool2d(enhanced_features, 1).view(batch_size, -1)
         else:
-            # 简单池化ViT特征
             image_pooled = F.adaptive_avg_pool2d(vit_features, 1).view(batch_size, -1)
             feat_dim = image_pooled.shape[1]
             
             if feat_dim != self.embed_dim:
-                # 动态创建投影层（如果需要）
                 if self.image_proj is None or self._image_feat_dim != feat_dim:
                     self.image_proj = nn.Linear(feat_dim, self.embed_dim).to(device)
                     self._image_feat_dim = feat_dim
                 image_pooled = self.image_proj(image_pooled)
         
-        # 融合文本和图像特征
+        # 融合文本提示和全局图像特征
         combined = torch.cat([text_embed, image_pooled], dim=1)
         prompt_embedding = self.feature_fusion(combined)
         
         return prompt_embedding
-

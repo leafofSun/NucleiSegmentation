@@ -1,27 +1,27 @@
 """
-CoOp (Context Optimization) 模块 - 用于CLIP的提示学习
-简化版本，用于SAM-Med2D的多模态提示
+CoOp (Context Optimization) 模块 - 用于 CONCH 的提示学习
+适配 MahmoodLab/CONCH 大模型的多模态提示
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import List, Optional
 
 try:
-    import clip
-    CLIP_AVAILABLE = True
+    from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer, tokenize
+    CONCH_AVAILABLE = True
 except ImportError:
-    CLIP_AVAILABLE = False
-    print("Warning: clip package not available")
+    CONCH_AVAILABLE = False
+    print("Warning: CONCH package not available. Please install it via git+https://github.com/Mahmoodlab/CONCH.git")
 
 
 class PromptLearner(nn.Module):
-    """可学习的提示学习器"""
+    """可学习的提示学习器 (适配 CONCH)"""
     def __init__(
         self,
         classnames: List[str],
         clip_model,
+        tokenizer,
         n_ctx: int = 16,
         ctx_init: Optional[str] = None,
         dtype: torch.dtype = torch.float32,
@@ -29,16 +29,22 @@ class PromptLearner(nn.Module):
         super().__init__()
         n_cls = len(classnames)
         self.dtype = dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
+        
+        # 兼容 OpenCLIP 架构，获取 token_embedding
+        token_embedding_module = getattr(clip_model, 'token_embedding', None)
+        if token_embedding_module is None and hasattr(clip_model, 'text'):
+            token_embedding_module = clip_model.text.token_embedding
+            
+        ctx_dim = token_embedding_module.weight.shape[1]
         
         # 初始化上下文
         if ctx_init:
-            # 使用预定义的上下文
+            # 使用预定义的临床上下文 (建议针对 CONCH 使用病理学术语)
             ctx_init = ctx_init.replace("_", " ")
             n_ctx = len(ctx_init.split(" "))
-            prompt = clip.tokenize(ctx_init)
+            prompt = tokenize(texts=[ctx_init], tokenizer=tokenizer)
             with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
+                embedding = token_embedding_module(prompt).type(dtype)
             ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
             prompt_prefix = ctx_init
         else:
@@ -53,17 +59,17 @@ class PromptLearner(nn.Module):
         classnames = [name.replace("_", " ") for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
         
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        tokenized_prompts = tokenize(texts=prompts, tokenizer=tokenizer)
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+            embedding = token_embedding_module(tokenized_prompts).type(dtype)
         
-        # 这些token不会被优化
+        # 获取 SOS, CLS, EOS 等 token
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # 后续的 tokens
         
         self.n_cls = n_cls
         self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.tokenized_prompts = tokenized_prompts
 
     def forward(self):
         ctx = self.ctx
@@ -82,48 +88,22 @@ class PromptLearner(nn.Module):
         return prompts
 
 
-class CustomCLIP(nn.Module):
-    """自定义CLIP模型，支持可学习的提示"""
-    def __init__(
-        self,
-        classnames: List[str],
-        clip_model,
-        n_ctx: int = 16,
-        ctx_init: Optional[str] = None,
-    ):
-        super().__init__()
-        self.prompt_learner = PromptLearner(classnames, clip_model, n_ctx, ctx_init)
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
-        self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
-
-    def forward(self, image, image_features=None):
-        if image_features is None:
-            image_features = self.image_encoder(image.type(self.dtype))
-        
-        prompts = self.prompt_learner()
-        tokenized_prompts = self.tokenized_prompts
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-        
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        
-        logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
-        
-        return logits
-
-
 class TextEncoder(nn.Module):
-    """文本编码器"""
+    """文本编码器 (适配 OpenCLIP/CONCH 架构)"""
     def __init__(self, clip_model):
         super().__init__()
-        self.transformer = clip_model.transformer
-        self.positional_embedding = clip_model.positional_embedding
-        self.ln_final = clip_model.ln_final
-        self.text_projection = clip_model.text_projection
+        # 兼容处理：获取 OpenCLIP 的内部组件
+        if hasattr(clip_model, 'transformer'):
+            self.transformer = clip_model.transformer
+            self.positional_embedding = clip_model.positional_embedding
+            self.ln_final = clip_model.ln_final
+            self.text_projection = clip_model.text_projection
+        elif hasattr(clip_model, 'text'):
+            self.transformer = clip_model.text.transformer
+            self.positional_embedding = clip_model.text.positional_embedding
+            self.ln_final = clip_model.text.ln_final
+            self.text_projection = clip_model.text.text_projection
+            
         self.dtype = clip_model.dtype
 
     def forward(self, prompts, tokenized_prompts):
@@ -133,47 +113,77 @@ class TextEncoder(nn.Module):
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
         
-        # 取EOS token的特征
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-        
+        # 取 EOS token 的特征并进行投影
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)]
+        if self.text_projection is not None:
+            x = x @ self.text_projection
+            
         return x
 
 
-def load_clip_to_cpu(pretrained_path: Optional[str] = None):
-    """加载CLIP模型到CPU"""
-    if not CLIP_AVAILABLE:
-        raise ImportError("CLIP package not available")
+class CustomCLIP(nn.Module):
+    """自定义 CONCH 模型，支持可学习的提示"""
+    def __init__(
+        self,
+        classnames: List[str],
+        clip_model,
+        tokenizer,
+        n_ctx: int = 16,
+        ctx_init: Optional[str] = None,
+    ):
+        super().__init__()
+        self.clip_model = clip_model
+        self.prompt_learner = PromptLearner(classnames, clip_model, tokenizer, n_ctx, ctx_init)
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.text_encoder = TextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
+
+    def forward(self, image, image_features=None):
+        if image_features is None:
+            # 【核心修改】CONCH 必须开启 proj_contrast 和 normalize 来对齐特征空间
+            image_features = self.clip_model.encode_image(
+                image.type(self.dtype), 
+                proj_contrast=True, 
+                normalize=True
+            )
+        
+        prompts = self.prompt_learner()
+        tokenized_prompts = self.tokenized_prompts
+        text_features = self.text_encoder(prompts, tokenized_prompts)
+        
+        # 再次确保特征归一化 (对比学习的必要步骤)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        
+        logit_scale = self.logit_scale.exp()
+        logits = logit_scale * image_features @ text_features.t()
+        
+        return logits
+
+
+def load_conch_model(hf_auth_token: str, device="cuda"):
+    """
+    通过 HuggingFace Token 加载 CONCH 模型
+    """
+    if not CONCH_AVAILABLE:
+        raise ImportError("CONCH package is not installed.")
     
-    model, _ = clip.load("RN50", device="cpu", jit=False)
-    if pretrained_path:
-        try:
-            checkpoint = torch.jit.load(pretrained_path, map_location='cpu')
-            state_dict = checkpoint.state_dict()
-            # 处理权重加载
-            model.load_state_dict(state_dict, strict=False)
-        except Exception as e:
-            print(f"Warning: Failed to load pretrained weights: {e}")
+    print("Loading CONCH model from Hugging Face...")
+    model, preprocess = create_model_from_pretrained(
+        'conch_ViT-B-16', 
+        "hf_hub:MahmoodLab/conch", 
+        hf_auth_token=hf_auth_token
+    )
+    model = model.to(device)
+    model.eval()
     
-    return model
+    tokenizer = get_tokenizer()
+    
+    return model, preprocess, tokenizer
 
 
-# 为了兼容用户代码中的不同CoOp变体
-class CustomCLIP_global(CustomCLIP):
-    """用于全局特征的CLIP"""
-    pass
-
-
-class CustomCLIP_np(CustomCLIP):
-    """用于nuclei pixel的CLIP"""
-    pass
-
-
-class CustomCLIP_ns(CustomCLIP):
-    """用于nuclei semantic的CLIP"""
-    pass
-
-
-class CustomCLIP_nc(CustomCLIP):
-    """用于nuclei classification的CLIP"""
-    pass
-
+class CustomCLIP_global(CustomCLIP): pass
+class CustomCLIP_np(CustomCLIP): pass
+class CustomCLIP_ns(CustomCLIP): pass
+class CustomCLIP_nc(CustomCLIP): pass
