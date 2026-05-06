@@ -79,9 +79,12 @@ def parse_args():
 
     parser.add_argument("--use_pnurl", action='store_true', default=False, help="启用 PNuRL 属性预测分支")
     parser.add_argument("--use_coop", action='store_true', default=False, help="启用 CoOp 可学习文本提示")
-    parser.add_argument("--use_sgot", action='store_true', default=False, help="启用 SG-OT 语义引导最优传输模块")
+    parser.add_argument("--use_ot", action='store_true', default=False, help="启用 SG-OT 语义引导最优传输模块")
     parser.add_argument("--use_asr", action='store_true', default=False, help="启用 ASR 自适应谱细化上采样模块")
     parser.add_argument("--prompt_mode", type=str, default="dynamic", choices=["generic", "dynamic"], help="训练时的文本提示生成模式")
+
+    # 🔥 新增：两阶段控制参数
+    parser.add_argument("--phase", type=str, default="vision", choices=["vision", "semantic"], help="训练阶段：vision(先训纯视觉) 或 semantic(引入医学知识全面提升)")
 
     parser.add_argument("--sg_epsilon", type=float, default=0.05, help="Sinkhorn熵正则化系数")
     parser.add_argument("--sg_iters", type=int, default=3, help="Sinkhorn迭代次数")
@@ -272,7 +275,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                         inst_batch = batched_input.get("label_inst", None)
                         gt_hv_map_batch = batched_input.get("gt_hv_map", None)
                         
-                        # 🔥 终极防弹校验：显式赋初值，彻底杜绝 UnboundLocalError
                         gt_hv = None
                         focus = None
                         
@@ -311,15 +313,25 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 loss_c = out.get('consistency_loss', torch.tensor(0.0, device=loss_m.device))
                 loss_d = out.get('density_loss', torch.tensor(0.0, device=loss_m.device))
                 
-                # 终极 Loss 大一统融合
-                loss_i = (
-                    args.mask_weight * loss_m
-                    + args.heatmap_weight * loss_h
-                    + getattr(args, "hv_weight", 1.0) * loss_hv
-                    + getattr(args, "attr_weight", 0.1) * loss_attr
-                    + getattr(args, "consistency_weight", 0.1) * loss_c
-                    + getattr(args, "density_map_weight", 0.5) * loss_d
-                )
+                # 🔥 动态 Loss 路由
+                if args.phase == "vision":
+                    # 第一阶段：纯粹的物理视觉损失，屏蔽文本属性和一致性损失
+                    loss_i = (
+                        args.mask_weight * loss_m
+                        + args.heatmap_weight * loss_h
+                        + getattr(args, "hv_weight", 1.0) * loss_hv
+                        + getattr(args, "density_map_weight", 0.5) * loss_d
+                    )
+                else:
+                    # 第二阶段：全模态 Loss 共同作用
+                    loss_i = (
+                        args.mask_weight * loss_m
+                        + args.heatmap_weight * loss_h
+                        + getattr(args, "hv_weight", 1.0) * loss_hv
+                        + getattr(args, "attr_weight", 0.1) * loss_attr
+                        + getattr(args, "consistency_weight", 0.1) * loss_c
+                        + getattr(args, "density_map_weight", 0.5) * loss_d
+                    )
                 
                 loss_batch += loss_i
                 loss_m_accum += loss_m.item()
@@ -366,6 +378,8 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         heatmap_losses.append(mean_h)
         hv_losses.append(mean_hv)
         attr_losses.append(mean_a)
+        del batched_input, images, labels, model_input, outputs
+        del loss_i, loss_m, loss_h, loss_hv, loss_attr, final_loss
         
         if rank == 0 and writer is not None and batch_idx % 10 == 0:
             global_step = epoch * len(train_loader) + batch_idx
@@ -524,7 +538,7 @@ def main(args):
         model_save_dir = os.path.join(args.work_dir, "models", args.run_name)
         os.makedirs(run_log_dir, exist_ok=True); os.makedirs(text_log_dir, exist_ok=True); os.makedirs(model_save_dir, exist_ok=True)
         logger = get_logger(os.path.join(text_log_dir, f"{args.run_name}_{timestamp}.log"))
-        logger.info(f"🚀 [Start] MP-SAM Stable (Size: {args.image_size})")
+        logger.info(f"🚀 [Start] MP-SAM Stable (Size: {args.image_size}) - Phase: {args.phase}")
         logger.info(f"   GPUs: {world_size}, Batch/GPU: {args.batch_size}, Resume: {args.resume if args.resume else 'No'}")
         writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
     else: logger = None; writer = None
@@ -600,7 +614,7 @@ def main(args):
             sg_iters=args.sg_iters,
             use_pnurl=args.use_pnurl,
             use_coop=args.use_coop,
-            use_sgot=args.use_sgot,
+            use_ot=args.use_ot,
             use_asr=args.use_asr,
         ).to(args.device)
         del vanilla_sam
@@ -619,37 +633,64 @@ def main(args):
             grad_params = [p for p in module.parameters() if p.requires_grad]
             if grad_params:
                 params.append({'params': grad_params, 'lr': lr})
-        vision_lr = args.lr*0.1
-        add_to_params(raw_model.mask_decoder, vision_lr)
-        add_to_params(raw_model.prompt_generator, vision_lr * 5)
-        
-        if hasattr(raw_model, 'basic_hv_head'):
-            add_to_params(raw_model.basic_hv_head, args.lr)
+
+        # ==========================================
+        # 🔥 两阶段架构：梯度冻结与分发
+        # ==========================================
+        if args.phase == "vision":
+            if rank == 0: logger.info("🔥 [Phase 1: 视觉筑基] 冻结文本语义(CoOp/PNuRL)，全力微调视觉解码器、ASR与OT切割！")
             
-        if getattr(raw_model, 'use_asr', False):
-            cnn_lr = args.lr * 0.05
-            add_to_params(raw_model.cnn_stage0, cnn_lr)
-            add_to_params(raw_model.cnn_stage1, cnn_lr)
-            add_to_params(raw_model.cnn_stage2, cnn_lr)
-            if hasattr(raw_model, 'global_asr_upsampler'):
-                add_to_params(raw_model.global_asr_upsampler, args.lr)
+            # 1. 冻结语义层 (防止乱初始化的文本特征污染视觉)
+            if hasattr(raw_model, 'prompt_learner'):
+                for p in raw_model.prompt_learner.parameters(): p.requires_grad = False
+            if hasattr(raw_model, 'pnurl'):
+                for p in raw_model.pnurl.parameters(): p.requires_grad = False
+                
+            # 2. 全力训练视觉层
+            vision_lr = args.lr
+            add_to_params(raw_model.mask_decoder, vision_lr)
+            add_to_params(raw_model.prompt_generator, vision_lr)
             
-        if getattr(raw_model, 'use_coop_prompt', getattr(raw_model, 'use_coop', True)) and hasattr(raw_model, 'prompt_learner'):
-            add_to_params(raw_model.prompt_learner, args.lr)
+            if hasattr(raw_model, 'sg_ot'): 
+                add_to_params(raw_model.sg_ot, vision_lr)
+            if hasattr(raw_model, 'basic_hv_head'): 
+                add_to_params(raw_model.basic_hv_head, vision_lr)
+                
+            if getattr(raw_model, 'use_asr', False):
+                cnn_lr = args.lr * 0.1 # CNN 骨干用小一点的学习率
+                add_to_params(raw_model.cnn_stage0, cnn_lr)
+                add_to_params(raw_model.cnn_stage1, cnn_lr)
+                add_to_params(raw_model.cnn_stage2, cnn_lr)
+                if hasattr(raw_model, 'global_asr_upsampler'): 
+                    add_to_params(raw_model.global_asr_upsampler, vision_lr)
+                    
+            adapter_params = [p for n, p in raw_model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
+            if adapter_params: params.append({'params': adapter_params, 'lr': args.lr * 0.1})
+
+        elif args.phase == "semantic":
+            if rank == 0: logger.info("🚀 [Phase 2: 语义拔高] 视觉底盘已稳固，解冻医学知识库与 PNuRL，开启端到端精调！")
             
-        if getattr(raw_model, 'use_pnurl', True) and hasattr(raw_model, 'pnurl'):
-            add_to_params(raw_model.pnurl, args.lr)
-            
-        if getattr(raw_model, 'use_sgot', True) and hasattr(raw_model, 'sg_ot'):
-            add_to_params(raw_model.sg_ot, args.lr * 5)
-            
-        adapter_params = [p for n, p in raw_model.image_encoder.named_parameters() if "Adapter" in n and p.requires_grad]
-        if adapter_params: params.append({'params': adapter_params, 'lr': args.lr})
+            # 1. 视觉层保持较小学习率微调
+            vision_lr = args.lr * 0.1
+            add_to_params(raw_model.mask_decoder, vision_lr)
+            add_to_params(raw_model.prompt_generator, vision_lr)
+            if hasattr(raw_model, 'sg_ot'): add_to_params(raw_model.sg_ot, vision_lr)
+            if getattr(raw_model, 'use_asr', False):
+                if hasattr(raw_model, 'global_asr_upsampler'): add_to_params(raw_model.global_asr_upsampler, vision_lr)
+                
+            # 2. 全力激活语义层
+            if getattr(raw_model, 'use_coop', True) and hasattr(raw_model, 'prompt_learner'):
+                for p in raw_model.prompt_learner.parameters(): p.requires_grad = True
+                add_to_params(raw_model.prompt_learner, args.lr)
+            if getattr(raw_model, 'use_pnurl', True) and hasattr(raw_model, 'pnurl'):
+                for p in raw_model.pnurl.parameters(): p.requires_grad = True
+                add_to_params(raw_model.pnurl, args.lr)
 
         optimizer = optim.AdamW(params, weight_decay=args.weight_decay)
         criterion = FocalDiceloss_IoULoss(weight=20.0, iou_scale=1.0, ignore_index=255)
         
-        scaler = None 
+        # 🔥 开启真正的混合精度缩放，充分利用 RTX 5090 的 Tensor Core
+        scaler = GradScaler('cuda') if args.use_amp else None
         
         warmup_epochs = 15 
         warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)

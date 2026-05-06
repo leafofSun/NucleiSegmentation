@@ -8,7 +8,7 @@ from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
 from .pnurl import PNuRL
-from .sg_ot import DensityGuidedOT 
+from .ot import DensityGuidedOT 
 import sys
 import os
 from dotenv import load_dotenv
@@ -137,7 +137,7 @@ class DualPromptLearner(nn.Module):
             text_encoder = clip_model
 
         ctx_dim = text_encoder.ln_final.weight.shape[0] # 512
-        dtype = clip_model.dtype
+        dtype = next(clip_model.parameters()).dtype 
         self.dtype = dtype
 
         print(f"🧠 Init DualLearner: General({n_ctx_gen}) + Specific({n_ctx_spec}x{num_organs})")
@@ -278,14 +278,14 @@ class TextSam(Sam):
         sg_iters=3,
         use_pnurl: bool = True,
         use_coop: bool = True,
-        use_sgot: bool = True,
+        use_ot: bool = True,
         use_asr: bool = True,
     ):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
 
         self.use_pnurl = use_pnurl
         self.use_coop = use_coop
-        self.use_sgot = use_sgot
+        self.use_ot = use_ot
         self.use_asr = use_asr
 
         print(f"🚀 Initializing MP-SAM (Multi-granularity Prompt SAM) with CONCH...")
@@ -335,14 +335,14 @@ class TextSam(Sam):
         )
 
         # 5. 极简版 OT：仅使用物理密度进行切割
-        if self.use_sgot:
+        if self.use_ot:
             print("🚀 Switched to Density-Guided Optimal Transport (DG-OT) for pure spatial alignment!")
-            self.sg_ot = DensityGuidedOT(
+            self.ot = DensityGuidedOT(
                 img_dim=embed_dim,
                 epsilon=sg_epsilon,
                 sinkhorn_iters=sg_iters,
             )
-            for param in self.sg_ot.parameters():
+            for param in self.ot.parameters():
                 param.requires_grad = True
         else:
             self.basic_hv_head = nn.Sequential(
@@ -486,15 +486,15 @@ class TextSam(Sam):
         # === 极简 OT 处理 ===
         pos_text_feats = text_features[:, 0, :]
         B, C, H, W = refined_image_embeddings.shape
-        sg_ot_density = density_map if density_map is not None else torch.ones(B, 1, H, W, device=device) / (H * W)
+        ot_density = density_map if density_map is not None else torch.ones(B, 1, H, W, device=device) / (H * W)
 
-        if self.use_sgot:
-            if next(self.sg_ot.parameters()).device != device:
-                self.sg_ot = self.sg_ot.to(device)
+        if self.use_ot:
+            if next(self.ot.parameters()).device != device:
+                self.ot = self.ot.to(device)
             # 仅仅使用物理密度图和图像特征去切割，不混入文本语义
-            fused_image_embeddings, heatmap_logits_coarse, hv_logits_coarse = self.sg_ot(
+            fused_image_embeddings, heatmap_logits_coarse, hv_logits_coarse = self.ot(
                 img_feat=refined_image_embeddings,
-                density_map=sg_ot_density,
+                density_map=ot_density,
             )
         else:
             fused_image_embeddings = refined_image_embeddings
