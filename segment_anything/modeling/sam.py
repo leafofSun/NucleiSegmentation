@@ -11,9 +11,11 @@ from .pnurl import PNuRL
 from .sg_ot import DensityGuidedOT 
 import sys
 import os
+from dotenv import load_dotenv
+
 
 try:
-    from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer, tokenize
+    from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer
 except ImportError:
     print("⚠️ Warning: CONCH not found. Please install it.")
 
@@ -23,7 +25,8 @@ except ImportError:
     sys.path.append(os.path.join(os.path.dirname(__file__), "../../.."))
     from prompt_generator import TextGuidedPointGenerator
 
-
+load_dotenv()
+hf_auth_token = os.environ.get("HF_TOKEN")
 class GlobalASRUpsampler(nn.Module):
     """
     全局高分辨率特征上采样器 (ASR-HV)
@@ -161,6 +164,8 @@ class DualPromptLearner(nn.Module):
 
     def forward(self, organ_indices, tokenized_prompts, density_features: Optional[List[torch.Tensor]] = None):
         batch_size = len(organ_indices)
+        
+        # tokenized_prompts 直接是 input_ids (Tensor)，传给 Embedding 是安全的
         embedding = self.clip_token_embedding(tokenized_prompts).type(self.dtype)
         
         ctx_gen = self.ctx_general.unsqueeze(0).expand(batch_size, -1, -1)
@@ -286,11 +291,15 @@ class TextSam(Sam):
         print(f"🚀 Initializing MP-SAM (Multi-granularity Prompt SAM) with CONCH...")
         
         # 1. 加载 CONCH (Freeze)
-        # ⚠️ 务必在此处填入你的 HF token!
+        # 🔥 关键修复：从环境变量读取 Token，杜绝 GitHub Push Protection 报错！
+        hf_auth_token = os.environ.get("HF_TOKEN")
+        if not hf_auth_token:
+            print("⚠️ Warning: HF_TOKEN environment variable is not set. Model load may fail if not cached.")
+            
         self.clip_model, _ = create_model_from_pretrained(
             'conch_ViT-B-16', 
             "hf_hub:MahmoodLab/conch", 
-            hf_auth_token="" 
+            hf_auth_token=hf_auth_token 
         )
         self.tokenizer = get_tokenizer()
         for param in self.clip_model.parameters():
@@ -307,8 +316,14 @@ class TextSam(Sam):
         for param in self.prompt_learner.parameters():
             param.requires_grad = use_coop
 
-        # 3. PNuRL (解耦版，接收外部 text_embed，text_dim=512)
-        self.pnurl = PNuRL(embed_dim=embed_dim, text_dim=512)
+        # 3. PNuRL (解耦版，接收外部 text_embed)
+        # 🔥 关键修复：修正 PNuRL 参数签名，与新版 pnurl.py 对齐
+        self.pnurl = PNuRL(
+            embed_dim=embed_dim, 
+            text_dim=512,
+            num_classes_per_attr=[2, 3, 2, 3, 3], # 确保与实际的 5 个属性类别数一致
+            attr_loss_weight=1.0
+        )
         for param in self.pnurl.parameters():
             param.requires_grad = use_pnurl
 
@@ -382,7 +397,8 @@ class TextSam(Sam):
         base_texts = [] 
         for x in batched_input:
             organ_indices.append(x.get("organ_id", 0)) 
-            attribute_texts.append(x.get("attribute_text", "")) 
+            # 确保空值回退为 "Cell nuclei"，防止 Tokenizer 解析空字符串异常
+            attribute_texts.append(x.get("attribute_text", "Cell nuclei")) 
             base_texts.append(x.get("text_prompt", "Cell nuclei"))
         organ_indices = torch.tensor(organ_indices).to(device)
 
@@ -406,7 +422,16 @@ class TextSam(Sam):
             
             # 1. 外部使用 CONCH 提取高质量文本语义
             with torch.no_grad():
-                attr_tokens = tokenize(texts=attribute_texts, tokenizer=self.tokenizer).to(device)
+                # 🔥 关键修复：直接使用 tokenizer 并提取 "input_ids"
+                attr_tokenized = self.tokenizer(
+                    attribute_texts, 
+                    padding="max_length", 
+                    max_length=77, 
+                    truncation=True, 
+                    return_tensors="pt"
+                )
+                attr_tokens = attr_tokenized["input_ids"].to(device)
+                
                 attr_text_embed = self.clip_model.encode_text(attr_tokens)
                 attr_text_embed = attr_text_embed / attr_text_embed.norm(dim=-1, keepdim=True)
                 
@@ -425,8 +450,24 @@ class TextSam(Sam):
             density_map = None
 
         # === CoOp 可学习提示 ===
-        pos_tokens = tokenize(texts=base_texts, tokenizer=self.tokenizer).to(device)
-        neg_tokens = tokenize(texts=["Background"] * len(base_texts), tokenizer=self.tokenizer).to(device)
+        # 🔥 关键修复：直接使用 tokenizer 并提取 "input_ids" 给 CoOp 
+        pos_tokenized = self.tokenizer(
+            base_texts, 
+            padding="max_length", 
+            max_length=77, 
+            truncation=True, 
+            return_tensors="pt"
+        )
+        pos_tokens = pos_tokenized["input_ids"].to(device)
+        
+        neg_tokenized = self.tokenizer(
+            ["Background"] * len(base_texts), 
+            padding="max_length", 
+            max_length=77, 
+            truncation=True, 
+            return_tensors="pt"
+        )
+        neg_tokens = neg_tokenized["input_ids"].to(device)
         
         if self.use_coop:
             if next(self.prompt_learner.parameters()).device != device:

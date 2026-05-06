@@ -394,6 +394,7 @@ class UniversalDataset(data.Dataset):
         if self.mode == 'train' and random.random() < 0.2:
             organ_id = 20
 
+        # 🔥 核心修复：确保 "attribute_text" 存在并传递高质量描述
         return {
             "image": img_tensor,
             "label": label_tensor,
@@ -401,7 +402,8 @@ class UniversalDataset(data.Dataset):
             "gt_heatmap": torch.from_numpy(gt_heatmap).float().unsqueeze(0),
             "gt_hv_map": torch.from_numpy(gt_hv_map).float(),
             "organ_id": organ_id,
-            "text_prompt": text_prompt,
+            "text_prompt": text_prompt, 
+            "attribute_text": base_prompt,  # <--- Added this line
             "attr_labels": torch.tensor(analysis['labels']).long(),
             "name": os.path.basename(item['img_path']),
             "original_size": (self.image_size, self.image_size),

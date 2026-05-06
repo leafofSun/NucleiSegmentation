@@ -5,11 +5,13 @@ from PIL import Image
 from tqdm import tqdm
 from collections import defaultdict
 from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer
+from dotenv import load_dotenv
 
+load_dotenv()
 # ==========================================
 # 1. 基础配置
 # ==========================================
-HF_TOKEN = ""  # ⚠️ 填入你的 Token
+HF_TOKEN = os.environ.get("HF_TOKEN")
 TEST_DIR = "/root/shared-nvme/NuSeg/data/PanNuke/test" # 你的测试集图片路径
 JSON_PATH = "/root/shared-nvme/NuSeg/data/PanNuke/medical_knowledge.json" # 你的大 JSON 文件路径
 device = "cuda" if torch.cuda.is_available() else "cpu"
