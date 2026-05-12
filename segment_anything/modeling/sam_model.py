@@ -68,9 +68,8 @@ class Sam(nn.Module):
                 # 默认使用 256（SAM 的标准输出维度）
                 feat_dim = 256
             self.pnurl = PNuRL(
-                feat_dim=feat_dim,
-                embed_dim=256,
-                clip_model_path=pnurl_config.get('clip_model_path', None),
+                embed_dim=feat_dim,  # 视觉特征的维度
+                text_dim=256,        # 外部传入的文本特征维度
                 num_classes_per_attr=pnurl_config.get('num_classes_per_attr', [3, 5, 4, 3, 3]),
                 attr_loss_weight=pnurl_config.get('attr_loss_weight', 1.0),
             )
@@ -122,7 +121,10 @@ class Sam(nn.Module):
         # PNuRL 处理（如果启用）：使用属性提示词对ViT特征进行加权
         pnurl_loss = None
         pnurl_context = None
+         # ======= [新增] 快速验证魔法：伪造频域解耦的 Text Prompt =======
+        morph_feat = None
         if self.use_pnurl and self.pnurl is not None:
+            morph_feat = pnurl_context.detach() + torch.randn_like(pnurl_context) * 0.1
             attribute_prompts = batched_input.get("attribute_prompts", None)
             attribute_labels = batched_input.get("attribute_labels", None)
             return_loss = self.training and attribute_labels is not None
@@ -188,6 +190,7 @@ class Sam(nn.Module):
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             multimask_output=multimask_output,
+            txt_mor_feat=morph_feat,
         )
 
         masks = self.postprocess_masks(

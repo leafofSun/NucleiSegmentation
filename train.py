@@ -674,6 +674,16 @@ def main(args):
             vision_lr = args.lr * 0.1
             add_to_params(raw_model.mask_decoder, vision_lr)
             add_to_params(raw_model.prompt_generator, vision_lr)
+            # --- [修改开始] 将新加的注意力层和预训练层分开 ---
+            decoder_pretrained_params = []
+            decoder_new_params =[]
+            for name, param in raw_model.mask_decoder.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if "text_to_cnn_attn" in name:
+                    decoder_new_params.append(param)
+                else:
+                    decoder_pretrained_params.append(param)
             if hasattr(raw_model, 'sg_ot'): add_to_params(raw_model.sg_ot, vision_lr)
             if getattr(raw_model, 'use_asr', False):
                 if hasattr(raw_model, 'global_asr_upsampler'): add_to_params(raw_model.global_asr_upsampler, vision_lr)

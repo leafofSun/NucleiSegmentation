@@ -23,45 +23,50 @@ class ASRBlock(nn.Module):
             activation(),
         )
         
+        # ======= [新增] 用于接收 形态学文本提示 (Morphology Prompt) =======
+        self.text_to_cnn_attn = nn.Sequential(
+            nn.Linear(256, out_dim),
+            nn.Sigmoid() # 生成 0~1 的权重
+        )
+        # =================================================================
+        
         # 2. 真实物理边缘流 (ResNet Skip Connection)
         self.has_cnn = cnn_dim is not None
         if self.has_cnn:
-            # 压缩 CNN 通道
             self.cnn_proj = nn.Sequential(
                 nn.Conv2d(cnn_dim, out_dim, kernel_size=1, bias=False),
                 LayerNorm2d(out_dim),
                 activation(),
             )
-            # 特征融合
             self.cnn_fusion = nn.Sequential(
                 nn.Conv2d(out_dim * 2, out_dim, kernel_size=3, padding=1, bias=False),
                 LayerNorm2d(out_dim),
                 activation()
             )
-            # 🔧 [零初始化]: 确保初期 CNN 增量为 0，防止破坏预训练流形，平滑过渡
+            # 🔧 零初始化
             nn.init.zeros_(self.cnn_fusion[0].weight)
-            
-            # 🔥 [防梯度爆炸优化]: 引入可学习的 Residual Scale 标量，初始化为 0.1
             self.residual_scale = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, x, cnn_feat=None):
+    def forward(self, x, cnn_feat=None, txt_mor_feat=None):
         # 1. 基础语义上采样
         x_up = self.structure_upsample(x)
+        
+        # ======= [修改] 确保必定执行的高频特征文本调制 =======
+        if txt_mor_feat is not None:
+            # txt_mor_feat: [B, 256] -> weight: [B, out_dim, 1, 1]
+            attn_weight = self.text_to_cnn_attn(txt_mor_feat).unsqueeze(-1).unsqueeze(-1)
+            x_up = x_up * attn_weight  # 直接提纯上采样的高频解码特征！
+        # =========================================================
         
         # 2. 注入真实物理边缘 (ResNet)
         if self.has_cnn and cnn_feat is not None:
             c = self.cnn_proj(cnn_feat)
-            # 空间尺寸对齐
             if c.shape[-2:] != x_up.shape[-2:]:
                 c = F.interpolate(c, size=x_up.shape[-2:], mode='bilinear', align_corners=False)
             
             # 拼接并计算真实的边缘增量
             detail = self.cnn_fusion(torch.cat([x_up, c], dim=1))
-            
-            # 🔥 获取动态缩放因子，并确保其设备和数据类型一致
             scale = self.residual_scale.to(x_up.device, dtype=x_up.dtype)
-            
-            # 残差融合 (引入动态缩放保护)
             x_up = x_up + (detail * scale)
             
         return x_up
@@ -91,11 +96,9 @@ class MaskDecoder(nn.Module):
         self.use_asr = use_asr
         
         if self.use_asr:
-            # 第一层上采样：1/16 -> 1/8 尺度，接收 ResNet Stage 2 (512通道)
             self.asr_upscale_1 = ASRBlock(
                 transformer_dim, transformer_dim // 4, cnn_dim=512, activation=activation
             )
-            # 第二层上采样：1/8 -> 1/4 尺度，接收 ResNet Stage 1 (256通道)
             self.asr_upscale_2 = ASRBlock(
                 transformer_dim // 4, transformer_dim // 8, cnn_dim=256, activation=activation
             )
@@ -126,9 +129,9 @@ class MaskDecoder(nn.Module):
         sparse_prompt_embeddings: torch.Tensor,
         dense_prompt_embeddings: torch.Tensor,
         multimask_output: bool,
-        cnn_feat_s1: torch.Tensor = None,  # 🔥 ResNet 1/4 特征
-        cnn_feat_s2: torch.Tensor = None,  # 🔥 ResNet 1/8 特征
-        # (屏蔽了所有与文本/密度相关的入参)
+        cnn_feat_s1: torch.Tensor = None,  
+        cnn_feat_s2: torch.Tensor = None,  
+        txt_mor_feat: torch.Tensor = None,  # 🔥 新增
         **kwargs 
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -139,6 +142,7 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             cnn_feat_s1=cnn_feat_s1,
             cnn_feat_s2=cnn_feat_s2,
+            txt_mor_feat=txt_mor_feat,
         )
 
         if multimask_output:
@@ -158,6 +162,7 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         cnn_feat_s1: torch.Tensor = None,
         cnn_feat_s2: torch.Tensor = None,
+        txt_mor_feat: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
         output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
@@ -174,14 +179,13 @@ class MaskDecoder(nn.Module):
 
         src = src.transpose(1, 2).view(b, c, h, w)
         
-        # 🔥 [核心修改] 仅注入物理边缘，剥离文本先验
         if self.use_asr:
-            upscaled_embedding = self.asr_upscale_1(src, cnn_feat=cnn_feat_s2)
-            upscaled_embedding = self.asr_upscale_2(upscaled_embedding, cnn_feat=cnn_feat_s1)
+            upscaled_embedding = self.asr_upscale_1(src, cnn_feat=cnn_feat_s2, txt_mor_feat=txt_mor_feat)
+            upscaled_embedding = self.asr_upscale_2(upscaled_embedding, cnn_feat=cnn_feat_s1, txt_mor_feat=txt_mor_feat)
         else:
             upscaled_embedding = self.output_upscaling(src)
 
-        hyper_in_list: List[torch.Tensor] = []
+        hyper_in_list: List[torch.Tensor] =[]
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
         hyper_in = torch.stack(hyper_in_list, dim=1)
