@@ -7,12 +7,42 @@ from torch.nn import functional as F
 from typing import List, Tuple, Type
 from .common import LayerNorm2d
 
+class MorphologyEncoder(nn.Module):
+    """
+    🔴 形态学提示编码器 (微观高频流)
+    接收已融合的形态特征 (Shape+Size)，逐层派发给 CNN 高频特征流
+    """
+    def __init__(self, text_dim=256, cnn_dims=[512, 256]):
+        super().__init__()
+        # 1. 进一步潜空间映射提纯 (输入已经是融合后的 256 维 txt_mor_feat)
+        self.joint_fusion = nn.Sequential(
+            nn.Linear(text_dim, text_dim), 
+            nn.LayerNorm(text_dim),
+            nn.GELU(),
+            nn.Linear(text_dim, text_dim)
+        )
+        
+        # 2. 为不同层级的 CNN 生成专属的引导向量
+        self.scale_projections = nn.ModuleList([
+            nn.Linear(text_dim, dim) for dim in cnn_dims
+        ])
+
+    def forward(self, morph_feat):
+        # 联合约束：对输入的形态学特征进行自适应提纯
+        joint_morph = self.joint_fusion(morph_feat)
+        
+        # 逐层派发：生成对应深浅层级的引导向量
+        layer_prompts = [proj(joint_morph) for proj in self.scale_projections]
+        
+        # 返回 [morph_prompt_s1 (512维), morph_prompt_s2 (256维)]
+        return layer_prompts
+
+
 class ASRBlock(nn.Module):
     """
-    🔥 [纯视觉消融版] ASR上采样模块 (CNN + ViT Hybrid)
-    仅融合两种信息：
-    1. x_struct: 来自 SAM 的低频全局语义特征
-    2. cnn_feat: 来自 ResNet 的高频物理边缘特征 (Skip Connection)
+    🔥 [频域解耦版] ASR上采样模块 (CNN + ViT Hybrid)
+    1. x_struct: 接收低频属性 (Color, Arrange, Density) 调制的全局语义
+    2. cnn_feat: 接收高频形态学 (Shape, Size) 提纯的物理边缘
     """
     def __init__(self, in_dim, out_dim, cnn_dim=None, activation: Type[nn.Module] = nn.GELU):
         super().__init__()
@@ -23,16 +53,21 @@ class ASRBlock(nn.Module):
             activation(),
         )
         
-        # ======= [新增] 用于接收 形态学文本提示 (Morphology Prompt) =======
-        self.text_to_cnn_attn = nn.Sequential(
+        # 🟢 宏观低频属性提示 (Attribute Prompt)
+        self.attr_attn = nn.Sequential(
             nn.Linear(256, out_dim),
-            nn.Sigmoid() # 生成 0~1 的权重
+            nn.Sigmoid() # 生成 0~1 的权重，调制全局感受野
         )
-        # =================================================================
         
         # 2. 真实物理边缘流 (ResNet Skip Connection)
         self.has_cnn = cnn_dim is not None
         if self.has_cnn:
+            # 🔴 微观高频形态提示 (Morphology Prompt)
+            self.morphology_attn = nn.Sequential(
+                nn.Linear(cnn_dim, cnn_dim),
+                nn.Sigmoid() # 生成 0~1 的权重，裁剪/提纯CNN边缘
+            )
+            
             self.cnn_proj = nn.Sequential(
                 nn.Conv2d(cnn_dim, out_dim, kernel_size=1, bias=False),
                 LayerNorm2d(out_dim),
@@ -43,23 +78,26 @@ class ASRBlock(nn.Module):
                 LayerNorm2d(out_dim),
                 activation()
             )
-            # 🔧 零初始化
+            # 🔧 零初始化，确保残差结构的稳定性
             nn.init.zeros_(self.cnn_fusion[0].weight)
             self.residual_scale = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, x, cnn_feat=None, txt_mor_feat=None):
-        # 1. 基础语义上采样
+    def forward(self, x, cnn_feat=None, attr_prompt=None, layer_morph_prompt=None):
+        # 1. 基础语义上采样 (低频)
         x_up = self.structure_upsample(x)
         
-        # ======= [修改] 确保必定执行的高频特征文本调制 =======
-        if txt_mor_feat is not None:
-            # txt_mor_feat: [B, 256] -> weight: [B, out_dim, 1, 1]
-            attn_weight = self.text_to_cnn_attn(txt_mor_feat).unsqueeze(-1).unsqueeze(-1)
-            x_up = x_up * attn_weight  # 直接提纯上采样的高频解码特征！
-        # =========================================================
+        # 🟢 Attribute Prompt 调制低频特征 (感知环境/材质)
+        if attr_prompt is not None:
+            attn_weight_low = self.attr_attn(attr_prompt).unsqueeze(-1).unsqueeze(-1)
+            x_up = x_up * attn_weight_low  
         
-        # 2. 注入真实物理边缘 (ResNet)
+        # 2. 注入真实物理边缘 (高频)
         if self.has_cnn and cnn_feat is not None:
+            # 🔴 Morphology Prompt 调制高频特征 (裁剪指定形状和大小的边缘)
+            if layer_morph_prompt is not None:
+                attn_weight_high = self.morphology_attn(layer_morph_prompt).unsqueeze(-1).unsqueeze(-1)
+                cnn_feat = cnn_feat * attn_weight_high
+                
             c = self.cnn_proj(cnn_feat)
             if c.shape[-2:] != x_up.shape[-2:]:
                 c = F.interpolate(c, size=x_up.shape[-2:], mode='bilinear', align_corners=False)
@@ -102,6 +140,8 @@ class MaskDecoder(nn.Module):
             self.asr_upscale_2 = ASRBlock(
                 transformer_dim // 4, transformer_dim // 8, cnn_dim=256, activation=activation
             )
+            # 🔴 初始化形态学编码器 (cnn_feat_s2 对应 512 维, cnn_feat_s1 对应 256 维)
+            self.morph_encoder = MorphologyEncoder(text_dim=256, cnn_dims=[512, 256])
         else:
             self.output_upscaling = nn.Sequential(
                 nn.ConvTranspose2d(transformer_dim, transformer_dim // 4, kernel_size=2, stride=2),
@@ -131,7 +171,8 @@ class MaskDecoder(nn.Module):
         multimask_output: bool,
         cnn_feat_s1: torch.Tensor = None,  
         cnn_feat_s2: torch.Tensor = None,  
-        txt_mor_feat: torch.Tensor = None,  # 🔥 新增
+        attr_prompt: torch.Tensor = None,   # 🟢 低频宏观特征 (Color, Arrange, Density)
+        morph_feat: torch.Tensor = None,    # 🔴 高频形态特征 (Shape + Size，即 PNuRL 的 txt_mor_feat)
         **kwargs 
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -142,7 +183,8 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             cnn_feat_s1=cnn_feat_s1,
             cnn_feat_s2=cnn_feat_s2,
-            txt_mor_feat=txt_mor_feat,
+            attr_prompt=attr_prompt,
+            morph_feat=morph_feat,
         )
 
         if multimask_output:
@@ -162,7 +204,8 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         cnn_feat_s1: torch.Tensor = None,
         cnn_feat_s2: torch.Tensor = None,
-        txt_mor_feat: torch.Tensor = None,
+        attr_prompt: torch.Tensor = None,
+        morph_feat: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
         output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
@@ -180,12 +223,29 @@ class MaskDecoder(nn.Module):
         src = src.transpose(1, 2).view(b, c, h, w)
         
         if self.use_asr:
-            upscaled_embedding = self.asr_upscale_1(src, cnn_feat=cnn_feat_s2, txt_mor_feat=txt_mor_feat)
-            upscaled_embedding = self.asr_upscale_2(upscaled_embedding, cnn_feat=cnn_feat_s1, txt_mor_feat=txt_mor_feat)
+            # 🔴 构建逐层的形态学高频引导
+            layer_morph_prompts = [None, None]
+            if morph_feat is not None:
+                layer_morph_prompts = self.morph_encoder(morph_feat) # 传入融合的形态特征
+                
+            # layer_morph_prompts[0] 对应 512维, 用于 cnn_feat_s2
+            upscaled_embedding = self.asr_upscale_1(
+                src, 
+                cnn_feat=cnn_feat_s2, 
+                attr_prompt=attr_prompt, 
+                layer_morph_prompt=layer_morph_prompts[0]
+            )
+            # layer_morph_prompts[1] 对应 256维, 用于 cnn_feat_s1
+            upscaled_embedding = self.asr_upscale_2(
+                upscaled_embedding, 
+                cnn_feat=cnn_feat_s1, 
+                attr_prompt=attr_prompt, 
+                layer_morph_prompt=layer_morph_prompts[1]
+            )
         else:
             upscaled_embedding = self.output_upscaling(src)
 
-        hyper_in_list: List[torch.Tensor] =[]
+        hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
         hyper_in = torch.stack(hyper_in_list, dim=1)

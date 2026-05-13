@@ -299,7 +299,7 @@ def process_chunk(worker_id, image_files_chunk, args):
         image_encoder=vanilla_sam.image_encoder, prompt_encoder=vanilla_sam.prompt_encoder,
         mask_decoder=vanilla_sam.mask_decoder, clip_model_name=args.clip_model,
         num_organs=args.num_organs, num_heads=args.num_heads, sg_epsilon=args.sg_epsilon, sg_iters=args.sg_iters,
-        use_pnurl=args.use_pnurl, use_coop=args.use_coop, use_sgot=args.use_sgot, use_asr=args.use_asr
+        use_pnurl=args.use_pnurl, use_coop=args.use_coop, use_ot=args.use_ot, use_asr=args.use_asr
     ).to(device)
     
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -371,7 +371,7 @@ def parse_args():
     parser.add_argument("--encoder_adapter", action='store_true', default=True)
     parser.add_argument("--use_pnurl", action='store_true', default=False)
     parser.add_argument("--use_coop", action='store_true', default=False)
-    parser.add_argument("--use_sgot", action='store_true', default=False)
+    parser.add_argument("--use_ot", action='store_true', default=False)
     parser.add_argument("--use_asr", action='store_true', default=False)
     
     parser.add_argument("--prob_thresh", type=float, default=0.40)

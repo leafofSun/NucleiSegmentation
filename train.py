@@ -79,7 +79,7 @@ def parse_args():
 
     parser.add_argument("--use_pnurl", action='store_true', default=False, help="启用 PNuRL 属性预测分支")
     parser.add_argument("--use_coop", action='store_true', default=False, help="启用 CoOp 可学习文本提示")
-    parser.add_argument("--use_ot", action='store_true', default=False, help="启用 SG-OT 语义引导最优传输模块")
+    parser.add_argument("--use_ot", action='store_true', default=False, help="启用 Density-Guided OT 模块")
     parser.add_argument("--use_asr", action='store_true', default=False, help="启用 ASR 自适应谱细化上采样模块")
     parser.add_argument("--prompt_mode", type=str, default="dynamic", choices=["generic", "dynamic"], help="训练时的文本提示生成模式")
 
@@ -308,10 +308,23 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                         loss_hv_grad = msge_loss(gt_hv, pred_hv, focus)
                         loss_hv = loss_hv_mse + 2.0 * loss_hv_grad
                         
-                # 4. PNuRL 属性预测损失与拓展损失
+                # 4. PNuRL 属性预测损失与密度回归损失
                 loss_attr = out.get('pnurl_loss', torch.tensor(0.0, device=loss_m.device))
                 loss_c = out.get('consistency_loss', torch.tensor(0.0, device=loss_m.device))
-                loss_d = out.get('density_loss', torch.tensor(0.0, device=loss_m.device))
+                
+                # 新增：计算密度图 Loss
+                pred_density = out.get('density_map', None)
+                if pred_density is not None:
+                    loss_d, _, _ = density_map_loss(
+                        pred_density_map=pred_density,
+                        gt_mask=labels[i].float().unsqueeze(0),
+                        pred_mask=pred_mask.unsqueeze(0).unsqueeze(0),
+                        mse_weight=1.0,
+                        iou_weight=0.5,
+                        enable_iou=(epoch > 20)
+                    )
+                else:
+                    loss_d = torch.tensor(0.0, device=loss_m.device)
                 
                 # 🔥 动态 Loss 路由
                 if args.phase == "vision":
@@ -638,21 +651,23 @@ def main(args):
         # 🔥 两阶段架构：梯度冻结与分发
         # ==========================================
         if args.phase == "vision":
-            if rank == 0: logger.info("🔥 [Phase 1: 视觉筑基] 冻结文本语义(CoOp/PNuRL)，全力微调视觉解码器、ASR与OT切割！")
+            if rank == 0: logger.info("🔥 [Phase 1: 视觉筑基] 冻结文本语义(CoOp/PNuRL)及OT，全力微调视觉解码器与ASR！")
             
-            # 1. 冻结语义层 (防止乱初始化的文本特征污染视觉)
+            # 1. 冻结语义层
             if hasattr(raw_model, 'prompt_learner'):
                 for p in raw_model.prompt_learner.parameters(): p.requires_grad = False
             if hasattr(raw_model, 'pnurl'):
                 for p in raw_model.pnurl.parameters(): p.requires_grad = False
+                
+            # 冻结 OT (严格遵守纯视觉阶段不激活 OT 的原则)
+            if hasattr(raw_model, 'ot'):
+                for p in raw_model.ot.parameters(): p.requires_grad = False
                 
             # 2. 全力训练视觉层
             vision_lr = args.lr
             add_to_params(raw_model.mask_decoder, vision_lr)
             add_to_params(raw_model.prompt_generator, vision_lr)
             
-            if hasattr(raw_model, 'sg_ot'): 
-                add_to_params(raw_model.sg_ot, vision_lr)
             if hasattr(raw_model, 'basic_hv_head'): 
                 add_to_params(raw_model.basic_hv_head, vision_lr)
                 
@@ -668,23 +683,33 @@ def main(args):
             if adapter_params: params.append({'params': adapter_params, 'lr': args.lr * 0.1})
 
         elif args.phase == "semantic":
-            if rank == 0: logger.info("🚀 [Phase 2: 语义拔高] 视觉底盘已稳固，解冻医学知识库与 PNuRL，开启端到端精调！")
+            if rank == 0: logger.info("🚀 [Phase 2: 语义拔高] 视觉底盘已稳固，解冻医学知识库、PNuRL与OT，开启端到端精调！")
             
             # 1. 视觉层保持较小学习率微调
             vision_lr = args.lr * 0.1
-            add_to_params(raw_model.mask_decoder, vision_lr)
             add_to_params(raw_model.prompt_generator, vision_lr)
-            # --- [修改开始] 将新加的注意力层和预训练层分开 ---
+            
+            # --- [修改] 精准拆分 MaskDecoder 中的新旧模块参数 ---
             decoder_pretrained_params = []
-            decoder_new_params =[]
+            decoder_new_params = []
             for name, param in raw_model.mask_decoder.named_parameters():
                 if not param.requires_grad:
                     continue
-                if "text_to_cnn_attn" in name:
+                # 为新加入的交叉注意力和形态学编码器赋予正常的初始学习率
+                if "attr_attn" in name or "morphology_attn" in name or "morph_encoder" in name:
                     decoder_new_params.append(param)
                 else:
                     decoder_pretrained_params.append(param)
-            if hasattr(raw_model, 'sg_ot'): add_to_params(raw_model.sg_ot, vision_lr)
+                    
+            if decoder_pretrained_params:
+                params.append({'params': decoder_pretrained_params, 'lr': vision_lr})
+            if decoder_new_params:
+                params.append({'params': decoder_new_params, 'lr': args.lr}) 
+
+            if hasattr(raw_model, 'ot'): 
+                for p in raw_model.ot.parameters(): p.requires_grad = True
+                add_to_params(raw_model.ot, vision_lr)
+                
             if getattr(raw_model, 'use_asr', False):
                 if hasattr(raw_model, 'global_asr_upsampler'): add_to_params(raw_model.global_asr_upsampler, vision_lr)
                 
@@ -730,7 +755,7 @@ def main(args):
                 best_aji = 0.0
                 best_dice = 0.0
                         
-                if rank == 0: logger.info(f"✅ 预训练权重加载成功！开始 SG-OT 渐进式微调。")
+                if rank == 0: logger.info(f"✅ 预训练权重加载成功！所有新增的频域解耦模块已随机初始化。")
             except Exception as e:
                 if rank == 0: logger.warning(f"⚠️ Resume failed: {e}")
 

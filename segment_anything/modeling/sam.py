@@ -27,6 +27,7 @@ except ImportError:
 
 load_dotenv()
 hf_auth_token = os.environ.get("HF_TOKEN")
+
 class GlobalASRUpsampler(nn.Module):
     """
     全局高分辨率特征上采样器 (ASR-HV)
@@ -317,7 +318,6 @@ class TextSam(Sam):
             param.requires_grad = use_coop
 
         # 3. PNuRL (解耦版，接收外部 text_embed)
-        # 🔥 关键修复：修正 PNuRL 参数签名，与新版 pnurl.py 对齐
         self.pnurl = PNuRL(
             embed_dim=embed_dim, 
             text_dim=512,
@@ -334,7 +334,7 @@ class TextSam(Sam):
             num_heads=num_heads,
         )
 
-        # 5. 极简版 OT：仅使用物理密度进行切割
+        # 5. OT (保留消融结构)
         if self.use_ot:
             print("🚀 Switched to Density-Guided Optimal Transport (DG-OT) for pure spatial alignment!")
             self.ot = DensityGuidedOT(
@@ -397,7 +397,6 @@ class TextSam(Sam):
         base_texts = [] 
         for x in batched_input:
             organ_indices.append(x.get("organ_id", 0)) 
-            # 确保空值回退为 "Cell nuclei"，防止 Tokenizer 解析空字符串异常
             attribute_texts.append(x.get("attribute_text", "Cell nuclei")) 
             base_texts.append(x.get("text_prompt", "Cell nuclei"))
         organ_indices = torch.tensor(organ_indices).to(device)
@@ -420,9 +419,7 @@ class TextSam(Sam):
             if next(self.pnurl.parameters()).device != device:
                 self.pnurl = self.pnurl.to(device)
             
-            # 1. 外部使用 CONCH 提取高质量文本语义
             with torch.no_grad():
-                # 🔥 关键修复：直接使用 tokenizer 并提取 "input_ids"
                 attr_tokenized = self.tokenizer(
                     attribute_texts, 
                     padding="max_length", 
@@ -435,8 +432,8 @@ class TextSam(Sam):
                 attr_text_embed = self.clip_model.encode_text(attr_tokens)
                 attr_text_embed = attr_text_embed / attr_text_embed.norm(dim=-1, keepdim=True)
                 
-            # 2. 传入解耦的 PNuRL (纯粹做宏观调控)
-            refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits, density_features, density_map = self.pnurl(
+            # 🔥 修复解耦参数接收：接收 PNuRL 吐出的 7 个变量
+            refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits, density_map, txt_attr_feat, txt_mor_feat = self.pnurl(
                 image_features=image_embeddings,
                 text_embed=attr_text_embed, 
                 attribute_labels=attribute_labels,
@@ -446,11 +443,11 @@ class TextSam(Sam):
             refined_image_embeddings = image_embeddings
             pnurl_loss = torch.tensor(0.0, device=device)
             attr_logits = {}
-            density_features = None
             density_map = None
+            txt_attr_feat = None
+            txt_mor_feat = None
 
         # === CoOp 可学习提示 ===
-        # 🔥 关键修复：直接使用 tokenizer 并提取 "input_ids" 给 CoOp 
         pos_tokenized = self.tokenizer(
             base_texts, 
             padding="max_length", 
@@ -472,8 +469,9 @@ class TextSam(Sam):
         if self.use_coop:
             if next(self.prompt_learner.parameters()).device != device:
                 self.prompt_learner = self.prompt_learner.to(device)
-            pos_feats = self.prompt_learner(organ_indices, pos_tokens, density_features=density_features)
-            neg_feats = self.prompt_learner(organ_indices, neg_tokens, density_features=density_features)
+            # 由于去除了 density_features，直接传 None 即可
+            pos_feats = self.prompt_learner(organ_indices, pos_tokens, density_features=None)
+            neg_feats = self.prompt_learner(organ_indices, neg_tokens, density_features=None)
         else:
             with torch.no_grad():
                 pos_feats = self.clip_model.encode_text(pos_tokens).float()
@@ -491,7 +489,6 @@ class TextSam(Sam):
         if self.use_ot:
             if next(self.ot.parameters()).device != device:
                 self.ot = self.ot.to(device)
-            # 仅仅使用物理密度图和图像特征去切割，不混入文本语义
             fused_image_embeddings, heatmap_logits_coarse, hv_logits_coarse = self.ot(
                 img_feat=refined_image_embeddings,
                 density_map=ot_density,
@@ -501,13 +498,13 @@ class TextSam(Sam):
             heatmap_logits_coarse = self.prompt_generator(refined_image_embeddings, text_features)
             hv_logits_coarse = self.basic_hv_head(refined_image_embeddings)
 
-        # 🔥🔥🔥 ASR 上采样：仅接受纯视觉高频特征 🔥🔥🔥
+        # 🔥 全局 ASR 上采样
         if self.use_asr:
             hv_logits_out, heatmap_logits_out = self.global_asr_upsampler(
                 fused_image_embeddings, 
                 hv_logits_coarse, 
                 heatmap_logits_coarse, 
-                feat_s2, feat_s1, feat_half  # 这些纯粹来自 ResNet！
+                feat_s2, feat_s1, feat_half 
             )
         else:
             hv_logits_out = hv_logits_coarse
@@ -596,6 +593,10 @@ class TextSam(Sam):
             chunk_masks = []
             chunk_ious = []
             
+            # 🔥 将宏观/微观特征根据当前图片提取，并准备扩维
+            curr_attr_prompt = txt_attr_feat[i:i+1] if txt_attr_feat is not None else None
+            curr_morph_feat = txt_mor_feat[i:i+1] if txt_mor_feat is not None else None
+            
             for start_idx in range(0, num_cells, chunk_size):
                 end_idx = min(start_idx + chunk_size, num_cells)
                 sub_coords = point_coords[start_idx:end_idx] 
@@ -610,6 +611,10 @@ class TextSam(Sam):
 
                 sparse, dense = self.prompt_encoder(points=(sub_coords, sub_labels), boxes=None, masks=None)
 
+                # 🔥 关键投送：将宏观低频与微观高频的Prompt正确扩维并送入 MaskDecoder
+                sub_attr_prompt = curr_attr_prompt.expand(current_batch, -1) if curr_attr_prompt is not None else None
+                sub_morph_feat = curr_morph_feat.expand(current_batch, -1) if curr_morph_feat is not None else None
+
                 sub_mask, sub_iou = self.mask_decoder(
                     image_embeddings=sub_img_embed,
                     image_pe=self.prompt_encoder.get_dense_pe(),
@@ -617,7 +622,9 @@ class TextSam(Sam):
                     dense_prompt_embeddings=dense,
                     multimask_output=multimask_output,
                     cnn_feat_s1=sub_cnn_s1,  
-                    cnn_feat_s2=sub_cnn_s2,  
+                    cnn_feat_s2=sub_cnn_s2, 
+                    attr_prompt=sub_attr_prompt, # 🟢 低频路由
+                    morph_feat=sub_morph_feat,   # 🔴 高频路由
                 )
                 chunk_masks.append(sub_mask)
                 chunk_ious.append(sub_iou)
