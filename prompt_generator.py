@@ -133,10 +133,10 @@ class TextGuidedPointGenerator(nn.Module):
             if pred_density is not None:
                 # 累加当前样本的密度图，得到物理预估的细胞总数
                 estimated_count = int(pred_density[b].sum().item())
-                dynamic_max = min(max(int(estimated_count * 1.5), 10), 128)
+                dynamic_max = min(max(int(estimated_count * 1.5), 10), 32)
             else:
                 # 保底机制
-                dynamic_max = 128
+                dynamic_max = 32
 
             # 🔥🔥🔥 [创新核心 2]: 放弃随机抽样，采用 Top-K 智能过滤
             if len(y_inds) > dynamic_max:
