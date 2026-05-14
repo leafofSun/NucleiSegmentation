@@ -1,4 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+#Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
 import torch
@@ -14,7 +14,7 @@ class MorphologyEncoder(nn.Module):
     """
     def __init__(self, text_dim=256, cnn_dims=[512, 256]):
         super().__init__()
-        # 1. 进一步潜空间映射提纯 (输入已经是融合后的 256 维 txt_mor_feat)
+        # 1. 进一步潜空间映射提纯 (输入已经是融合后的 text_dim 维 txt_mor_feat)
         self.joint_fusion = nn.Sequential(
             nn.Linear(text_dim, text_dim), 
             nn.LayerNorm(text_dim),
@@ -28,6 +28,10 @@ class MorphologyEncoder(nn.Module):
         ])
 
     def forward(self, morph_feat):
+        # 鲁棒性保护：如果输入是 Sequence [B, N, C]，则取均值降维到 [B, C]
+        if morph_feat.dim() == 3:
+            morph_feat = morph_feat.mean(dim=1)
+            
         # 联合约束：对输入的形态学特征进行自适应提纯
         joint_morph = self.joint_fusion(morph_feat)
         
@@ -41,28 +45,28 @@ class MorphologyEncoder(nn.Module):
 class ASRBlock(nn.Module):
     """
     🔥 [频域解耦版] ASR上采样模块 (CNN + ViT Hybrid)
-    1. x_struct: 接收低频属性 (Color, Arrange, Density) 调制的全局语义
-    2. cnn_feat: 接收高频形态学 (Shape, Size) 提纯的物理边缘
+    1. x_up (Low-freq): 接收低频属性 (Color, Arrange, Density) 调制的全局语义
+    2. cnn_feat (High-freq): 接收高频形态学 (Shape, Size) 提纯的物理边缘
     """
-    def __init__(self, in_dim, out_dim, cnn_dim=None, activation: Type[nn.Module] = nn.GELU):
+    def __init__(self, in_dim, out_dim, cnn_dim=None, text_dim=256, activation: Type[nn.Module] = nn.GELU):
         super().__init__()
-        # 1. 基础结构上采样 (SAM 流)
+        # 1. 基础结构上采样 (SAM 低频语义流)
         self.structure_upsample = nn.Sequential(
             nn.ConvTranspose2d(in_dim, out_dim, kernel_size=2, stride=2),
             LayerNorm2d(out_dim),
             activation(),
         )
         
-        # 🟢 宏观低频属性提示 (Attribute Prompt)
+        # 🟢 宏观低频属性提示 (Attribute Prompt Modulator)
         self.attr_attn = nn.Sequential(
-            nn.Linear(256, out_dim),
+            nn.Linear(text_dim, out_dim),
             nn.Sigmoid() # 生成 0~1 的权重，调制全局感受野
         )
         
-        # 2. 真实物理边缘流 (ResNet Skip Connection)
+        # 2. 真实物理边缘流 (ResNet Skip Connection 高频流)
         self.has_cnn = cnn_dim is not None
         if self.has_cnn:
-            # 🔴 微观高频形态提示 (Morphology Prompt)
+            # 🔴 微观高频形态提示 (Morphology Prompt Modulator)
             self.morphology_attn = nn.Sequential(
                 nn.Linear(cnn_dim, cnn_dim),
                 nn.Sigmoid() # 生成 0~1 的权重，裁剪/提纯CNN边缘
@@ -78,7 +82,7 @@ class ASRBlock(nn.Module):
                 LayerNorm2d(out_dim),
                 activation()
             )
-            # 🔧 零初始化，确保残差结构的稳定性
+            # 🔧 零初始化，确保残差结构的初始等效性（极其重要的稳定技巧）
             nn.init.zeros_(self.cnn_fusion[0].weight)
             self.residual_scale = nn.Parameter(torch.tensor(0.1))
 
@@ -88,6 +92,9 @@ class ASRBlock(nn.Module):
         
         # 🟢 Attribute Prompt 调制低频特征 (感知环境/材质)
         if attr_prompt is not None:
+            # 鲁棒性保护：适配 sequence 输入
+            if attr_prompt.dim() == 3:
+                attr_prompt = attr_prompt.mean(dim=1)
             attn_weight_low = self.attr_attn(attr_prompt).unsqueeze(-1).unsqueeze(-1)
             x_up = x_up * attn_weight_low  
         
@@ -95,6 +102,9 @@ class ASRBlock(nn.Module):
         if self.has_cnn and cnn_feat is not None:
             # 🔴 Morphology Prompt 调制高频特征 (裁剪指定形状和大小的边缘)
             if layer_morph_prompt is not None:
+                # 鲁棒性保护
+                if layer_morph_prompt.dim() == 3:
+                    layer_morph_prompt = layer_morph_prompt.mean(dim=1)
                 attn_weight_high = self.morphology_attn(layer_morph_prompt).unsqueeze(-1).unsqueeze(-1)
                 cnn_feat = cnn_feat * attn_weight_high
                 
@@ -134,14 +144,15 @@ class MaskDecoder(nn.Module):
         self.use_asr = use_asr
         
         if self.use_asr:
+            # 统一使用 transformer_dim 作为 text_dim 传入，避免硬编码 256
             self.asr_upscale_1 = ASRBlock(
-                transformer_dim, transformer_dim // 4, cnn_dim=512, activation=activation
+                transformer_dim, transformer_dim // 4, cnn_dim=512, text_dim=512, activation=activation
             )
             self.asr_upscale_2 = ASRBlock(
-                transformer_dim // 4, transformer_dim // 8, cnn_dim=256, activation=activation
+                transformer_dim // 4, transformer_dim // 8, cnn_dim=256, text_dim=512, activation=activation
             )
             # 🔴 初始化形态学编码器 (cnn_feat_s2 对应 512 维, cnn_feat_s1 对应 256 维)
-            self.morph_encoder = MorphologyEncoder(text_dim=256, cnn_dims=[512, 256])
+            self.morph_encoder = MorphologyEncoder(text_dim=512, cnn_dims=[512, 256])
         else:
             self.output_upscaling = nn.Sequential(
                 nn.ConvTranspose2d(transformer_dim, transformer_dim // 4, kernel_size=2, stride=2),
@@ -245,7 +256,7 @@ class MaskDecoder(nn.Module):
         else:
             upscaled_embedding = self.output_upscaling(src)
 
-        hyper_in_list: List[torch.Tensor] = []
+        hyper_in_list: List[torch.Tensor] =[]
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
         hyper_in = torch.stack(hyper_in_list, dim=1)

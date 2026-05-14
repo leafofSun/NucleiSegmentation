@@ -357,12 +357,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
 
         is_accumulating = (batch_idx + 1) % args.accumulation_steps != 0 and (batch_idx + 1) != len(train_loader)
 
-        # 防死锁补丁
-        dummy_loss = 0.0
-        for p in model.parameters():
-            if p.requires_grad:
-                dummy_loss = dummy_loss + p.sum() * 0.0
-        final_loss = final_loss + dummy_loss
 
         if scaler:
             scaler.scale(final_loss).backward()

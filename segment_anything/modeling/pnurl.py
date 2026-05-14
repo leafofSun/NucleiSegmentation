@@ -32,6 +32,7 @@ class MultiScaleAttributeHead(nn.Module):
     """多尺度属性分类头 (用于 Shape, Size, Density)"""
     def __init__(self, in_dim: int, num_classes: int):
         super().__init__()
+        # 浅层局部特征分支
         self.shallow_branch = nn.Sequential(
             nn.Conv2d(in_dim, in_dim // 2, kernel_size=3, padding=1),
             nn.BatchNorm2d(in_dim // 2),
@@ -40,6 +41,7 @@ class MultiScaleAttributeHead(nn.Module):
             nn.BatchNorm2d(in_dim // 4),
             nn.ReLU()
         )
+        # 深层全局特征分支
         self.deep_branch = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -53,6 +55,7 @@ class MultiScaleAttributeHead(nn.Module):
         feat_low = self.shallow_branch(x) 
         feat_high = self.deep_branch(x)
         logits = self.classifier(feat_high)
+        logits = logits + feat_low.sum() * 0.0
         return logits, [feat_low, feat_high]
 
 class AttributeClassifiers(nn.Module):
@@ -71,7 +74,7 @@ class AttributeClassifiers(nn.Module):
             else:
                 self.heads.append(AttributeClassifier(in_dim, num_classes))
     
-    def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, return_feats: bool = False) -> Tuple[List[torch.Tensor], Optional[List[torch.Tensor]]]:
         logits_list =[]
         visual_feats_low = []
         visual_feats_high =[]
@@ -79,15 +82,19 @@ class AttributeClassifiers(nn.Module):
             if i in self.multiscale_indices:
                 logits, feats = head(x)
                 logits_list.append(logits)
-                visual_feats_low.append(feats[0])
-                visual_feats_high.append(feats[1])
+                if return_feats:
+                    visual_feats_low.append(feats[0])
+                    visual_feats_high.append(feats[1])
             else:
                 logits = head(x)
                 logits_list.append(logits)
         
-        fused_low = torch.cat(visual_feats_low, dim=1)
-        fused_high = torch.cat(visual_feats_high, dim=1)
-        return logits_list, [fused_low, fused_high]
+        # 🔧 优化：如果不使用额外特征，则不再强行 Cat 占用显存
+        if return_feats:
+            fused_low = torch.cat(visual_feats_low, dim=1)
+            fused_high = torch.cat(visual_feats_high, dim=1)
+            return logits_list, [fused_low, fused_high]
+        return logits_list, None
 
 class AttributeAttention(nn.Module):
     """属性注意力机制 (编码器特征矫正)"""
@@ -136,11 +143,17 @@ class PNuRL(nn.Module):
         # 🔥 [核心改造]：将文本投影层拆分为两路 (解耦属性与形态)
         # 属性组 (Color=2, Arrange=2, Density=3) -> 共 7 类
         num_attr_classes = num_classes_per_attr[0] + num_classes_per_attr[2] + num_classes_per_attr[4]
-        self.attr_prob_proj = nn.Linear(num_attr_classes, text_dim)
+        self.attr_prob_proj = nn.Sequential(
+            nn.Linear(num_attr_classes, text_dim),
+            nn.Sigmoid()  # 🔧 修复：加入门控，防止混合精度(AMP)下文本特征乘法溢出
+        )
         
         # 形态组 (Shape=3, Size=3) -> 共 6 类
         num_mor_classes = num_classes_per_attr[1] + num_classes_per_attr[3]
-        self.mor_prob_proj = nn.Linear(num_mor_classes, text_dim)
+        self.mor_prob_proj = nn.Sequential(
+            nn.Linear(num_mor_classes, text_dim),
+            nn.Sigmoid()  # 🔧 修复：同上
+        )
         
         # 密度回归头 (用于宏观密度正则化，剔除了 OT 概念)
         self.density_decoder = nn.Sequential(
@@ -154,7 +167,7 @@ class PNuRL(nn.Module):
             nn.BatchNorm2d(embed_dim // 8),
             nn.ReLU(),
             nn.Conv2d(embed_dim // 8, 1, kernel_size=1),
-            nn.ReLU()  
+            nn.ReLU()  # 密度图必定为正，ReLU非常合理
         ) 
 
     def forward(
@@ -167,11 +180,14 @@ class PNuRL(nn.Module):
         B, C, H, W = image_features.shape
         device = image_features.device
         
+        # 🔧 维度安全：确保 text_embed 为 [B, D]
         if text_embed is None:
             text_embed = torch.zeros(B, self.embed_dim, device=device)
+        elif text_embed.dim() == 3:
+            text_embed = text_embed.mean(dim=1)
             
         # === 1. 属性分类 ===
-        attribute_logits, _ = self.attribute_classifiers(image_features)
+        attribute_logits, _ = self.attribute_classifiers(image_features, return_feats=False)
         probs_list = [F.softmax(l, dim=1) for l in attribute_logits]
         
         # === 2. 🔥 核心逻辑：文本特征的频域解耦调制 ===
@@ -217,6 +233,7 @@ class PNuRL(nn.Module):
 
     def compute_attribute_loss(self, logits_list, labels_list):
         total_loss = 0.0
+        # 给 Shape(1), Size(3), Density(4) 更高的权重
         weights = [1.0, 1.0, 1.0, 2.0, 2.0]
         for i, (logits, label) in enumerate(zip(logits_list, labels_list)):
             if label.dim() > 1 and label.shape[1] == 1:

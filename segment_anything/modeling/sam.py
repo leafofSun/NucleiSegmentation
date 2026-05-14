@@ -198,6 +198,9 @@ class DualPromptLearner(nn.Module):
             ctx_gen = torch.cat([ctx_gen_low_modulated, ctx_gen_high_modulated], dim=1)
             ctx_spec = ctx_spec_modulated
             ctx = torch.cat([ctx_gen, ctx_spec], dim=1)
+        else:
+            dummy_adapter = sum(p.sum() * 0.0 for p in self.physical_adapter.parameters())
+            ctx = ctx + dummy_adapter
 
         prefix = embedding[:, :1, :] 
         suffix = embedding[:, 1 : 77 - self.total_ctx, :] 
@@ -262,6 +265,13 @@ class Sam(nn.Module):
         return x
 
 
+import os
+import torch
+from torch import nn
+from torch.nn import functional as F
+import torchvision.models as models
+
+
 class TextSam(Sam):
     def __init__(
         self,
@@ -292,7 +302,6 @@ class TextSam(Sam):
         print(f"🚀 Initializing MP-SAM (Multi-granularity Prompt SAM) with CONCH...")
         
         # 1. 加载 CONCH (Freeze)
-        # 🔥 关键修复：从环境变量读取 Token，杜绝 GitHub Push Protection 报错！
         hf_auth_token = os.environ.get("HF_TOKEN")
         if not hf_auth_token:
             print("⚠️ Warning: HF_TOKEN environment variable is not set. Model load may fail if not cached.")
@@ -317,11 +326,11 @@ class TextSam(Sam):
         for param in self.prompt_learner.parameters():
             param.requires_grad = use_coop
 
-        # 3. PNuRL (解耦版，接收外部 text_embed)
+        # 3. PNuRL (频域-语义解耦版)
         self.pnurl = PNuRL(
             embed_dim=embed_dim, 
             text_dim=512,
-            num_classes_per_attr=[2, 3, 2, 3, 3], # 确保与实际的 5 个属性类别数一致
+            num_classes_per_attr=[2, 3, 2, 3, 3], # [Color, Shape, Arrange, Size, Density]
             attr_loss_weight=1.0
         )
         for param in self.pnurl.parameters():
@@ -334,7 +343,7 @@ class TextSam(Sam):
             num_heads=num_heads,
         )
 
-        # 5. OT (保留消融结构)
+        # 5. OT (保留结构开关)
         if self.use_ot:
             print("🚀 Switched to Density-Guided Optimal Transport (DG-OT) for pure spatial alignment!")
             self.ot = DensityGuidedOT(
@@ -376,7 +385,7 @@ class TextSam(Sam):
         image_embeddings = self.image_encoder(input_images) 
         device = image_embeddings.device
 
-        # 🔥 提取纯视觉高频特征 (给 ASR 使用，与语义无关)
+        # 🔥 提取纯视觉高频特征 (给 ASR 使用，此时与语义完全无关，提供纯物理边缘)
         feat_half, feat_s1, feat_s2 = None, None, None
         if self.use_asr:
             with torch.autocast('cuda', enabled=True):
@@ -392,47 +401,45 @@ class TextSam(Sam):
             self.clip_model = self.clip_model.to(device)
 
         # === 提取元数据 ===
-        organ_indices = []
+        organ_indices =[]
         attribute_texts = []
-        base_texts = [] 
+        base_texts =[] 
         for x in batched_input:
             organ_indices.append(x.get("organ_id", 0)) 
             attribute_texts.append(x.get("attribute_text", "Cell nuclei")) 
             base_texts.append(x.get("text_prompt", "Cell nuclei"))
         organ_indices = torch.tensor(organ_indices).to(device)
 
-        # === 解耦版 PNuRL ===
-        attribute_labels_list = []
+        # === 提取并组装属性 Labels ===
+        attribute_labels_list =[]
         for x in batched_input:
             attr_labels = x.get("attr_labels", None)
             if attr_labels is not None:
                 attribute_labels_list.append(attr_labels)
             else:
+                # 默认: Color, Shape, Arrange, Size, Density 的缺省索引
                 attribute_labels_list.append(torch.tensor([0, 0, 0, 1, 1], dtype=torch.long))
 
         attribute_labels = None
         if len(attribute_labels_list) > 0:
             attr_labels_batch = torch.stack(attribute_labels_list).to(device)
+            # 分解成 5 个一维 tensor
             attribute_labels = [attr_labels_batch[:, i] for i in range(5)]
 
+        # === 🟢🔴 PNuRL 特征解耦 (Spectral-Semantic Decoupling) ===
         if self.use_pnurl:
             if next(self.pnurl.parameters()).device != device:
                 self.pnurl = self.pnurl.to(device)
             
             with torch.no_grad():
                 attr_tokenized = self.tokenizer(
-                    attribute_texts, 
-                    padding="max_length", 
-                    max_length=77, 
-                    truncation=True, 
-                    return_tensors="pt"
+                    attribute_texts, padding="max_length", max_length=77, truncation=True, return_tensors="pt"
                 )
                 attr_tokens = attr_tokenized["input_ids"].to(device)
-                
                 attr_text_embed = self.clip_model.encode_text(attr_tokens)
                 attr_text_embed = attr_text_embed / attr_text_embed.norm(dim=-1, keepdim=True)
                 
-            # 🔥 修复解耦参数接收：接收 PNuRL 吐出的 7 个变量
+            # 接收 PNuRL 吐出的解耦变量：txt_attr_feat (宏观/低频) 和 txt_mor_feat (微观/高频)
             refined_image_embeddings, pnurl_context, pnurl_loss, attr_logits, density_map, txt_attr_feat, txt_mor_feat = self.pnurl(
                 image_features=image_embeddings,
                 text_embed=attr_text_embed, 
@@ -449,27 +456,18 @@ class TextSam(Sam):
 
         # === CoOp 可学习提示 ===
         pos_tokenized = self.tokenizer(
-            base_texts, 
-            padding="max_length", 
-            max_length=77, 
-            truncation=True, 
-            return_tensors="pt"
+            base_texts, padding="max_length", max_length=77, truncation=True, return_tensors="pt"
         )
         pos_tokens = pos_tokenized["input_ids"].to(device)
         
         neg_tokenized = self.tokenizer(
-            ["Background"] * len(base_texts), 
-            padding="max_length", 
-            max_length=77, 
-            truncation=True, 
-            return_tensors="pt"
+            ["Background"] * len(base_texts), padding="max_length", max_length=77, truncation=True, return_tensors="pt"
         )
         neg_tokens = neg_tokenized["input_ids"].to(device)
         
         if self.use_coop:
             if next(self.prompt_learner.parameters()).device != device:
                 self.prompt_learner = self.prompt_learner.to(device)
-            # 由于去除了 density_features，直接传 None 即可
             pos_feats = self.prompt_learner(organ_indices, pos_tokens, density_features=None)
             neg_feats = self.prompt_learner(organ_indices, neg_tokens, density_features=None)
         else:
@@ -481,8 +479,7 @@ class TextSam(Sam):
         neg_feats = neg_feats / neg_feats.norm(dim=-1, keepdim=True)
         text_features = torch.stack([pos_feats, neg_feats], dim=1).float()
 
-        # === 极简 OT 处理 ===
-        pos_text_feats = text_features[:, 0, :]
+        # === OT/Point Generator 模块 ===
         B, C, H, W = refined_image_embeddings.shape
         ot_density = density_map if density_map is not None else torch.ones(B, 1, H, W, device=device) / (H * W)
 
@@ -498,7 +495,7 @@ class TextSam(Sam):
             heatmap_logits_coarse = self.prompt_generator(refined_image_embeddings, text_features)
             hv_logits_coarse = self.basic_hv_head(refined_image_embeddings)
 
-        # 🔥 全局 ASR 上采样
+        # 🔥 全局 ASR 上采样 (输出 Heatmap 和 HV Map)
         if self.use_asr:
             hv_logits_out, heatmap_logits_out = self.global_asr_upsampler(
                 fused_image_embeddings, 
@@ -510,7 +507,7 @@ class TextSam(Sam):
             hv_logits_out = hv_logits_coarse
             heatmap_logits_out = heatmap_logits_coarse
 
-        # 动态阈值计算
+        # 🚀 亮点：利用 Size 属性自适应调节点生成间距！
         size_logits = attr_logits.get('size', None)
         if size_logits is not None and size_logits.numel() > 0:
             pred_size_class = torch.argmax(size_logits, dim=1)
@@ -532,7 +529,7 @@ class TextSam(Sam):
         scale_factor = input_size / feat_size
 
         # === SAM Mask Decoder Loop ===
-        outputs = []
+        outputs =[]
         for i in range(len(batched_input)):
             prompt_data = prompts_list[i]
             target_h, target_w = batched_input[i]["original_size"]
@@ -590,10 +587,10 @@ class TextSam(Sam):
 
             num_cells = point_coords.shape[0]
             chunk_size = 16 
-            chunk_masks = []
-            chunk_ious = []
+            chunk_masks =[]
+            chunk_ious =[]
             
-            # 🔥 将宏观/微观特征根据当前图片提取，并准备扩维
+            # 🔥 提取当前图片的宏观与微观 Prompt 特征
             curr_attr_prompt = txt_attr_feat[i:i+1] if txt_attr_feat is not None else None
             curr_morph_feat = txt_mor_feat[i:i+1] if txt_mor_feat is not None else None
             
@@ -605,16 +602,27 @@ class TextSam(Sam):
 
                 sub_img_embed = fused_image_embeddings[i].unsqueeze(0).expand(current_batch, -1, -1, -1)
                 
-                # ASR 需要的高频特征也切分
-                sub_cnn_s1 = feat_s1[i].unsqueeze(0).expand(current_batch, -1, -1, -1) if self.use_asr else None
-                sub_cnn_s2 = feat_s2[i].unsqueeze(0).expand(current_batch, -1, -1, -1) if self.use_asr else None
+                # ASR 需要的高频特征随之切分扩维
+                sub_cnn_s1 = feat_s1[i].unsqueeze(0).expand(current_batch, -1, -1, -1).contiguous() if self.use_asr else None
+                sub_cnn_s2 = feat_s2[i].unsqueeze(0).expand(current_batch, -1, -1, -1).contiguous() if self.use_asr else None
 
                 sparse, dense = self.prompt_encoder(points=(sub_coords, sub_labels), boxes=None, masks=None)
 
-                # 🔥 关键投送：将宏观低频与微观高频的Prompt正确扩维并送入 MaskDecoder
-                sub_attr_prompt = curr_attr_prompt.expand(current_batch, -1) if curr_attr_prompt is not None else None
-                sub_morph_feat = curr_morph_feat.expand(current_batch, -1) if curr_morph_feat is not None else None
+                # 🚨 安全扩维防御：判断文本Prompt是 2D 还是 3D (防止 Runtime Error)
+                sub_attr_prompt, sub_morph_feat = None, None
+                if curr_attr_prompt is not None:
+                    if curr_attr_prompt.dim() == 2:   # [1, C]
+                        sub_attr_prompt = curr_attr_prompt.expand(current_batch, -1).contiguous()
+                    elif curr_attr_prompt.dim() == 3: # [1, Seq, C]
+                        sub_attr_prompt = curr_attr_prompt.expand(current_batch, -1, -1).contiguous()
+                
+                if curr_morph_feat is not None:
+                    if curr_morph_feat.dim() == 2:
+                        sub_morph_feat = curr_morph_feat.expand(current_batch, -1).contiguous()
+                    elif curr_morph_feat.dim() == 3:
+                        sub_morph_feat = curr_morph_feat.expand(current_batch, -1, -1).contiguous()
 
+                # 🔥 关键投送：将解耦的宏观低频与微观高频的Prompt送入 MaskDecoder
                 sub_mask, sub_iou = self.mask_decoder(
                     image_embeddings=sub_img_embed,
                     image_pe=self.prompt_encoder.get_dense_pe(),
@@ -623,8 +631,8 @@ class TextSam(Sam):
                     multimask_output=multimask_output,
                     cnn_feat_s1=sub_cnn_s1,  
                     cnn_feat_s2=sub_cnn_s2, 
-                    attr_prompt=sub_attr_prompt, # 🟢 低频路由
-                    morph_feat=sub_morph_feat,   # 🔴 高频路由
+                    attr_prompt=sub_attr_prompt, # 🟢 低频特征流 (Color, Arrange, Density)
+                    morph_feat=sub_morph_feat,   # 🔴 高频特征流 (Shape, Size)
                 )
                 chunk_masks.append(sub_mask)
                 chunk_ious.append(sub_iou)
@@ -651,5 +659,12 @@ class TextSam(Sam):
                 "pnurl_loss": pnurl_loss,
                 "organ_cls_loss": getattr(self, 'organ_cls_loss_cache', torch.tensor(0.0, device=device)) 
             })
-            
+        if self.training and len(outputs) > 0:
+            dummy = torch.tensor(0.0, device=device)
+            for p in self.parameters():
+                if p.requires_grad:
+                    dummy = dummy + p.sum() * 0.0
+            # 强行注入到 heatmap_logits 中 (它必定会参与 loss_h 的计算)
+            outputs[0]["heatmap_logits"] = outputs[0]["heatmap_logits"] + dummy
+
         return outputs

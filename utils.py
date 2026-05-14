@@ -10,6 +10,7 @@ import random
 import torch.nn as nn
 import logging
 import os
+import sys  # 🔥 新增：用于标准流控制
 
 # ==========================================
 # 辅助函数部分
@@ -189,6 +190,19 @@ def train_transforms(img_size, ori_h, ori_w):
     return get_transforms(img_size, ori_h, ori_w, mode='train')
 
 
+# 🔥 核心修复：防爆破的安全输出流处理器
+class SafeStreamHandler(logging.StreamHandler):
+    def flush(self):
+        try:
+            super().flush()
+        except OSError as e:
+            # 捕获并忽略 [Errno 9] Bad file descriptor 错误
+            if e.errno == 9:
+                pass
+            else:
+                raise
+
+
 def get_logger(filename, verbosity=1, name=None):
     level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
     formatter = logging.Formatter(
@@ -197,13 +211,19 @@ def get_logger(filename, verbosity=1, name=None):
     logger = logging.getLogger(name)
     logger.setLevel(level_dict[verbosity])
 
+    # 🔥 核心修复：清空旧的 handlers，防止打开过多文件句柄导致系统级 Errno 9
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
     os.makedirs(os.path.dirname(filename), exist_ok=True)
 
-    fh = logging.FileHandler(filename, "w")
+    # 修改为追加模式 "a"，防止断点续训时覆盖原有日志
+    fh = logging.FileHandler(filename, "a")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
-    sh = logging.StreamHandler()
+    # 🔥 核心修复：使用安全的 StreamHandler 替换默认的 Handler
+    sh = SafeStreamHandler(sys.stdout)
     sh.setFormatter(formatter)
     logger.addHandler(sh)
 
