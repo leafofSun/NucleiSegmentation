@@ -1,4 +1,4 @@
-#Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
 import torch
@@ -82,9 +82,20 @@ class ASRBlock(nn.Module):
                 LayerNorm2d(out_dim),
                 activation()
             )
-            # 🔧 零初始化，确保残差结构的初始等效性（极其重要的稳定技巧）
-            nn.init.zeros_(self.cnn_fusion[0].weight)
-            self.residual_scale = nn.Parameter(torch.tensor(0.1))
+
+            self.cnn_fusion = nn.Sequential(
+                nn.Conv2d(out_dim * 2, out_dim, kernel_size=3, padding=1, bias=False),
+                LayerNorm2d(out_dim),
+                activation(),
+                # 专门用于零初始化的安全层 (绝不引发梯度断裂)
+                nn.Conv2d(out_dim, out_dim, kernel_size=1, bias=False) 
+            )
+            # 仅对最后的 1x1 卷积执行零初始化
+            nn.init.zeros_(self.cnn_fusion[-1].weight)
+            
+            # 此时可以把 residual_scale 设回 1.0 (因为初始输出已经是 0 了)
+            self.residual_scale = nn.Parameter(torch.tensor(1.0))
+            
 
     def forward(self, x, cnn_feat=None, attr_prompt=None, layer_morph_prompt=None):
         # 1. 基础语义上采样 (低频)
@@ -144,7 +155,7 @@ class MaskDecoder(nn.Module):
         self.use_asr = use_asr
         
         if self.use_asr:
-            # 统一使用 transformer_dim 作为 text_dim 传入，避免硬编码 256
+            # 统一使用 512 作为 text_dim 传入，完美对齐 PNuRL 的输出
             self.asr_upscale_1 = ASRBlock(
                 transformer_dim, transformer_dim // 4, cnn_dim=512, text_dim=512, activation=activation
             )
@@ -183,7 +194,7 @@ class MaskDecoder(nn.Module):
         cnn_feat_s1: torch.Tensor = None,  
         cnn_feat_s2: torch.Tensor = None,  
         attr_prompt: torch.Tensor = None,   # 🟢 低频宏观特征 (Color, Arrange, Density)
-        morph_feat: torch.Tensor = None,    # 🔴 高频形态特征 (Shape + Size，即 PNuRL 的 txt_mor_feat)
+        morph_feat: torch.Tensor = None,    # 🔴 高频形态特征 (Shape + Size)
         **kwargs 
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -256,7 +267,7 @@ class MaskDecoder(nn.Module):
         else:
             upscaled_embedding = self.output_upscaling(src)
 
-        hyper_in_list: List[torch.Tensor] =[]
+        hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
         hyper_in = torch.stack(hyper_in_list, dim=1)

@@ -49,7 +49,17 @@ from skimage.measure import label as skimage_label
 # 🔥 [SPEEDUP] 开启 TF32 (RTX 30/40/50系 核心加速)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+import cv2
+cv2.setNumThreads(0) # 🔴 极其重要：彻底禁用 OpenCV 的内部多线程，防止 DataLoader 死锁
+cv2.ocl.setUseOpenCL(False)
 
+import os
+# 确保以下环境变量在最前面生效
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 # ==================================================================================================
 # 1. Configuration
 # ==================================================================================================
@@ -572,7 +582,7 @@ def main(args):
         val_sampler = DistributedSampler(val_dataset, shuffle=True) if world_size > 1 else None
         
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), 
-                                  num_workers=8, collate_fn=stack_dict_batched, pin_memory=True, sampler=train_sampler,
+                                  num_workers=4, collate_fn=stack_dict_batched, pin_memory=True, sampler=train_sampler,
                                   persistent_workers=True, prefetch_factor=2)
         val_loader = DataLoader(val_dataset, batch_size=1, shuffle=(val_sampler is None), 
                                 num_workers=4, collate_fn=stack_dict_batched, pin_memory=True, sampler=val_sampler,
@@ -666,7 +676,7 @@ def main(args):
                 add_to_params(raw_model.basic_hv_head, vision_lr)
                 
             if getattr(raw_model, 'use_asr', False):
-                cnn_lr = args.lr * 0.1 # CNN 骨干用小一点的学习率
+                cnn_lr = args.lr * 0.5 # CNN 骨干用小一点的学习率
                 add_to_params(raw_model.cnn_stage0, cnn_lr)
                 add_to_params(raw_model.cnn_stage1, cnn_lr)
                 add_to_params(raw_model.cnn_stage2, cnn_lr)
