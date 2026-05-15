@@ -97,12 +97,12 @@ def parse_args():
     parser.add_argument("--use_coop", action="store_true", default=False, help="启用 CoOp 可学习文本提示")
     parser.add_argument("--use_asr", action="store_true", default=False, help="启用 ASR 自适应谱细化上采样模块")
     parser.add_argument(
-        "--prompt_mode",
-        type=str,
-        default="dynamic",
-        choices=["generic", "dynamic"],
-        help="训练时的文本提示生成模式",
-    )
+    "--prompt_mode",
+    type=str,
+    default="dynamic",
+    choices=["base", "generic", "organ_static", "dynamic", "attribute_only", "morphology_only"],
+    help="训练时的文本提示生成模式",
+)
 
     # 两阶段控制参数
     parser.add_argument(

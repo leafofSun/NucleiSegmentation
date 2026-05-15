@@ -454,10 +454,19 @@ class TextSam(Sam):
             return_tensors="pt",
         )
 
-        if isinstance(tokenized, dict):
+        # ==== 主要修改部分开始 ====
+        # 更强壮的字典/BatchEncoding判断，确保只返回 Tensor
+        if hasattr(tokenized, "input_ids"):
+            tokens = tokenized.input_ids
+        elif isinstance(tokenized, dict) and "input_ids" in tokenized:
             tokens = tokenized["input_ids"]
         else:
             tokens = tokenized
+
+        # 兜底防抖：以防某些自定义 tokenizer 忽略了 return_tensors="pt"
+        if not torch.is_tensor(tokens):
+            tokens = torch.tensor(tokens)
+        # ==== 主要修改部分结束 ====
 
         return tokens.to(device)
 
