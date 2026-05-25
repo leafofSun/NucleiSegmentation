@@ -50,7 +50,6 @@ class GlobalASRUpsampler(nn.Module):
 
         self.init_conv = nn.Conv2d(embed_dim + 2 + hm_channels, 256, kernel_size=3, padding=1)
 
-        # 上采样 1: 64x64 -> 128x128, 拼接 ResNet Stage2: 512 channels
         self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
         self.conv1 = nn.Sequential(
             nn.Conv2d(128 + (512 if use_asr else 0), 128, kernel_size=3, padding=1),
@@ -58,7 +57,6 @@ class GlobalASRUpsampler(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # 上采样 2: 128x128 -> 256x256, 拼接 ResNet Stage1: 256 channels
         self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
         self.conv2 = nn.Sequential(
             nn.Conv2d(64 + (256 if use_asr else 0), 64, kernel_size=3, padding=1),
@@ -66,7 +64,6 @@ class GlobalASRUpsampler(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # 上采样 3: 256x256 -> 512x512, 拼接 ResNet conv stem: 64 channels
         self.up3 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
         self.conv3 = nn.Sequential(
             nn.Conv2d(32 + (64 if use_asr else 0), 32, kernel_size=3, padding=1),
@@ -74,7 +71,6 @@ class GlobalASRUpsampler(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # 上采样 4: 512x512 -> 1024x1024
         self.up4 = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
         self.conv4 = nn.Sequential(
             nn.Conv2d(16, 16, kernel_size=3, padding=1),
@@ -110,13 +106,72 @@ class GlobalASRUpsampler(nn.Module):
         return self.hv_out(x), self.hm_out(x)
 
 
+class SemanticChannelGate(nn.Module):
+    """
+    Pathology-aware channel recalibration gate.
+
+    设计目的:
+        病理文本通常是 patch-level / organ-level 全局语义，不具备像素级空间对齐。
+        因此语义分支不应该直接覆盖 SAM 的空间定位特征，而应该只通过通道级权重
+        选择性增强或抑制与染色、形态、密度、边界相关的通道。
+
+    输入:
+        semantic_delta: [B, C, H, W]
+
+    输出:
+        channel_gate: [B, C, 1, 1]
+
+    当前版本:
+        channel_gate = max_gate * sigmoid(gate_logits)
+
+    这样即使 gate 被学习打开，也不会让语义残差完全压过视觉底盘。
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        reduction: int = 16,
+        init_bias: float = -4.0,
+        max_gate: float = 0.10,
+    ):
+        super().__init__()
+        hidden_dim = max(embed_dim // reduction, 16)
+        self.max_gate = float(max_gate)
+
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(embed_dim, hidden_dim, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, embed_dim, kernel_size=1, bias=True),
+        )
+
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.constant_(self.gate[-1].bias, init_bias)
+
+    def forward(self, semantic_delta: torch.Tensor) -> torch.Tensor:
+        gate = torch.sigmoid(self.gate(semantic_delta))
+        return gate * self.max_gate
+
+
 class PhysicalAdapter(nn.Module):
+    """
+    将低频 / 高频视觉特征转换成 CoOp context modulation 参数。
+
+    当前版本：
+        1. low/high 都先通过 _to_vector() 统一转成 [B, C]。
+        2. 支持输入 [B, C] 或 [B, C, H, W]。
+        3. 显式检查通道维，维度不符时直接抛出可读错误。
+    """
+
     def __init__(self, feat_dim_low: int, feat_dim_high: int, ctx_dim: int):
         super().__init__()
 
+        self.feat_dim_low = feat_dim_low
+        self.feat_dim_high = feat_dim_high
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
         self.adapter_low = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
             nn.Linear(feat_dim_low, ctx_dim),
             nn.ReLU(),
             nn.Linear(ctx_dim, ctx_dim * 2),
@@ -133,15 +188,37 @@ class PhysicalAdapter(nn.Module):
         nn.init.zeros_(self.adapter_high[-1].weight)
         nn.init.zeros_(self.adapter_high[-1].bias)
 
+    def _to_vector(self, feat: torch.Tensor, expected_dim: int, name: str) -> torch.Tensor:
+        if feat.dim() == 4:
+            feat = self.pool(feat).flatten(1)
+        elif feat.dim() == 2:
+            feat = feat
+        else:
+            raise ValueError(
+                f"PhysicalAdapter expects {name} to be 2D [B, C] or 4D [B, C, H, W], "
+                f"but got shape={tuple(feat.shape)}"
+            )
+
+        if feat.shape[-1] != expected_dim:
+            raise ValueError(
+                f"PhysicalAdapter {name} channel mismatch: expected {expected_dim}, "
+                f"got {feat.shape[-1]} from shape={tuple(feat.shape)}"
+            )
+
+        return feat
+
     def forward(
         self,
         feat_low: torch.Tensor,
         feat_high: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        low_params = self.adapter_low(feat_low)
+        feat_low_vec = self._to_vector(feat_low, self.feat_dim_low, "feat_low")
+        feat_high_vec = self._to_vector(feat_high, self.feat_dim_high, "feat_high")
+
+        low_params = self.adapter_low(feat_low_vec)
         gamma_low, beta_low = torch.chunk(low_params, 2, dim=1)
 
-        high_params = self.adapter_high(feat_high)
+        high_params = self.adapter_high(feat_high_vec)
         gamma_high, beta_high = torch.chunk(high_params, 2, dim=1)
 
         return gamma_low, beta_low, gamma_high, beta_high
@@ -178,7 +255,6 @@ class DualPromptLearner(nn.Module):
         self.ctx_specific = nn.Parameter(torch.empty(num_organs, n_ctx_spec, ctx_dim, dtype=dtype))
         nn.init.normal_(self.ctx_specific, std=0.02)
 
-        # 重点：使用 object.__setattr__，避免这些 CONCH 子模块被注册进 prompt_learner.parameters()
         object.__setattr__(self, "clip_token_embedding", text_encoder.token_embedding)
         object.__setattr__(self, "clip_transformer", text_encoder.transformer)
         object.__setattr__(self, "clip_ln_final", text_encoder.ln_final)
@@ -241,7 +317,6 @@ class DualPromptLearner(nn.Module):
             ctx_spec = ctx_spec_modulated
             ctx = torch.cat([ctx_gen, ctx_spec], dim=1)
         else:
-            # 保证 physical_adapter 在 DDP 下不会完全 unused
             dummy_adapter = sum(p.sum() * 0.0 for p in self.physical_adapter.parameters())
             ctx = ctx + dummy_adapter
 
@@ -341,22 +416,26 @@ class TextSam(Sam):
         use_coop: bool = True,
         use_ot: bool = False,
         use_asr: bool = True,
+        max_semantic_gate: float = 0.10,
+        max_delta_ratio: float = 0.10,
+        init_delta_ratio: float = 0.02,
     ):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
 
         self.use_pnurl = use_pnurl
         self.use_coop = use_coop
 
-        # OT 已从当前主线移除。保留 use_ot 入参只是为了兼容旧 train.py / 旧命令。
         if use_ot:
             print("⚠️ use_ot=True was passed, but OT is disabled in this version of TextSam.")
         self.use_ot = False
 
         self.use_asr = use_asr
+        self.max_semantic_gate = float(max_semantic_gate)
+        self.max_delta_ratio = float(max_delta_ratio)
+        self.init_delta_ratio = float(init_delta_ratio)
 
         print("🚀 Initializing MP-SAM / FreqPath-SAM with CONCH...")
 
-        # 1. Load CONCH and freeze it
         hf_auth_token = os.environ.get("HF_TOKEN")
         if not hf_auth_token:
             print("⚠️ Warning: HF_TOKEN environment variable is not set. Model load may fail if not cached.")
@@ -371,7 +450,6 @@ class TextSam(Sam):
         for param in self.clip_model.parameters():
             param.requires_grad = False
 
-        # 2. CoOp / Dual Prompt Learner
         self.prompt_learner = DualPromptLearner(
             self.clip_model,
             num_organs=num_organs,
@@ -382,37 +460,37 @@ class TextSam(Sam):
         for param in self.prompt_learner.parameters():
             param.requires_grad = use_coop
 
-        # 3. PNuRL
         self.pnurl = PNuRL(
             embed_dim=embed_dim,
             text_dim=512,
             num_classes_per_attr=[2, 3, 2, 3, 3],
             attr_loss_weight=1.0,
+            max_delta_ratio=max_delta_ratio,
+            init_delta_ratio=init_delta_ratio,
         )
 
-        # 关键修复：把 PNuRL residual gate 注册到 pnurl 内部。
-        # 这样 train.py 中 add_to_params(raw_model.pnurl, args.lr) 会自动包含这个 gate。
-        # sigmoid(-6) ≈ 0.002，第二阶段起步时几乎不扰动 vision best。
-        self.pnurl.residual_gate = nn.Parameter(torch.tensor(-6.0))
+        self.pnurl.semantic_channel_gate = SemanticChannelGate(
+            embed_dim=embed_dim,
+            reduction=16,
+            init_bias=-4.0,
+            max_gate=max_semantic_gate,
+        )
 
         for param in self.pnurl.parameters():
             param.requires_grad = use_pnurl
 
-        # 4. Auto Prompt Generator
         self.prompt_generator = TextGuidedPointGenerator(
             embed_dim=embed_dim,
             text_dim=text_dim,
             num_heads=num_heads,
         )
 
-        # 5. HV head: OT 移除后，始终使用普通 HV head
         self.basic_hv_head = nn.Sequential(
             nn.Conv2d(embed_dim, embed_dim // 2, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(embed_dim // 2, 2, kernel_size=1),
         )
 
-        # 6. CNN high-frequency branch for ASR
         if self.use_asr:
             resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
 
@@ -431,7 +509,6 @@ class TextSam(Sam):
                 hm_channels=2,
             )
 
-        # 7. SAM freeze strategy
         for param in self.image_encoder.parameters():
             param.requires_grad = False
 
@@ -441,9 +518,11 @@ class TextSam(Sam):
         for param in self.mask_decoder.parameters():
             param.requires_grad = True
 
-        for name, param in self.image_encoder.named_parameters():
-            if "Adapter" in name:
-                param.requires_grad = True
+        for param in self.pnurl.parameters():
+            param.requires_grad = use_pnurl
+
+        for param in self.prompt_learner.parameters():
+            param.requires_grad = use_coop
 
     def _tokenize_to_input_ids(self, texts: List[str], device: torch.device) -> torch.Tensor:
         tokenized = self.tokenizer(
@@ -454,8 +533,6 @@ class TextSam(Sam):
             return_tensors="pt",
         )
 
-        # ==== 主要修改部分开始 ====
-        # 更强壮的字典/BatchEncoding判断，确保只返回 Tensor
         if hasattr(tokenized, "input_ids"):
             tokens = tokenized.input_ids
         elif isinstance(tokenized, dict) and "input_ids" in tokenized:
@@ -463,10 +540,8 @@ class TextSam(Sam):
         else:
             tokens = tokenized
 
-        # 兜底防抖：以防某些自定义 tokenizer 忽略了 return_tensors="pt"
         if not torch.is_tensor(tokens):
             tokens = torch.tensor(tokens)
-        # ==== 主要修改部分结束 ====
 
         return tokens.to(device)
 
@@ -480,19 +555,108 @@ class TextSam(Sam):
             return int(value.detach().cpu().view(-1)[0].item())
         return int(value)
 
+    @staticmethod
+    def _safe_text(value, default: str = "Cell nuclei") -> str:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value if value.strip() else default
+        return str(value)
+
+    @staticmethod
+    def _safe_scalar(
+        value: Optional[torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+        default: float = 0.0,
+    ) -> torch.Tensor:
+        if value is None:
+            return torch.tensor(default, device=device, dtype=dtype)
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return torch.tensor(default, device=device, dtype=dtype)
+            return value.detach().float().mean().to(device=device, dtype=dtype)
+        return torch.tensor(float(value), device=device, dtype=dtype)
+
+    @staticmethod
+    def _feature_norm(x: Optional[torch.Tensor], device: Optional[torch.device] = None) -> torch.Tensor:
+        if x is None:
+            if device is None:
+                return torch.tensor(0.0)
+            return torch.tensor(0.0, device=device)
+        if x.dim() >= 2:
+            return x.detach().float().norm(dim=1).mean()
+        return x.detach().float().norm()
+
+    def _get_semantic_channel_gate(
+        self,
+        semantic_delta: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        返回通道级语义门控 [B, C, 1, 1]。
+
+        兼容旧 checkpoint：如果旧模型没有 semantic_channel_gate，则动态补一个。
+        正式训练建议从新 full-architecture checkpoint 开始。
+        """
+        if not hasattr(self.pnurl, "semantic_channel_gate"):
+            self.pnurl.semantic_channel_gate = SemanticChannelGate(
+                embed_dim=semantic_delta.shape[1],
+                reduction=16,
+                init_bias=-4.0,
+                max_gate=self.max_semantic_gate,
+            ).to(device)
+
+        channel_gate = self.pnurl.semantic_channel_gate(semantic_delta.to(dtype=torch.float32))
+        return channel_gate.to(device=device, dtype=dtype)
+
+    @staticmethod
+    def _controlled_residual_injection(
+        image_embeddings: torch.Tensor,
+        semantic_delta: torch.Tensor,
+        channel_gate: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        执行受控语义残差注入，并返回诊断。
+
+        Args:
+            image_embeddings: [B, C, H, W]
+            semantic_delta: [B, C, H, W]
+            channel_gate: [B, C, 1, 1]
+
+        Returns:
+            refined_image_embeddings
+            injected_delta
+            injected_delta_norm
+            injection_ratio
+        """
+        if semantic_delta.shape != image_embeddings.shape:
+            raise ValueError(
+                f"semantic_delta shape mismatch: expected {tuple(image_embeddings.shape)}, "
+                f"got {tuple(semantic_delta.shape)}"
+            )
+
+        injected_delta = channel_gate * semantic_delta
+        refined_image_embeddings = image_embeddings + injected_delta
+
+        base_feat_norm = image_embeddings.detach().float().norm(dim=1).mean()
+        injected_delta_norm = injected_delta.detach().float().norm(dim=1).mean()
+        injection_ratio = injected_delta_norm / (base_feat_norm + 1e-6)
+
+        return refined_image_embeddings, injected_delta, injected_delta_norm, injection_ratio
+
     def forward(self, batched_input, multimask_output=False):
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         image_embeddings = self.image_encoder(input_images)
         device = image_embeddings.device
 
-        # 1. CNN high-frequency features for ASR
         feat_half, feat_s1, feat_s2 = None, None, None
 
         if self.use_asr:
             with torch.autocast("cuda", enabled=input_images.is_cuda):
                 x_cnn = input_images
 
-                # conv1 + bn1 + relu
                 for i in range(3):
                     x_cnn = self.cnn_stage0[i](x_cnn)
 
@@ -501,23 +665,20 @@ class TextSam(Sam):
                 feat_s1 = self.cnn_stage1(feat_s0)
                 feat_s2 = self.cnn_stage2(feat_s1)
 
-        # 2. Ensure CONCH is on the same device
         if next(self.clip_model.parameters()).device != device:
             self.clip_model = self.clip_model.to(device)
 
-        # 3. Metadata
         organ_indices_list = []
         attribute_texts = []
         base_texts = []
 
         for x in batched_input:
             organ_indices_list.append(self._get_int_value(x.get("organ_id", 20), default=20))
-            attribute_texts.append(x.get("attribute_text", "Cell nuclei"))
-            base_texts.append(x.get("text_prompt", "Cell nuclei"))
+            attribute_texts.append(self._safe_text(x.get("attribute_text", "Cell nuclei"), "Cell nuclei"))
+            base_texts.append(self._safe_text(x.get("text_prompt", "Cell nuclei"), "Cell nuclei"))
 
         organ_indices = torch.tensor(organ_indices_list, dtype=torch.long, device=device)
 
-        # 4. Attribute labels
         attribute_labels_list = []
         for x in batched_input:
             attr_labels = x.get("attr_labels", None)
@@ -536,7 +697,6 @@ class TextSam(Sam):
             attr_labels_batch = torch.stack(attribute_labels_list, dim=0).to(device=device, dtype=torch.long)
             attribute_labels = [attr_labels_batch[:, i] for i in range(5)]
 
-        # 5. PNuRL: pathology semantic disentanglement with residual gate
         if self.use_pnurl:
             if next(self.pnurl.parameters()).device != device:
                 self.pnurl = self.pnurl.to(device)
@@ -546,39 +706,97 @@ class TextSam(Sam):
                 attr_text_embed = self.clip_model.encode_text(attr_tokens).float()
                 attr_text_embed = F.normalize(attr_text_embed, dim=-1, eps=1e-6)
 
-            (
-                pnurl_refined_embeddings,
-                pnurl_context,
-                pnurl_loss,
-                attr_logits,
-                density_map,
-                txt_attr_feat,
-                txt_mor_feat,
-            ) = self.pnurl(
+            pnurl_out = self.pnurl(
                 image_features=image_embeddings,
                 text_embed=attr_text_embed,
                 attribute_labels=attribute_labels,
                 return_loss=True,
             )
 
-            # 关键修复：PNuRL 只通过 residual gate 渐进影响视觉底盘
-            gate = torch.sigmoid(self.pnurl.residual_gate).to(device=device, dtype=image_embeddings.dtype)
-            refined_image_embeddings = image_embeddings + gate * (pnurl_refined_embeddings - image_embeddings)
+            if not isinstance(pnurl_out, dict):
+                raise TypeError(
+                    "PNuRL.forward must return a dict with keys: "
+                    "semantic_delta, attr_logits, density_map, "
+                    "low_freq_prompt, high_freq_prompt, pnurl_loss. "
+                    "The old tuple return protocol is no longer supported."
+                )
 
-            if txt_attr_feat is not None:
-                txt_attr_feat = gate * txt_attr_feat
-            if txt_mor_feat is not None:
-                txt_mor_feat = gate * txt_mor_feat
+            required_keys = ("semantic_delta", "low_freq_prompt", "high_freq_prompt")
+            missing_keys = [key for key in required_keys if key not in pnurl_out]
+            if missing_keys:
+                raise KeyError(f"PNuRL output missing required keys: {missing_keys}")
 
+            semantic_delta = pnurl_out["semantic_delta"].to(dtype=image_embeddings.dtype)
+            attr_logits = pnurl_out.get("attr_logits", {})
+            density_map = pnurl_out.get("density_map", None)
+
+            low_freq_prompt = pnurl_out["low_freq_prompt"]
+            high_freq_prompt = pnurl_out["high_freq_prompt"]
+
+            pnurl_loss = pnurl_out.get("pnurl_loss", torch.tensor(0.0, device=device))
+            semantic_delta_reg_loss = pnurl_out.get(
+                "semantic_delta_reg_loss",
+                torch.tensor(0.0, device=device),
+            )
+            semantic_delta_ratio = pnurl_out.get("semantic_delta_ratio", None)
+            semantic_delta_raw_norm = pnurl_out.get("semantic_delta_raw_norm", None)
+            semantic_delta_direction_norm = pnurl_out.get("semantic_delta_direction_norm", None)
+
+            channel_gate = self._get_semantic_channel_gate(
+                semantic_delta=semantic_delta,
+                device=device,
+                dtype=image_embeddings.dtype,
+            )
+
+            (
+                refined_image_embeddings,
+                injected_delta,
+                injected_delta_norm,
+                injection_ratio,
+            ) = self._controlled_residual_injection(
+                image_embeddings=image_embeddings,
+                semantic_delta=semantic_delta,
+                channel_gate=channel_gate,
+            )
+
+            semantic_delta_norm = semantic_delta.detach().float().norm(dim=1).mean()
+            base_feat_norm = image_embeddings.detach().float().norm(dim=1).mean()
+            channel_gate_mean = channel_gate.detach().float().mean()
+            channel_gate_min = channel_gate.detach().float().min()
+            channel_gate_max = channel_gate.detach().float().max()
         else:
+            semantic_delta = torch.zeros_like(image_embeddings)
+            channel_gate = torch.zeros(
+                image_embeddings.shape[0],
+                image_embeddings.shape[1],
+                1,
+                1,
+                device=device,
+                dtype=image_embeddings.dtype,
+            )
+            injected_delta = torch.zeros_like(image_embeddings)
             refined_image_embeddings = image_embeddings
+
+            channel_gate_mean = torch.tensor(0.0, device=device)
+            channel_gate_min = torch.tensor(0.0, device=device)
+            channel_gate_max = torch.tensor(0.0, device=device)
+
+            semantic_delta_norm = torch.tensor(0.0, device=device)
+            base_feat_norm = image_embeddings.detach().float().norm(dim=1).mean()
+            injected_delta_norm = torch.tensor(0.0, device=device)
+            injection_ratio = torch.tensor(0.0, device=device)
+
             pnurl_loss = torch.tensor(0.0, device=device)
+            semantic_delta_reg_loss = torch.tensor(0.0, device=device)
+            semantic_delta_ratio = torch.tensor(0.0, device=device)
+            semantic_delta_raw_norm = torch.tensor(0.0, device=device)
+            semantic_delta_direction_norm = torch.tensor(0.0, device=device)
+
             attr_logits = {}
             density_map = None
-            txt_attr_feat = None
-            txt_mor_feat = None
+            low_freq_prompt = None
+            high_freq_prompt = None
 
-        # 6. Text features for positive / negative prompt generation
         pos_tokens = self._tokenize_to_input_ids(base_texts, device)
         neg_tokens = self._tokenize_to_input_ids(["Background"] * len(base_texts), device)
 
@@ -593,18 +811,34 @@ class TextSam(Sam):
                 pos_feats = self.clip_model.encode_text(pos_tokens).float()
                 neg_feats = self.clip_model.encode_text(neg_tokens).float()
 
-        # 关键修复：无论 CoOp 是否启用，都统一归一化
         pos_feats = F.normalize(pos_feats.float(), dim=-1, eps=1e-6)
         neg_feats = F.normalize(neg_feats.float(), dim=-1, eps=1e-6)
 
         text_features = torch.stack([pos_feats, neg_feats], dim=1).float()
 
-        # 7. Point Generator and HV head
+        diagnostics = {
+            "semantic_channel_gate_mean": channel_gate_mean.detach().float(),
+            "semantic_channel_gate_min": channel_gate_min.detach().float(),
+            "semantic_channel_gate_max": channel_gate_max.detach().float(),
+            "semantic_delta_norm": semantic_delta_norm.detach().float(),
+            "base_feat_norm": base_feat_norm.detach().float(),
+            "injected_delta_norm": injected_delta_norm.detach().float(),
+            "injection_ratio": injection_ratio.detach().float(),
+            "semantic_delta_reg_loss": self._safe_scalar(semantic_delta_reg_loss, device),
+            "semantic_delta_ratio": self._safe_scalar(semantic_delta_ratio, device),
+            "semantic_delta_raw_norm": self._safe_scalar(semantic_delta_raw_norm, device),
+            "semantic_delta_direction_norm": self._safe_scalar(semantic_delta_direction_norm, device),
+            "pos_text_norm": pos_feats.detach().float().norm(dim=-1).mean(),
+            "neg_text_norm": neg_feats.detach().float().norm(dim=-1).mean(),
+            "use_pnurl": torch.tensor(float(self.use_pnurl), device=device),
+            "use_coop": torch.tensor(float(self.use_coop), device=device),
+            "use_ot": torch.tensor(0.0, device=device),
+        }
+
         fused_image_embeddings = refined_image_embeddings
         heatmap_logits_coarse = self.prompt_generator(refined_image_embeddings, text_features)
         hv_logits_coarse = self.basic_hv_head(refined_image_embeddings)
 
-        # 8. Global ASR upsampling
         if self.use_asr:
             hv_logits_out, heatmap_logits_out = self.global_asr_upsampler(
                 fused_image_embeddings,
@@ -618,7 +852,6 @@ class TextSam(Sam):
             hv_logits_out = hv_logits_coarse
             heatmap_logits_out = heatmap_logits_coarse
 
-        # 9. Adaptive point distance according to size attribute
         size_logits = attr_logits.get("size", None)
         if size_logits is not None and size_logits.numel() > 0:
             pred_size_class = torch.argmax(size_logits, dim=1)
@@ -639,7 +872,6 @@ class TextSam(Sam):
         input_size = self.image_encoder.img_size
         scale_factor = input_size / feat_size
 
-        # 10. SAM Mask Decoder loop
         outputs = []
 
         for i in range(len(batched_input)):
@@ -672,13 +904,35 @@ class TextSam(Sam):
                 else:
                     density_map_i = density_map_raw
 
+            common_output = {
+                "heatmap_logits": hm_out_i,
+                "hv_logits": hv_out_i,
+                "attr_logits": attr_logits,
+                "density_map": density_map_i,
+                "pnurl_loss": pnurl_loss,
+                "semantic_delta": semantic_delta[i:i + 1],
+                "semantic_channel_gate": channel_gate[i:i + 1],
+                "injected_delta": injected_delta[i:i + 1],
+                "base_feat": image_embeddings[i:i + 1],
+                "semantic_delta_norm": semantic_delta_norm,
+                "base_feat_norm": base_feat_norm,
+                "injected_delta_norm": injected_delta_norm,
+                "injection_ratio": injection_ratio,
+                "semantic_delta_reg_loss": semantic_delta_reg_loss,
+                "semantic_delta_ratio": diagnostics["semantic_delta_ratio"],
+                "semantic_delta_raw_norm": diagnostics["semantic_delta_raw_norm"],
+                "semantic_delta_direction_norm": diagnostics["semantic_delta_direction_norm"],
+                "diagnostics": diagnostics,
+                "organ_cls_loss": getattr(self, "organ_cls_loss_cache", torch.tensor(0.0, device=device)),
+            }
+
             if not prompt_data["has_points"]:
                 dummy = fused_image_embeddings[i].sum() * 0.0
 
                 if density_map_i is not None:
-                    density_map_i = density_map_i + dummy
+                    common_output["density_map"] = density_map_i + dummy
 
-                outputs.append(
+                common_output.update(
                     {
                         "masks": (
                             torch.zeros((1, 1, target_h, target_w), device=device, dtype=torch.float32) - 100.0
@@ -689,12 +943,9 @@ class TextSam(Sam):
                         ) + dummy,
                         "heatmap_logits": hm_out_i + dummy,
                         "hv_logits": hv_out_i + dummy if hv_out_i is not None else None,
-                        "attr_logits": attr_logits,
-                        "density_map": density_map_i,
-                        "pnurl_loss": pnurl_loss,
-                        "organ_cls_loss": getattr(self, "organ_cls_loss_cache", torch.tensor(0.0, device=device)),
                     }
                 )
+                outputs.append(common_output)
                 continue
 
             point_coords = prompt_data["point_coords"]
@@ -715,8 +966,8 @@ class TextSam(Sam):
             chunk_masks = []
             chunk_ious = []
 
-            curr_attr_prompt = txt_attr_feat[i:i + 1] if txt_attr_feat is not None else None
-            curr_morph_feat = txt_mor_feat[i:i + 1] if txt_mor_feat is not None else None
+            curr_low_freq_prompt = low_freq_prompt[i:i + 1] if low_freq_prompt is not None else None
+            curr_high_freq_prompt = high_freq_prompt[i:i + 1] if high_freq_prompt is not None else None
 
             for start_idx in range(0, num_cells, chunk_size):
                 end_idx = min(start_idx + chunk_size, num_cells)
@@ -745,20 +996,20 @@ class TextSam(Sam):
                     masks=None,
                 )
 
-                sub_attr_prompt = None
-                sub_morph_feat = None
+                sub_low_freq_prompt = None
+                sub_high_freq_prompt = None
 
-                if curr_attr_prompt is not None:
-                    if curr_attr_prompt.dim() == 2:
-                        sub_attr_prompt = curr_attr_prompt.expand(current_batch, -1).contiguous()
-                    elif curr_attr_prompt.dim() == 3:
-                        sub_attr_prompt = curr_attr_prompt.expand(current_batch, -1, -1).contiguous()
+                if curr_low_freq_prompt is not None:
+                    if curr_low_freq_prompt.dim() == 2:
+                        sub_low_freq_prompt = curr_low_freq_prompt.expand(current_batch, -1).contiguous()
+                    elif curr_low_freq_prompt.dim() == 3:
+                        sub_low_freq_prompt = curr_low_freq_prompt.expand(current_batch, -1, -1).contiguous()
 
-                if curr_morph_feat is not None:
-                    if curr_morph_feat.dim() == 2:
-                        sub_morph_feat = curr_morph_feat.expand(current_batch, -1).contiguous()
-                    elif curr_morph_feat.dim() == 3:
-                        sub_morph_feat = curr_morph_feat.expand(current_batch, -1, -1).contiguous()
+                if curr_high_freq_prompt is not None:
+                    if curr_high_freq_prompt.dim() == 2:
+                        sub_high_freq_prompt = curr_high_freq_prompt.expand(current_batch, -1).contiguous()
+                    elif curr_high_freq_prompt.dim() == 3:
+                        sub_high_freq_prompt = curr_high_freq_prompt.expand(current_batch, -1, -1).contiguous()
 
                 sub_mask, sub_iou = self.mask_decoder(
                     image_embeddings=sub_img_embed,
@@ -768,8 +1019,8 @@ class TextSam(Sam):
                     multimask_output=multimask_output,
                     cnn_feat_s1=sub_cnn_s1,
                     cnn_feat_s2=sub_cnn_s2,
-                    attr_prompt=sub_attr_prompt,
-                    morph_feat=sub_morph_feat,
+                    low_freq_prompt=sub_low_freq_prompt,
+                    high_freq_prompt=sub_high_freq_prompt,
                 )
 
                 chunk_masks.append(sub_mask)
@@ -787,21 +1038,15 @@ class TextSam(Sam):
                 original_size=batched_input[i]["original_size"],
             )
 
-            outputs.append(
+            common_output.update(
                 {
                     "masks": mask_post,
                     "iou_predictions": merged_iou,
                     "low_res_logits": merged_logits,
-                    "heatmap_logits": hm_out_i,
-                    "hv_logits": hv_out_i,
-                    "attr_logits": attr_logits,
-                    "density_map": density_map_i,
-                    "pnurl_loss": pnurl_loss,
-                    "organ_cls_loss": getattr(self, "organ_cls_loss_cache", torch.tensor(0.0, device=device)),
                 }
             )
+            outputs.append(common_output)
 
-        # DDP safety: ensure all trainable parameters have a zero-gradient path.
         if self.training and len(outputs) > 0:
             dummy = torch.tensor(0.0, device=device)
 

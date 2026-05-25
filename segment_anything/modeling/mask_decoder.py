@@ -10,20 +10,22 @@ from torch.nn import functional as F
 from .common import LayerNorm2d
 
 
-class MorphologyEncoder(nn.Module):
+class HighFrequencyPromptEncoder(nn.Module):
     """
-    形态学提示编码器。
+    高频形态提示编码器。
 
     输入:
-        morph_feat:
+        high_freq_prompt:
             来自 PNuRL 的高频形态特征，通常为 [B, C] 或 [B, N, C]。
 
     输出:
-        layer_prompts:
-            为不同 CNN 层级生成的形态提示。
-            默认:
-                layer_prompts[0] -> 512 dim, 对应 ResNet Stage2 / cnn_feat_s2
-                layer_prompts[1] -> 256 dim, 对应 ResNet Stage1 / cnn_feat_s1
+        layer_high_freq_prompts:
+            layer_high_freq_prompts[0] -> 512 dim，对应 ResNet Stage2 / cnn_feat_s2。
+            layer_high_freq_prompts[1] -> 256 dim，对应 ResNet Stage1 / cnn_feat_s1。
+
+    约束:
+        该模块只服务 high-frequency boundary branch。
+        不参与 low-frequency semantic branch。
     """
 
     def __init__(self, text_dim: int = 512, cnn_dims: List[int] = [512, 256]):
@@ -43,41 +45,59 @@ class MorphologyEncoder(nn.Module):
             [nn.Linear(text_dim, dim) for dim in cnn_dims]
         )
 
-    def forward(self, morph_feat: torch.Tensor) -> List[torch.Tensor]:
-        if morph_feat.dim() == 3:
-            morph_feat = morph_feat.mean(dim=1)
+    def forward(self, high_freq_prompt: torch.Tensor) -> List[torch.Tensor]:
+        if high_freq_prompt.dim() == 3:
+            high_freq_prompt = high_freq_prompt.mean(dim=1)
 
-        if morph_feat.dim() != 2:
-            raise ValueError(f"morph_feat must be [B, C] or [B, N, C], got {morph_feat.shape}")
+        if high_freq_prompt.dim() != 2:
+            raise ValueError(
+                f"high_freq_prompt must be [B, C] or [B, N, C], "
+                f"got {tuple(high_freq_prompt.shape)}"
+            )
+
+        if high_freq_prompt.shape[-1] != self.text_dim:
+            raise ValueError(
+                f"high_freq_prompt channel mismatch: expected {self.text_dim}, "
+                f"got {high_freq_prompt.shape[-1]} from shape={tuple(high_freq_prompt.shape)}"
+            )
 
         dtype = self.joint_fusion[0].weight.dtype
         device = self.joint_fusion[0].weight.device
-        morph_feat = morph_feat.to(device=device, dtype=dtype)
+        high_freq_prompt = high_freq_prompt.to(device=device, dtype=dtype)
 
-        joint_morph = self.joint_fusion(morph_feat)
-        layer_prompts = [proj(joint_morph) for proj in self.scale_projections]
+        fused_high_freq_prompt = self.joint_fusion(high_freq_prompt)
+        layer_high_freq_prompts = [
+            proj(fused_high_freq_prompt) for proj in self.scale_projections
+        ]
 
-        return layer_prompts
+        return layer_high_freq_prompts
 
 
 class ASRBlock(nn.Module):
     """
     频域解耦式 SAM 上采样模块。
 
-    低频语义流:
-        x -> structure_upsample -> x_up
-        由 attr_prompt 做残差调制。
+    分支定义:
+        1. low-frequency semantic branch
+           x -> structure_upsample -> x_up
+           low_freq_prompt -> low_freq_modulator -> gamma_low
+           x_up = x_up * (1 + gamma_low)
 
-    高频边界流:
-        cnn_feat -> cnn_proj -> c
-        由 layer_morph_prompt 做残差调制。
-        之后与 x_up 融合，输出 detail 残差。
+        2. high-frequency boundary branch
+           high_freq_prompt -> HighFrequencyPromptEncoder -> layer_high_freq_prompt
+           layer_high_freq_prompt -> high_freq_modulator -> gamma_high
+           cnn_feat = cnn_feat * (1 + gamma_high)
+
+        3. CNN residual fusion
+           cnn_feat -> cnn_proj -> c
+           concat(x_up, c) -> cnn_residual_fusion -> detail
+           x_up = x_up + residual_scale * detail
 
     稳定性设计:
-        1. attr_modulator 最后一层零初始化，初始不改变 x_up。
-        2. morphology_modulator 最后一层零初始化，初始不改变 cnn_feat。
-        3. cnn_fusion 最后一层 1x1 卷积零初始化，初始 detail = 0。
-        4. 初始状态等价于原始 SAM 上采样分支。
+        1. low_freq_modulator 最后一层 zero-init，初始 gamma_low = 0。
+        2. high_freq_modulator 最后一层 zero-init，初始 gamma_high = 0。
+        3. cnn_residual_fusion 最后一层 zero-init，初始 detail = 0。
+        4. 初始状态接近原 SAM decoder。
     """
 
     def __init__(
@@ -94,6 +114,7 @@ class ASRBlock(nn.Module):
         self.out_dim = out_dim
         self.cnn_dim = cnn_dim
         self.text_dim = text_dim
+        self.has_cnn = cnn_dim is not None
 
         self.structure_upsample = nn.Sequential(
             nn.ConvTranspose2d(in_dim, out_dim, kernel_size=2, stride=2),
@@ -101,28 +122,26 @@ class ASRBlock(nn.Module):
             activation(),
         )
 
-        # 低频属性调制：初始 gamma = 0，因此 x_up 初始不变。
-        self.attr_modulator = nn.Sequential(
+        self.low_freq_modulator = nn.Sequential(
             nn.Linear(text_dim, out_dim),
             nn.LayerNorm(out_dim),
             activation(),
             nn.Linear(out_dim, out_dim),
         )
-        nn.init.zeros_(self.attr_modulator[-1].weight)
-        nn.init.zeros_(self.attr_modulator[-1].bias)
-
-        self.has_cnn = cnn_dim is not None
+        nn.init.zeros_(self.low_freq_modulator[-1].weight)
+        nn.init.zeros_(self.low_freq_modulator[-1].bias)
+        self.low_freq_residual_scale = nn.Parameter(torch.tensor(1.0))
 
         if self.has_cnn:
-            # 高频形态调制：初始 gamma = 0，因此 cnn_feat 初始不变。
-            self.morphology_modulator = nn.Sequential(
+            self.high_freq_modulator = nn.Sequential(
                 nn.Linear(cnn_dim, cnn_dim),
                 nn.LayerNorm(cnn_dim),
                 activation(),
                 nn.Linear(cnn_dim, cnn_dim),
             )
-            nn.init.zeros_(self.morphology_modulator[-1].weight)
-            nn.init.zeros_(self.morphology_modulator[-1].bias)
+            nn.init.zeros_(self.high_freq_modulator[-1].weight)
+            nn.init.zeros_(self.high_freq_modulator[-1].bias)
+            self.high_freq_residual_scale = nn.Parameter(torch.tensor(1.0))
 
             self.cnn_proj = nn.Sequential(
                 nn.Conv2d(cnn_dim, out_dim, kernel_size=1, bias=False),
@@ -130,81 +149,131 @@ class ASRBlock(nn.Module):
                 activation(),
             )
 
-            self.cnn_fusion = nn.Sequential(
+            self.cnn_residual_fusion = nn.Sequential(
                 nn.Conv2d(out_dim * 2, out_dim, kernel_size=3, padding=1, bias=False),
                 LayerNorm2d(out_dim),
                 activation(),
                 nn.Conv2d(out_dim, out_dim, kernel_size=1, bias=False),
             )
+            nn.init.zeros_(self.cnn_residual_fusion[-1].weight)
 
-            # 关键：初始 detail = 0，保证 ASR/CNN 分支接入时不破坏原始 SAM。
-            nn.init.zeros_(self.cnn_fusion[-1].weight)
-
-            # 可学习残差缩放因子。由于 detail 初始为 0，scale 初值为 1 仍然安全。
             self.residual_scale = nn.Parameter(torch.tensor(1.0))
 
     @staticmethod
-    def _to_prompt_vector(prompt: torch.Tensor, target_batch: int) -> torch.Tensor:
+    def _to_prompt_vector(
+        prompt: torch.Tensor,
+        target_batch: int,
+        expected_dim: int,
+        prompt_name: str,
+    ) -> torch.Tensor:
         if prompt.dim() == 3:
             prompt = prompt.mean(dim=1)
 
         if prompt.dim() != 2:
-            raise ValueError(f"Prompt must be [B, C] or [B, N, C], got {prompt.shape}")
+            raise ValueError(
+                f"{prompt_name} must be [B, C] or [B, N, C], got {tuple(prompt.shape)}"
+            )
 
         if prompt.shape[0] == 1 and target_batch > 1:
             prompt = prompt.expand(target_batch, -1).contiguous()
 
         if prompt.shape[0] != target_batch:
             raise ValueError(
-                f"Prompt batch size mismatch: prompt batch={prompt.shape[0]}, target batch={target_batch}"
+                f"{prompt_name} batch size mismatch: "
+                f"prompt batch={prompt.shape[0]}, target batch={target_batch}"
+            )
+
+        if prompt.shape[-1] != expected_dim:
+            raise ValueError(
+                f"{prompt_name} channel mismatch: expected {expected_dim}, "
+                f"got {prompt.shape[-1]} from shape={tuple(prompt.shape)}"
             )
 
         return prompt
+
+    @staticmethod
+    def _match_cnn_batch(cnn_feat: torch.Tensor, target_batch: int) -> torch.Tensor:
+        if cnn_feat.shape[0] == 1 and target_batch > 1:
+            return cnn_feat.expand(target_batch, -1, -1, -1).contiguous()
+
+        if cnn_feat.shape[0] != target_batch:
+            raise ValueError(
+                f"cnn_feat batch mismatch: cnn batch={cnn_feat.shape[0]}, "
+                f"target batch={target_batch}"
+            )
+
+        return cnn_feat
 
     def forward(
         self,
         x: torch.Tensor,
         cnn_feat: Optional[torch.Tensor] = None,
-        attr_prompt: Optional[torch.Tensor] = None,
-        layer_morph_prompt: Optional[torch.Tensor] = None,
+        low_freq_prompt: Optional[torch.Tensor] = None,
+        layer_high_freq_prompt: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x_up = self.structure_upsample(x)
         batch_size = x_up.shape[0]
 
-        # 1. 低频属性提示调制 x_up
-        if attr_prompt is not None:
-            attr_prompt = self._to_prompt_vector(attr_prompt, batch_size)
-            attr_prompt = attr_prompt.to(device=x_up.device, dtype=self.attr_modulator[0].weight.dtype)
+        # 1. low-frequency semantic branch：只接收 low_freq_prompt。
+        if low_freq_prompt is not None:
+            low_freq_prompt = self._to_prompt_vector(
+                low_freq_prompt,
+                target_batch=batch_size,
+                expected_dim=self.text_dim,
+                prompt_name="low_freq_prompt",
+            )
+            low_freq_prompt = low_freq_prompt.to(
+                device=x_up.device,
+                dtype=self.low_freq_modulator[0].weight.dtype,
+            )
 
-            gamma_low = self.attr_modulator(attr_prompt).to(dtype=x_up.dtype)
-            gamma_low = torch.tanh(gamma_low).unsqueeze(-1).unsqueeze(-1)
+            gamma_low = self.low_freq_modulator(low_freq_prompt).to(dtype=x_up.dtype)
+            low_scale = self.low_freq_residual_scale.to(device=x_up.device, dtype=x_up.dtype)
 
-            # 残差式调制，初始等价于 x_up。
+            gamma_low = torch.tanh(gamma_low) * low_scale
+            gamma_low = gamma_low.unsqueeze(-1).unsqueeze(-1)
+
             x_up = x_up * (1.0 + gamma_low)
 
-        # 2. 高频 CNN 边界流
+        # 2. high-frequency boundary branch：只接收 layer_high_freq_prompt 调制 CNN feature。
         if self.has_cnn and cnn_feat is not None:
+            cnn_feat = self._match_cnn_batch(cnn_feat, batch_size)
             cnn_feat = cnn_feat.to(device=x_up.device, dtype=x_up.dtype)
 
-            if layer_morph_prompt is not None:
-                layer_morph_prompt = self._to_prompt_vector(layer_morph_prompt, cnn_feat.shape[0])
-                layer_morph_prompt = layer_morph_prompt.to(
+            if layer_high_freq_prompt is not None:
+                layer_high_freq_prompt = self._to_prompt_vector(
+                    layer_high_freq_prompt,
+                    target_batch=batch_size,
+                    expected_dim=self.cnn_dim,
+                    prompt_name="layer_high_freq_prompt",
+                )
+                layer_high_freq_prompt = layer_high_freq_prompt.to(
                     device=cnn_feat.device,
-                    dtype=self.morphology_modulator[0].weight.dtype,
+                    dtype=self.high_freq_modulator[0].weight.dtype,
                 )
 
-                gamma_high = self.morphology_modulator(layer_morph_prompt).to(dtype=cnn_feat.dtype)
-                gamma_high = torch.tanh(gamma_high).unsqueeze(-1).unsqueeze(-1)
+                gamma_high = self.high_freq_modulator(layer_high_freq_prompt).to(dtype=cnn_feat.dtype)
+                high_scale = self.high_freq_residual_scale.to(
+                    device=cnn_feat.device,
+                    dtype=cnn_feat.dtype,
+                )
 
-                # 残差式调制，初始等价于 cnn_feat。
+                gamma_high = torch.tanh(gamma_high) * high_scale
+                gamma_high = gamma_high.unsqueeze(-1).unsqueeze(-1)
+
                 cnn_feat = cnn_feat * (1.0 + gamma_high)
 
             c = self.cnn_proj(cnn_feat)
 
             if c.shape[-2:] != x_up.shape[-2:]:
-                c = F.interpolate(c, size=x_up.shape[-2:], mode="bilinear", align_corners=False)
+                c = F.interpolate(
+                    c,
+                    size=x_up.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
-            detail = self.cnn_fusion(torch.cat([x_up, c], dim=1))
+            detail = self.cnn_residual_fusion(torch.cat([x_up, c], dim=1))
             scale = self.residual_scale.to(device=x_up.device, dtype=x_up.dtype)
 
             x_up = x_up + detail * scale
@@ -253,7 +322,7 @@ class MaskDecoder(nn.Module):
                 activation=activation,
             )
 
-            self.morph_encoder = MorphologyEncoder(
+            self.high_freq_prompt_encoder = HighFrequencyPromptEncoder(
                 text_dim=512,
                 cnn_dims=[512, 256],
             )
@@ -289,8 +358,8 @@ class MaskDecoder(nn.Module):
         multimask_output: bool,
         cnn_feat_s1: Optional[torch.Tensor] = None,
         cnn_feat_s2: Optional[torch.Tensor] = None,
-        attr_prompt: Optional[torch.Tensor] = None,
-        morph_feat: Optional[torch.Tensor] = None,
+        low_freq_prompt: Optional[torch.Tensor] = None,
+        high_freq_prompt: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         masks, iou_pred = self.predict_masks(
@@ -300,8 +369,8 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             cnn_feat_s1=cnn_feat_s1,
             cnn_feat_s2=cnn_feat_s2,
-            attr_prompt=attr_prompt,
-            morph_feat=morph_feat,
+            low_freq_prompt=low_freq_prompt,
+            high_freq_prompt=high_freq_prompt,
         )
 
         if multimask_output:
@@ -322,8 +391,8 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         cnn_feat_s1: Optional[torch.Tensor] = None,
         cnn_feat_s2: Optional[torch.Tensor] = None,
-        attr_prompt: Optional[torch.Tensor] = None,
-        morph_feat: Optional[torch.Tensor] = None,
+        low_freq_prompt: Optional[torch.Tensor] = None,
+        high_freq_prompt: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         output_tokens = torch.cat(
             [self.iou_token.weight, self.mask_tokens.weight],
@@ -353,23 +422,24 @@ class MaskDecoder(nn.Module):
         src = src.transpose(1, 2).view(b, c, h, w)
 
         if self.use_asr:
-            layer_morph_prompts = [None, None]
+            layer_high_freq_prompts = [None, None]
 
-            if morph_feat is not None:
-                layer_morph_prompts = self.morph_encoder(morph_feat)
+            # high_freq_prompt 只进入 high-frequency boundary branch。
+            if high_freq_prompt is not None:
+                layer_high_freq_prompts = self.high_freq_prompt_encoder(high_freq_prompt)
 
             upscaled_embedding = self.asr_upscale_1(
                 src,
                 cnn_feat=cnn_feat_s2,
-                attr_prompt=attr_prompt,
-                layer_morph_prompt=layer_morph_prompts[0],
+                low_freq_prompt=low_freq_prompt,
+                layer_high_freq_prompt=layer_high_freq_prompts[0],
             )
 
             upscaled_embedding = self.asr_upscale_2(
                 upscaled_embedding,
                 cnn_feat=cnn_feat_s1,
-                attr_prompt=attr_prompt,
-                layer_morph_prompt=layer_morph_prompts[1],
+                low_freq_prompt=low_freq_prompt,
+                layer_high_freq_prompt=layer_high_freq_prompts[1],
             )
         else:
             upscaled_embedding = self.output_upscaling(src)

@@ -26,7 +26,7 @@ except ImportError:
 
 
 # ==============================================================================
-# 0. Organ mapping
+# 0. Organ mapping and prompt protocol
 # ==============================================================================
 ORGAN_TO_ID = {
     # PanNuke 19 organs
@@ -42,14 +42,53 @@ ORGAN_TO_ID = {
 
 ID_TO_ORGAN = {v: k for k, v in ORGAN_TO_ID.items()}
 
+STRICT_BASE_PROMPT = "Cell nuclei"
+
 VALID_PROMPT_MODES = {
     "base",
-    "generic",
     "organ_static",
-    "dynamic",
-    "attribute_only",
-    "morphology_only",
+    "dynamic_gt",
+    "dynamic_pred",
 }
+
+LEGACY_PROMPT_MODE_ALIASES = {
+    # Old non-leaking validation/test name.
+    "generic": "organ_static",
+
+    # Old GT-derived prompt mode.
+    "dynamic": "dynamic_gt",
+
+    # Old ablation names. These are removed from the formal protocol.
+    # They map to dynamic_gt to preserve runnable old scripts, but should not be used
+    # for final experiments unless explicitly documented as oracle/debug.
+    "attribute_only": "dynamic_gt",
+    "morphology_only": "dynamic_gt",
+}
+
+
+def normalize_prompt_mode(prompt_mode: str, default: str = "organ_static") -> Tuple[str, str]:
+    """
+    Normalize prompt_mode to the formal four-mode protocol.
+
+    Returns:
+        canonical_mode:
+            One of base / organ_static / dynamic_gt / dynamic_pred.
+        raw_mode:
+            The original lower-cased user input.
+    """
+    raw_mode = str(prompt_mode).lower().strip()
+
+    if raw_mode in VALID_PROMPT_MODES:
+        return raw_mode, raw_mode
+
+    if raw_mode in LEGACY_PROMPT_MODE_ALIASES:
+        return LEGACY_PROMPT_MODE_ALIASES[raw_mode], raw_mode
+
+    return default, raw_mode
+
+
+def prompt_uses_gt_attributes(prompt_mode: str) -> bool:
+    return prompt_mode == "dynamic_gt"
 
 
 # ==============================================================================
@@ -120,58 +159,16 @@ def format_organ_name(organ_name: str) -> str:
 
 def _safe_base_prompt(base_prompt: Optional[str]) -> str:
     if base_prompt is None or str(base_prompt).strip() == "":
-        return "Cell nuclei"
+        return STRICT_BASE_PROMPT
     return str(base_prompt).strip()
 
 
-def build_pathology_prompts(
-    base_prompt: str,
-    organ_name: str,
-    visuals: Dict[str, str],
-    task_type: str = "generic",
-    text_suffix: str = "",
-    prompt_mode: str = "dynamic",
-) -> Tuple[str, str, str]:
+def _build_organ_static_prompts(base_prompt: str, organ_name: str) -> Tuple[str, str, str]:
     """
-    Build three prompts for different branches.
+    Build non-leaking organ-context prompts.
 
-    Returns:
-        text_prompt:
-            Short prompt for TextGuidedPointGenerator and general text branch.
-
-        attribute_text:
-            Low-frequency semantic prompt for PNuRL / CONCH attribute branch.
-            It describes organ context, staining, density, size and arrangement.
-
-        morphology_text:
-            High-frequency morphology prompt for boundary / morphology branch.
-            It describes contour, touching nuclei and instance-level separation.
-
-    prompt_mode:
-        base:
-            Return base_prompt only. Used for ablation.
-
-        generic:
-            Return a non-leaking generic prompt with organ context only.
-            This is suitable for training-time quick validation and test-time baseline.
-
-        organ_static:
-            Alias of generic. More explicit name.
-
-        dynamic:
-            Use crop-level attributes estimated from mask/statistics.
-            Suitable for training or oracle/debug ablation.
-
-        attribute_only:
-            Use only attribute_text for all text branches.
-
-        morphology_only:
-            Use only morphology_text for all text branches.
+    These prompts do not use crop-level mask statistics.
     """
-    prompt_mode = str(prompt_mode).lower().strip()
-    if prompt_mode not in VALID_PROMPT_MODES:
-        prompt_mode = "dynamic"
-
     base_prompt = _safe_base_prompt(base_prompt)
     organ_text = format_organ_name(organ_name)
 
@@ -182,23 +179,45 @@ def build_pathology_prompts(
         tissue_prefix = f"H&E-stained {organ_text} histopathology patch"
         organ_phrase = f"{organ_text} tissue"
 
-    # 1. Strict base ablation: no organ, no attributes.
-    if prompt_mode == "base":
-        return base_prompt, base_prompt, base_prompt
+    text_prompt = f"{base_prompt} in {organ_phrase}."
 
-    # 2. Fair non-leaking text mode for validation/test.
-    if prompt_mode in {"generic", "organ_static"}:
-        text_prompt = f"{base_prompt} in {organ_phrase}."
-        attribute_text = (
-            f"{tissue_prefix}. "
-            f"The image contains cell nuclei in {organ_phrase}. "
-            f"This prompt provides organ context without using crop-level mask-derived attributes."
-        )
-        morphology_text = (
-            f"{tissue_prefix}. "
-            f"Focus on nuclear boundaries, touching nuclei, and instance-level delineation."
-        )
-        return text_prompt, attribute_text, morphology_text
+    attribute_text = (
+        f"{tissue_prefix}. "
+        f"The image contains cell nuclei in {organ_phrase}. "
+        f"This prompt provides organ and tissue context without using crop-level mask-derived attributes."
+    )
+
+    morphology_text = (
+        f"{tissue_prefix}. "
+        f"Focus on nuclear boundaries, touching nuclei, contour clarity, and instance-level delineation. "
+        f"This prompt does not use ground-truth mask-derived shape, size, density, or arrangement statistics."
+    )
+
+    return text_prompt, attribute_text, morphology_text
+
+
+def _build_dynamic_gt_prompts(
+    base_prompt: str,
+    organ_name: str,
+    visuals: Dict[str, str],
+    task_type: str = "generic",
+    text_suffix: str = "",
+) -> Tuple[str, str, str]:
+    """
+    Build GT-derived oracle/training prompts.
+
+    This function uses crop-level attributes estimated from the GT mask.
+    It must not be used for normal validation/test.
+    """
+    base_prompt = _safe_base_prompt(base_prompt)
+    organ_text = format_organ_name(organ_name)
+
+    if organ_text == "generic":
+        tissue_prefix = "H&E-stained histopathology patch"
+        organ_phrase = "histopathology tissue"
+    else:
+        tissue_prefix = f"H&E-stained {organ_text} histopathology patch"
+        organ_phrase = f"{organ_text} tissue"
 
     color = visuals.get("color", "deep-purple stained")
     shape = visuals.get("shape", "round")
@@ -206,7 +225,6 @@ def build_pathology_prompts(
     size = visuals.get("size", "medium-sized")
     density = visuals.get("density", "moderately distributed")
 
-    # 3. Dynamic prompt mode.
     if task_type != "generic" and text_suffix:
         text_prompt = (
             f"{text_suffix} cell nuclei in {organ_phrase}; "
@@ -234,14 +252,75 @@ def build_pathology_prompts(
         f"irregular contours, and instance-level delineation."
     )
 
-    # 4. Ablation modes.
-    if prompt_mode == "attribute_only":
-        return attribute_text, attribute_text, attribute_text
-
-    if prompt_mode == "morphology_only":
-        return morphology_text, morphology_text, morphology_text
-
     return text_prompt, attribute_text, morphology_text
+
+
+def build_pathology_prompts(
+    base_prompt: str,
+    organ_name: str,
+    visuals: Optional[Dict[str, str]] = None,
+    task_type: str = "generic",
+    text_suffix: str = "",
+    prompt_mode: str = "organ_static",
+) -> Tuple[str, str, str]:
+    """
+    Build three prompts for different branches.
+
+    Formal prompt protocol:
+        base:
+            Return "Cell nuclei" only. No organ, no GT-derived attributes.
+
+        organ_static:
+            Use only organ / tissue context. No GT mask statistics.
+
+        dynamic_gt:
+            Use GT mask-derived shape / size / density / arrangement / color.
+            This is allowed only for training or oracle/debug experiments.
+
+        dynamic_pred:
+            Reserved for future predicted-attribute prompts.
+            Current implementation uses the same non-leaking organ-level prompt as organ_static.
+
+    Returns:
+        text_prompt:
+            General text prompt for TextGuidedPointGenerator.
+
+        attribute_text:
+            Low-frequency semantic text for PNuRL / CONCH branch.
+
+        morphology_text:
+            High-frequency morphology text for future morphology branch.
+    """
+    canonical_mode, _ = normalize_prompt_mode(prompt_mode, default="organ_static")
+
+    if canonical_mode == "base":
+        return STRICT_BASE_PROMPT, STRICT_BASE_PROMPT, STRICT_BASE_PROMPT
+
+    if canonical_mode == "organ_static":
+        return _build_organ_static_prompts(base_prompt, organ_name)
+
+    if canonical_mode == "dynamic_pred":
+        # Placeholder. Later this should consume model-predicted attributes.
+        # It must not use GT mask statistics.
+        return _build_organ_static_prompts(base_prompt, organ_name)
+
+    if canonical_mode == "dynamic_gt":
+        visuals = visuals or {
+            "color": "deep-purple stained",
+            "shape": "round",
+            "arrangement": "uniformly arranged",
+            "size": "medium-sized",
+            "density": "moderately distributed",
+        }
+        return _build_dynamic_gt_prompts(
+            base_prompt=base_prompt,
+            organ_name=organ_name,
+            visuals=visuals,
+            task_type=task_type,
+            text_suffix=text_suffix,
+        )
+
+    return _build_organ_static_prompts(base_prompt, organ_name)
 
 
 # ==============================================================================
@@ -551,18 +630,33 @@ class UniversalDataset(data.Dataset):
         image_size=1024,
         crop_size=256,
         mode="train",
-        prompt_mode="dynamic",
+        prompt_mode="organ_static",
     ):
         self.data_root = data_root
         self.image_size = image_size
         self.crop_size = crop_size
-        self.mode = mode
-        self.prompt_mode = str(prompt_mode).lower().strip()
-        self.organ_map = ORGAN_TO_ID
+        self.mode = str(mode).lower().strip()
+        self.raw_mode = mode
 
-        if self.prompt_mode not in VALID_PROMPT_MODES:
-            print(f"⚠️ [DataLoader] Unknown prompt_mode='{prompt_mode}', fallback to 'dynamic'.")
-            self.prompt_mode = "dynamic"
+        canonical_prompt_mode, raw_prompt_mode = normalize_prompt_mode(prompt_mode, default="organ_static")
+        self.requested_prompt_mode = raw_prompt_mode
+        self.prompt_mode = canonical_prompt_mode
+
+        if raw_prompt_mode != canonical_prompt_mode:
+            print(
+                f"⚠️ [DataLoader] prompt_mode='{prompt_mode}' is deprecated or unknown; "
+                f"using canonical prompt_mode='{canonical_prompt_mode}'."
+            )
+
+        # Hard guard against GT prompt leakage during normal validation/test.
+        if self.prompt_mode == "dynamic_gt" and self.mode not in {"train", "oracle", "debug"}:
+            print(
+                f"⚠️ [DataLoader] prompt_mode='dynamic_gt' is not allowed in mode='{self.mode}'. "
+                f"Falling back to 'organ_static' to avoid GT-derived prompt leakage."
+            )
+            self.prompt_mode = "organ_static"
+
+        self.organ_map = ORGAN_TO_ID
 
         print(f"📖 [DataLoader] Loading Knowledge Base: {knowledge_path}")
         with open(knowledge_path, "r") as f:
@@ -582,7 +676,7 @@ class UniversalDataset(data.Dataset):
         skipped = 0
 
         for rel_path, entry in self.full_db.items():
-            if entry.get("split") != mode:
+            if entry.get("split") != self.raw_mode:
                 skipped += 1
                 continue
 
@@ -603,7 +697,8 @@ class UniversalDataset(data.Dataset):
                 )
 
         print(
-            f"✅ [DataLoader] Mode: {mode} | Prompt: {self.prompt_mode} | "
+            f"✅ [DataLoader] Mode: {self.raw_mode} | Prompt: {self.prompt_mode} "
+            f"(requested: {self.requested_prompt_mode}) | "
             f"Loaded: {len(self.samples)} | Skipped: {skipped}"
         )
 
@@ -712,6 +807,8 @@ class UniversalDataset(data.Dataset):
         aug_mask = (aug_mask_inst > 0).astype(np.uint8)
 
         # 3. Physical attributes
+        # These labels are still used as supervised targets for PNuRL warmup.
+        # Whether they are injected into text prompts is controlled only by prompt_mode.
         area_scale = 1.0
         task_type = "generic"
         text_suffix = ""
@@ -727,7 +824,7 @@ class UniversalDataset(data.Dataset):
         )
         visuals = analysis["visuals"]
 
-        # 4. Organ and prompts
+        # 4. Organ metadata
         json_data = item["data"]
 
         if "organ_idx" in json_data:
@@ -737,7 +834,13 @@ class UniversalDataset(data.Dataset):
             organ_name = json_data.get("organ_id", "Generic")
             organ_id = self.organ_map.get(organ_name, 20)
 
-        base_prompt = json_data.get("text_prompt", "Cell nuclei")
+        # Training-time organ dropout must happen before prompt construction,
+        # otherwise the returned organ_id and prompt text can disagree.
+        if self.mode == "train" and random.random() < 0.2:
+            organ_id = 20
+            organ_name = "Generic"
+
+        base_prompt = json_data.get("text_prompt", STRICT_BASE_PROMPT)
 
         text_prompt, attribute_text, morphology_text = build_pathology_prompts(
             base_prompt=base_prompt,
@@ -747,10 +850,6 @@ class UniversalDataset(data.Dataset):
             text_suffix=text_suffix,
             prompt_mode=self.prompt_mode,
         )
-
-        # Training-time organ dropout.
-        if self.mode == "train" and random.random() < 0.2:
-            organ_id = 20
 
         # 5. Labels / density / HV
         label_tensor = torch.from_numpy(aug_mask).long().unsqueeze(0)
@@ -766,6 +865,8 @@ class UniversalDataset(data.Dataset):
         gt_hv_map_tensor = torch.from_numpy(gt_hv_map).float()
 
         attr_labels = torch.tensor(analysis["labels"], dtype=torch.long)
+
+        uses_gt_prompt = prompt_uses_gt_attributes(self.prompt_mode)
 
         return {
             "image": img_tensor,
@@ -784,7 +885,9 @@ class UniversalDataset(data.Dataset):
             "attribute_text": attribute_text,
             "morphology_text": morphology_text,
 
-            # Attribute labels for PNuRL
+            # Attribute labels for PNuRL supervision.
+            # These labels can be used in training loss, but they are not necessarily used
+            # to build text prompts. prompt_uses_gt_attributes marks that difference.
             "attr_labels": attr_labels,
 
             # Debug / metadata
@@ -793,6 +896,8 @@ class UniversalDataset(data.Dataset):
             "original_size": (self.image_size, self.image_size),
             "task_type": task_type,
             "prompt_mode": self.prompt_mode,
+            "requested_prompt_mode": self.requested_prompt_mode,
+            "prompt_uses_gt_attributes": bool(uses_gt_prompt),
         }
 
 
@@ -802,7 +907,7 @@ def stack_dict_batched(batch):
     for key, value in batch[0].items():
         if isinstance(value, torch.Tensor):
             tensor_dict[key] = torch.stack([sample[key] for sample in batch])
-        elif isinstance(value, (int, float, str)):
+        elif isinstance(value, (int, float, str, bool)):
             tensor_dict[key] = [sample[key] for sample in batch]
         else:
             tensor_dict[key] = [sample[key] for sample in batch]
