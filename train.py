@@ -298,6 +298,7 @@ def set_named_requires_grad(module: Optional[nn.Module], flag: bool, include_key
 def set_semantic_gate_state(raw_model: nn.Module, stage: str):
     close_value = -12.0
     warm_value = -10.0
+    open_value = -5.0
     gate_trainable = stage == "semantic_injection"
 
     pnurl = getattr(raw_model, "pnurl", None)
@@ -310,6 +311,8 @@ def set_semantic_gate_state(raw_model: nn.Module, stage: str):
                     gate.fill_(close_value)
                 elif stage == "pnurl_warmup":
                     gate.fill_(warm_value)
+                elif stage == "semantic_injection":
+                    gate.fill_(open_value)
             gate.requires_grad = gate_trainable
 
     gate_modules = []
@@ -337,12 +340,17 @@ def set_semantic_gate_state(raw_model: nn.Module, stage: str):
         if hasattr(gate_module, "reset_to_closed") and stage in ("vision", "pnurl_warmup"):
             gate_module.reset_to_closed()
 
-        if stage in ("vision", "pnurl_warmup") and hasattr(gate_module, "gate"):
+        if hasattr(gate_module, "gate"):
             try:
                 final_layer = gate_module.gate[-1]
                 if hasattr(final_layer, "bias") and final_layer.bias is not None:
                     with torch.no_grad():
-                        final_layer.bias.fill_(close_value if stage == "vision" else warm_value)
+                        if stage == "vision":
+                            final_layer.bias.fill_(close_value)
+                        elif stage == "pnurl_warmup":
+                            final_layer.bias.fill_(warm_value)
+                        elif stage == "semantic_injection":
+                            final_layer.bias.fill_(open_value)
             except Exception:
                 pass
 
@@ -1518,12 +1526,12 @@ def main(args):
                     f"(M:{train_stats['mask']:.3f}, H:{train_stats['heatmap']:.3f}, "
                     f"HV:{train_stats['hv']:.3f}, P:{train_stats['pnurl']:.3f}, D:{train_stats['density']:.3f}, "
                     f"S:{train_stats['semantic_stability']:.4f}) | "
-                    f"GateMean:{train_stats['semantic_channel_gate_mean']:.4f} | "
-                    f"DeltaNorm:{train_stats['semantic_delta_norm']:.4f} | "
-                    f"BaseNorm:{train_stats['base_feat_norm']:.4f} | "
-                    f"InjectedNorm:{train_stats['injected_delta_norm']:.4f} | "
-                    f"InjRatio:{train_stats['injection_ratio']:.4f} | "
-                    f"DeltaRatio:{train_stats['semantic_delta_ratio']:.4f} | "
+                    f"GateMean:{train_stats['semantic_channel_gate_mean']:.6e} | "
+                    f"DeltaNorm:{train_stats['semantic_delta_norm']:.6e} | "
+                    f"BaseNorm:{train_stats['base_feat_norm']:.6e} | "
+                    f"InjectedNorm:{train_stats['injected_delta_norm']:.6e} | "
+                    f"InjRatio:{train_stats['injection_ratio']:.6e} | "
+                    f"DeltaRatio:{train_stats['semantic_delta_ratio']:.6e} | "
                     f"Dice:{dice:.4f} | AJI:{aji:.4f} | PQ:{pq:.4f}"
                 )
 
