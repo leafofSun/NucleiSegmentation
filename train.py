@@ -36,8 +36,10 @@ from segment_anything.modeling.sam import TextSam
 from utils import FocalDiceloss_IoULoss, density_map_loss, get_logger, point_guidance_loss
 
 
-ARCHITECTURE_VERSION = "freqpath_sam_controlled_injection_v2"
+ARCHITECTURE_VERSION = "freqpath_sam_asr_legacy_recovery_v1"
 VALID_STAGES = ("vision", "pnurl_warmup", "semantic_injection")
+VALID_ASR_VARIANTS = ("legacy", "freqpath")
+VALID_ASR_REGRESSION_STAGES = ("freeze_decoder", "finetune_decoder")
 
 
 # Speedup settings
@@ -57,7 +59,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 # ==================================================================================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="FreqPath-SAM / MP-SAM staged training with controlled PNuRL semantic injection"
+        description="FreqPath-SAM staged training with legacy ASR recovery switch"
     )
 
     parser.add_argument("--work_dir", type=str, default="workdir", help="Directory to save logs and models")
@@ -89,11 +91,39 @@ def parse_args():
     parser.add_argument("--use_asr", action="store_true", default=False, help="Enable CNN/ASR high-frequency branch")
 
     parser.add_argument(
+        "--asr_variant",
+        type=str,
+        default="legacy",
+        choices=list(VALID_ASR_VARIANTS),
+        help="ASR variant: legacy for pure-visual ASR recovery, freqpath for low/high-frequency semantic branch",
+    )
+    parser.add_argument(
+        "--asr_regression",
+        action="store_true",
+        default=False,
+        help="Enable pure-visual ASR regression mode. Forces PNuRL/CoOp off and base prompt.",
+    )
+    parser.add_argument(
+        "--asr_regression_stage",
+        type=str,
+        default="finetune_decoder",
+        choices=list(VALID_ASR_REGRESSION_STAGES),
+        help="ASR regression schedule: freeze_decoder first trains HV/heatmap/ASR, finetune_decoder unlocks decoder.",
+    )
+
+    parser.add_argument(
         "--prompt_mode",
         type=str,
         default="organ_static",
         choices=["base", "organ_static", "dynamic_gt", "dynamic_pred"],
         help="Training text prompt mode: base | organ_static | dynamic_gt | dynamic_pred",
+    )
+    parser.add_argument(
+        "--eval_prompt_mode",
+        type=str,
+        default="base",
+        choices=["base", "organ_static", "dynamic_gt", "dynamic_pred"],
+        help="Validation prompt mode. ASR regression should use base.",
     )
 
     parser.add_argument(
@@ -111,6 +141,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--warmup_epochs", type=int, default=15)
     parser.add_argument("--use_amp", action="store_true", default=True, help="Use automatic mixed precision")
+    parser.add_argument("--no_amp", action="store_false", dest="use_amp", help="Disable AMP and use FP32")
 
     parser.add_argument("--mask_weight", type=float, default=10.0)
     parser.add_argument("--heatmap_weight", type=float, default=1.0)
@@ -118,6 +149,11 @@ def parse_args():
     parser.add_argument("--pnurl_weight", type=float, default=0.1, help="Weight for PNuRL attribute/classification loss")
     parser.add_argument("--attr_weight", type=float, default=None, help="Backward-compatible alias for pnurl_weight")
     parser.add_argument("--density_map_weight", type=float, default=0.5)
+
+    parser.add_argument("--cnn_lr_ratio", type=float, default=None, help="LR ratio for ResNet/CNN high-frequency branch")
+    parser.add_argument("--prompt_generator_lr_mult", type=float, default=None, help="LR multiplier for prompt generator")
+    parser.add_argument("--adapter_lr_ratio", type=float, default=None, help="LR ratio for image encoder adapters")
+    parser.add_argument("--asr_lr_ratio", type=float, default=1.0, help="LR ratio for GlobalASRUpsampler")
 
     parser.add_argument("--max_semantic_gate", type=float, default=0.10, help="Upper bound for SemanticChannelGate output")
     parser.add_argument("--max_delta_ratio", type=float, default=0.10, help="Upper bound for semantic_delta/base feature RMS ratio")
@@ -150,6 +186,25 @@ def parse_args():
 
     if args.attr_weight is not None:
         args.pnurl_weight = args.attr_weight
+
+
+    if args.asr_regression:
+        if args.phase != "vision":
+            raise ValueError("--asr_regression can only be used with --phase vision.")
+        args.use_asr = True
+        args.use_pnurl = False
+        args.use_coop = False
+        args.prompt_mode = "base"
+        args.eval_prompt_mode = "base"
+        # 先排除 bf16/AMP 对 HV/heatmap 回归的干扰。
+        args.use_amp = False
+
+    if args.cnn_lr_ratio is None:
+        args.cnn_lr_ratio = 0.1 if args.asr_regression else 0.5
+    if args.prompt_generator_lr_mult is None:
+        args.prompt_generator_lr_mult = 5.0 if args.asr_regression else 1.0
+    if args.adapter_lr_ratio is None:
+        args.adapter_lr_ratio = 1.0 if args.asr_regression else 0.1
 
     args.architecture_version = ARCHITECTURE_VERSION
     return args
@@ -308,13 +363,25 @@ def apply_stage_policy(model: nn.Module, stage: str, args=None, logger=None, ran
     set_requires_grad(getattr(raw_model, "clip_model", None), False)
     set_requires_grad(getattr(raw_model, "prompt_encoder", None), False)
 
-    if hasattr(raw_model, "use_pnurl"):
-        raw_model.use_pnurl = stage in ("pnurl_warmup", "semantic_injection") and hasattr(raw_model, "pnurl")
-    if hasattr(raw_model, "use_coop"):
-        raw_model.use_coop = stage == "semantic_injection" and hasattr(raw_model, "prompt_learner")
+    if getattr(args, "asr_regression", False):
+        if hasattr(raw_model, "use_pnurl"):
+            raw_model.use_pnurl = False
+        if hasattr(raw_model, "use_coop"):
+            raw_model.use_coop = False
+    else:
+        if hasattr(raw_model, "use_pnurl"):
+            raw_model.use_pnurl = stage in ("pnurl_warmup", "semantic_injection") and hasattr(raw_model, "pnurl")
+        if hasattr(raw_model, "use_coop"):
+            raw_model.use_coop = stage == "semantic_injection" and hasattr(raw_model, "prompt_learner")
 
     if stage == "vision":
-        set_requires_grad(getattr(raw_model, "mask_decoder", None), True)
+        freeze_decoder = (
+            args is not None
+            and getattr(args, "asr_regression", False)
+            and getattr(args, "asr_regression_stage", "finetune_decoder") == "freeze_decoder"
+        )
+
+        set_requires_grad(getattr(raw_model, "mask_decoder", None), not freeze_decoder)
         set_requires_grad(getattr(raw_model, "prompt_generator", None), True)
         set_requires_grad(getattr(raw_model, "basic_hv_head", None), True)
 
@@ -328,7 +395,14 @@ def apply_stage_policy(model: nn.Module, stage: str, args=None, logger=None, ran
             set_named_requires_grad(getattr(raw_model, "image_encoder", None), True, include_keywords=("Adapter", "adapter"))
 
         set_semantic_gate_state(raw_model, stage)
-        msg = "[Stage A: vision] Train mask decoder / prompt generator / HV-ASR / image adapters. Freeze PNuRL and CoOp."
+        if args is not None and getattr(args, "asr_regression", False):
+            msg = (
+                f"[ASR regression: {getattr(args, 'asr_regression_stage', 'finetune_decoder')}] "
+                "Pure-visual legacy ASR. PNuRL/CoOp/OT disabled. "
+                "Use base prompt and recover SamMed2D+ResNet+ASR baseline first."
+            )
+        else:
+            msg = "[Stage A: vision] Train mask decoder / prompt generator / HV-ASR / image adapters. Freeze PNuRL and CoOp."
 
     elif stage == "pnurl_warmup":
         set_requires_grad(getattr(raw_model, "pnurl", None), True)
@@ -401,12 +475,22 @@ def build_optimizer_by_stage(model: nn.Module, stage: str, args, logger=None, ra
 
     if stage == "vision":
         add_named_params("mask_decoder", module_named_params(getattr(raw_model, "mask_decoder", None)), base_lr)
-        add_named_params("prompt_generator", module_named_params(getattr(raw_model, "prompt_generator", None)), base_lr)
+        add_named_params(
+            "prompt_generator",
+            module_named_params(getattr(raw_model, "prompt_generator", None)),
+            base_lr * float(getattr(args, "prompt_generator_lr_mult", 1.0)),
+        )
         add_named_params("basic_hv_head", module_named_params(getattr(raw_model, "basic_hv_head", None)), base_lr)
-        add_named_params("global_asr_upsampler", module_named_params(getattr(raw_model, "global_asr_upsampler", None)), base_lr)
-        add_named_params("cnn_stage0", module_named_params(getattr(raw_model, "cnn_stage0", None)), base_lr * 0.5)
-        add_named_params("cnn_stage1", module_named_params(getattr(raw_model, "cnn_stage1", None)), base_lr * 0.5)
-        add_named_params("cnn_stage2", module_named_params(getattr(raw_model, "cnn_stage2", None)), base_lr * 0.5)
+        add_named_params(
+            "global_asr_upsampler",
+            module_named_params(getattr(raw_model, "global_asr_upsampler", None)),
+            base_lr * float(getattr(args, "asr_lr_ratio", 1.0)),
+        )
+
+        cnn_lr = base_lr * float(getattr(args, "cnn_lr_ratio", 0.1))
+        add_named_params("cnn_stage0", module_named_params(getattr(raw_model, "cnn_stage0", None)), cnn_lr)
+        add_named_params("cnn_stage1", module_named_params(getattr(raw_model, "cnn_stage1", None)), cnn_lr)
+        add_named_params("cnn_stage2", module_named_params(getattr(raw_model, "cnn_stage2", None)), cnn_lr)
 
         adapter_params = []
         image_encoder = getattr(raw_model, "image_encoder", None)
@@ -416,7 +500,11 @@ def build_optimizer_by_stage(model: nn.Module, stage: str, args, logger=None, ra
                 for n, p in image_encoder.named_parameters()
                 if ("Adapter" in n or "adapter" in n) and p.requires_grad
             ]
-        add_named_params("image_encoder_adapter", adapter_params, base_lr * 0.1)
+        add_named_params(
+            "image_encoder_adapter",
+            adapter_params,
+            base_lr * float(getattr(args, "adapter_lr_ratio", 0.1)),
+        )
 
     elif stage == "pnurl_warmup":
         add_named_params("pnurl", module_named_params(getattr(raw_model, "pnurl", None)), base_lr)
@@ -495,6 +583,10 @@ def _split_decoder_params(mask_decoder: Optional[nn.Module]):
         "low_freq_residual_scale",
         "high_freq_residual_scale",
         "residual_scale",
+        "attr_modulator",
+        "morphology_modulator",
+        "morph_encoder",
+        "asr_upscale",
     )
 
     new_params, old_params = [], []
@@ -766,6 +858,12 @@ def _write_scalar_if_finite(writer, tag: str, value: float, step: int):
     writer.add_scalar(tag, value, step)
 
 
+def _autocast_context(args):
+    if not torch.cuda.is_available():
+        return torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=False)
+    return autocast("cuda", enabled=args.use_amp, dtype=torch.bfloat16)
+
+
 # ==================================================================================================
 # 5. Training logic
 # ==================================================================================================
@@ -816,6 +914,11 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         dynamic_text = batched_input.get("text_prompt", ["Cell nuclei"] * len(images))
         dynamic_attr_text = batched_input.get("attribute_text", ["Cell nuclei"] * len(images))
 
+        if getattr(args, "asr_regression", False):
+            dynamic_text = ["Cell nuclei"] * len(images)
+            dynamic_attr_text = ["Cell nuclei"] * len(images)
+            attr_labels = None
+
         model_input = []
         for i in range(len(images)):
             curr_id = 20
@@ -833,7 +936,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 }
             )
 
-        with autocast("cuda", enabled=args.use_amp, dtype=torch.bfloat16):
+        with _autocast_context(args):
             outputs = model(model_input, multimask_output=True)
 
             loss_batch = torch.tensor(0.0, device=args.device)
@@ -862,11 +965,17 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 )
 
                 if stage == "vision":
-                    loss_i = (
-                        args.mask_weight * loss_m
-                        + args.heatmap_weight * loss_h
-                        + args.hv_weight * loss_hv
-                    )
+                    if (
+                        getattr(args, "asr_regression", False)
+                        and getattr(args, "asr_regression_stage", "finetune_decoder") == "freeze_decoder"
+                    ):
+                        loss_i = args.heatmap_weight * loss_h + args.hv_weight * loss_hv
+                    else:
+                        loss_i = (
+                            args.mask_weight * loss_m
+                            + args.heatmap_weight * loss_h
+                            + args.hv_weight * loss_hv
+                        )
                 elif stage == "pnurl_warmup":
                     loss_i = (
                         args.pnurl_weight * loss_pnurl
@@ -902,13 +1011,14 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             final_loss.backward()
 
         if not is_accumulating:
+            trainable_params = [p for g in optimizer.param_groups for p in g["params"] if p.requires_grad]
             if scaler:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -1006,6 +1116,11 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
         dynamic_attr_text = batched_input.get("attribute_text", dynamic_text)
         attr_labels = batched_input.get("attr_labels", None)
 
+        if getattr(args, "asr_regression", False):
+            dynamic_text = ["Cell nuclei"] * len(images)
+            dynamic_attr_text = ["Cell nuclei"] * len(images)
+            attr_labels = None
+
         if images.shape[-1] != args.image_size:
             images = F.interpolate(images, size=(args.image_size, args.image_size), mode="bilinear", align_corners=False)
 
@@ -1015,7 +1130,7 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                 val = organ_ids[i]
                 curr_organ_id = val.item() if isinstance(val, torch.Tensor) else val
 
-            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.inference_mode(), _autocast_context(args):
                 model_input = [
                     {
                         "image": images[i],
@@ -1111,7 +1226,52 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
 
 
 # ==================================================================================================
-# 7. Main entry
+# 7. Checkpoint helpers
+# ==================================================================================================
+def load_sam_checkpoint_with_asr_mapping(raw_model: nn.Module, args, logger=None, rank: int = 0):
+    """
+    兼容旧 SAM/SamMed2D checkpoint：
+    将原始 output_upscaling 的部分权重映射到 legacy/freqpath ASRBlock 的 structure_upsample。
+    build_sam.py 可能已经做过一次 strict=False 加载；这里再执行一次映射，保证 ASR upscaling 能吃到旧权重。
+    """
+    if not args.sam_checkpoint or not os.path.exists(args.sam_checkpoint):
+        return
+
+    if rank == 0 and logger is not None:
+        logger.info(f"Loading SAM checkpoint with ASR mapping: {args.sam_checkpoint}")
+
+    try:
+        ckpt = torch.load(args.sam_checkpoint, map_location="cpu", weights_only=False)
+        state_dict = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+        state_dict = resize_pos_embed(state_dict, raw_model.state_dict())
+
+        key_mapping = {
+            "mask_decoder.output_upscaling.0.weight": "mask_decoder.asr_upscale_1.structure_upsample.0.weight",
+            "mask_decoder.output_upscaling.0.bias": "mask_decoder.asr_upscale_1.structure_upsample.0.bias",
+            "mask_decoder.output_upscaling.1.weight": "mask_decoder.asr_upscale_1.structure_upsample.1.weight",
+            "mask_decoder.output_upscaling.1.bias": "mask_decoder.asr_upscale_1.structure_upsample.1.bias",
+            "mask_decoder.output_upscaling.3.weight": "mask_decoder.asr_upscale_2.structure_upsample.0.weight",
+            "mask_decoder.output_upscaling.3.bias": "mask_decoder.asr_upscale_2.structure_upsample.0.bias",
+        }
+        mapped_state_dict = dict(state_dict)
+        mapped_count = 0
+        model_keys = raw_model.state_dict().keys()
+        for old_key, new_key in key_mapping.items():
+            if old_key in state_dict and new_key in model_keys:
+                mapped_state_dict[new_key] = state_dict[old_key]
+                mapped_count += 1
+
+        missing_keys, unexpected_keys = raw_model.load_state_dict(mapped_state_dict, strict=False)
+        if rank == 0 and logger is not None:
+            logger.info(f"ASRBlock upscaling weights mapped: {mapped_count}/{len(key_mapping)}")
+            logger.info(f"SAM checkpoint load: Missing keys={len(missing_keys)} | Unexpected keys={len(unexpected_keys)}")
+    except Exception as e:
+        if rank == 0 and logger is not None:
+            logger.warning(f"SAM checkpoint mapping/loading failed: {e}")
+
+
+# ==================================================================================================
+# 8. Main entry
 # ==================================================================================================
 def main(args):
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -1161,6 +1321,13 @@ def main(args):
             f"stage={args.phase} | arch={args.architecture_version}"
         )
         logger.info(f"GPUs: {world_size}, Batch/GPU: {args.batch_size}, Resume: {args.resume if args.resume else 'No'}")
+        logger.info(
+            f"ASR config | use_asr={args.use_asr} | asr_variant={args.asr_variant} | "
+            f"asr_regression={args.asr_regression} | asr_regression_stage={args.asr_regression_stage} | "
+            f"prompt_mode={args.prompt_mode} | eval_prompt_mode={args.eval_prompt_mode} | "
+            f"use_amp={args.use_amp} | cnn_lr_ratio={args.cnn_lr_ratio} | "
+            f"prompt_generator_lr_mult={args.prompt_generator_lr_mult} | adapter_lr_ratio={args.adapter_lr_ratio}"
+        )
         writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
     else:
         logger = None
@@ -1181,7 +1348,7 @@ def main(args):
             image_size=args.image_size,
             crop_size=args.crop_size,
             mode="test",
-            prompt_mode="organ_static",
+            prompt_mode=args.eval_prompt_mode,
         )
 
         train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
@@ -1214,56 +1381,33 @@ def main(args):
             logger.info(f"Train Size: {len(train_dataset)} | Val Size: {len(val_dataset)}")
 
         args.checkpoint = args.sam_checkpoint
-        vanilla_sam = sam_model_registry[args.model_type](args)
+        built_model = sam_model_registry[args.model_type](args)
 
-        if os.path.exists(args.sam_checkpoint):
-            if rank == 0:
-                logger.info(f"Loading SAM checkpoint: {args.sam_checkpoint}")
-            try:
-                ckpt = torch.load(args.sam_checkpoint, map_location="cpu", weights_only=False)
-                state_dict = ckpt.get("model", ckpt)
-                state_dict = resize_pos_embed(state_dict, vanilla_sam.state_dict())
+        if isinstance(built_model, TextSam):
+            raw_model = built_model.to(args.device)
+        else:
+            raw_model = TextSam(
+                image_encoder=built_model.image_encoder,
+                prompt_encoder=built_model.prompt_encoder,
+                mask_decoder=built_model.mask_decoder,
+                clip_model_name=args.clip_model,
+                num_organs=args.num_organs,
+                num_heads=args.num_heads,
+                sg_epsilon=0.05,
+                sg_iters=3,
+                use_pnurl=True if args.phase in ("pnurl_warmup", "semantic_injection") else args.use_pnurl,
+                use_coop=True if args.phase == "semantic_injection" else args.use_coop,
+                use_ot=False,
+                use_asr=args.use_asr,
+                asr_variant=args.asr_variant,
+                asr_regression=args.asr_regression,
+                max_semantic_gate=args.max_semantic_gate,
+                max_delta_ratio=args.max_delta_ratio,
+                init_delta_ratio=args.init_delta_ratio,
+            ).to(args.device)
+            del built_model
 
-                key_mapping = {
-                    "mask_decoder.output_upscaling.0.weight": "mask_decoder.asr_upscale_1.structure_upsample.0.weight",
-                    "mask_decoder.output_upscaling.0.bias": "mask_decoder.asr_upscale_1.structure_upsample.0.bias",
-                    "mask_decoder.output_upscaling.1.weight": "mask_decoder.asr_upscale_1.structure_upsample.1.weight",
-                    "mask_decoder.output_upscaling.1.bias": "mask_decoder.asr_upscale_1.structure_upsample.1.bias",
-                    "mask_decoder.output_upscaling.3.weight": "mask_decoder.asr_upscale_2.structure_upsample.0.weight",
-                    "mask_decoder.output_upscaling.3.bias": "mask_decoder.asr_upscale_2.structure_upsample.0.bias",
-                }
-                mapped_state_dict = dict(state_dict)
-                mapped_count = 0
-                for old_key, new_key in key_mapping.items():
-                    if old_key in state_dict:
-                        mapped_state_dict[new_key] = state_dict[old_key]
-                        mapped_count += 1
-
-                vanilla_sam.load_state_dict(mapped_state_dict, strict=False)
-                if rank == 0:
-                    logger.info(f"ASRBlock upscaling weights mapped: {mapped_count}/{len(key_mapping)}")
-            except Exception as e:
-                if rank == 0:
-                    logger.warning(f"Checkpoint loading failed: {e}")
-
-        raw_model = TextSam(
-            image_encoder=vanilla_sam.image_encoder,
-            prompt_encoder=vanilla_sam.prompt_encoder,
-            mask_decoder=vanilla_sam.mask_decoder,
-            clip_model_name=args.clip_model,
-            num_organs=args.num_organs,
-            num_heads=args.num_heads,
-            sg_epsilon=0.05,
-            sg_iters=3,
-            use_pnurl=True if args.phase in ("pnurl_warmup", "semantic_injection") else args.use_pnurl,
-            use_coop=True if args.phase == "semantic_injection" else args.use_coop,
-            use_ot=False,
-            use_asr=args.use_asr,
-            max_semantic_gate=args.max_semantic_gate,
-            max_delta_ratio=args.max_delta_ratio,
-            init_delta_ratio=args.init_delta_ratio,
-        ).to(args.device)
-        del vanilla_sam
+        load_sam_checkpoint_with_asr_mapping(raw_model, args=args, logger=logger, rank=rank)
 
         if args.encoder_adapter:
             for n, p in raw_model.image_encoder.named_parameters():
@@ -1275,7 +1419,7 @@ def main(args):
                 logger.info(f"Loading model weights from: {args.resume}")
             try:
                 checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
-                state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+                state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
                 state_dict = resize_pos_embed(state_dict, raw_model.state_dict())
                 missing_keys, unexpected_keys = raw_model.load_state_dict(state_dict, strict=False)
                 if rank == 0:
@@ -1283,6 +1427,12 @@ def main(args):
                     logger.info(f"Missing keys: {len(missing_keys)} | Unexpected keys: {len(unexpected_keys)}")
                     old_arch = checkpoint.get("architecture_version", "unknown") if isinstance(checkpoint, dict) else "unknown"
                     logger.info(f"Checkpoint architecture_version: {old_arch}")
+                    if isinstance(checkpoint, dict):
+                        logger.info(
+                            f"Checkpoint phase={checkpoint.get('phase', 'unknown')} | "
+                            f"asr_variant={checkpoint.get('asr_variant', 'unknown')} | "
+                            f"asr_regression={checkpoint.get('asr_regression', 'unknown')}"
+                        )
             except Exception as e:
                 if rank == 0:
                     logger.warning(f"Resume failed: {e}")
@@ -1363,6 +1513,7 @@ def main(args):
 
                 logger.info(
                     f"Ep {epoch + 1}/{args.epochs} | Stage: {args.phase} | "
+                    f"ASR:{args.asr_variant}/{args.asr_regression_stage if args.asr_regression else 'normal'} | "
                     f"Loss: {train_stats['total']:.4f} "
                     f"(M:{train_stats['mask']:.3f}, H:{train_stats['heatmap']:.3f}, "
                     f"HV:{train_stats['hv']:.3f}, P:{train_stats['pnurl']:.3f}, D:{train_stats['density']:.3f}, "
@@ -1386,6 +1537,9 @@ def main(args):
                     "best_dice": best_dice,
                     "phase": args.phase,
                     "architecture_version": args.architecture_version,
+                    "asr_variant": args.asr_variant,
+                    "asr_regression": args.asr_regression,
+                    "asr_regression_stage": args.asr_regression_stage,
                     "args": vars(args),
                 }
 

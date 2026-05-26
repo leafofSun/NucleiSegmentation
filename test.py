@@ -16,6 +16,12 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
+# 👇 新增：通用环境变量清洗器（自动剔除所有非 ASCII 脏字符）
+for _key, _value in list(os.environ.items()):
+    if isinstance(_value, str):
+        # 强制只保留标准 ASCII 字符 (0-127)，肉眼不可见的幽灵字符会被瞬间蒸发
+        os.environ[_key] = "".join(c for c in _value if ord(c) < 128).strip()
+
 import torch
 import torch.nn.functional as F
 

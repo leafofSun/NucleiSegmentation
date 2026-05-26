@@ -31,75 +31,216 @@ hf_auth_token = os.environ.get("HF_TOKEN")
 
 class GlobalASRUpsampler(nn.Module):
     """
-    全局高分辨率特征上采样器。
+    全局高分辨率 HV / heatmap 上采样器。
 
-    输入:
-        sam_feat: SAM image embedding, usually [B, 256, 32/64, 32/64]
-        hv_logits: coarse HV logits
-        hm_logits: coarse heatmap logits
-        feat_s2 / feat_s1 / feat_half: CNN shallow features
+    这里显式拆成两种模式：
 
-    作用:
-        利用纯 CNN 高频特征补充边界细节。
-        这里不再依赖 OT，也不再将 OT 作为 heatmap/HV 的上游。
+    1. legacy:
+       用于回归旧版纯视觉 ASR。
+       - heatmap 输出 1 通道
+       - 只做 SAM coarse HV/heatmap + ResNet 细节融合
+       - 不引入语义高低频调制
+       - 默认输出到 512 级别，不额外 up4 到 1024
+
+    2. freqpath:
+       用于后续论文主线。
+       - 保留当前 FreqPath/Frequency-aware 版本
+       - heatmap 可为 2 通道
+       - 保留 up4 到更高分辨率
+       - 与后续低频语义 / 高频形态约束配合
     """
 
-    def __init__(self, embed_dim=256, hm_channels=2, use_asr=True):
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        hm_channels: int = 2,
+        use_asr: bool = True,
+        asr_variant: str = "legacy",
+    ):
         super().__init__()
+
+        asr_variant = str(asr_variant).lower().strip()
+        if asr_variant not in ("legacy", "freqpath"):
+            raise ValueError(
+                f"GlobalASRUpsampler asr_variant must be 'legacy' or 'freqpath', got {asr_variant}"
+            )
+
         self.use_asr = use_asr
+        self.asr_variant = asr_variant
+        self.hm_channels = 1 if asr_variant == "legacy" else int(hm_channels)
 
-        self.init_conv = nn.Conv2d(embed_dim + 2 + hm_channels, 256, kernel_size=3, padding=1)
+        if self.asr_variant == "legacy":
+            self.init_conv = nn.Conv2d(embed_dim + 2 + self.hm_channels, 256, kernel_size=3, padding=1)
 
-        self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(128 + (512 if use_asr else 0), 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
+            self.up1 = nn.ConvTranspose2d(
+                256 + (512 if use_asr else 0),
+                128,
+                kernel_size=2,
+                stride=2,
+            )
+            self.conv1 = nn.Sequential(
+                nn.Conv2d(128 + (256 if use_asr else 0), 128, kernel_size=3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+            )
+
+            self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+            self.conv2 = nn.Sequential(
+                nn.Conv2d(64 + (64 if use_asr else 0), 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+            )
+
+            self.up3 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+            self.conv3 = nn.Sequential(
+                nn.Conv2d(32, 32, kernel_size=3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+            )
+
+            self.hv_out = nn.Conv2d(32, 2, kernel_size=1)
+            self.hm_out = nn.Conv2d(32, self.hm_channels, kernel_size=1)
+
+        else:
+            self.init_conv = nn.Conv2d(embed_dim + 2 + self.hm_channels, 256, kernel_size=3, padding=1)
+
+            self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+            self.conv1 = nn.Sequential(
+                nn.Conv2d(128 + (512 if use_asr else 0), 128, kernel_size=3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+            )
+
+            self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+            self.conv2 = nn.Sequential(
+                nn.Conv2d(64 + (256 if use_asr else 0), 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+            )
+
+            self.up3 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+            self.conv3 = nn.Sequential(
+                nn.Conv2d(32 + (64 if use_asr else 0), 32, kernel_size=3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+            )
+
+            self.up4 = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
+            self.conv4 = nn.Sequential(
+                nn.Conv2d(16, 16, kernel_size=3, padding=1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+            )
+
+            self.hv_out = nn.Conv2d(16, 2, kernel_size=1)
+            self.hm_out = nn.Conv2d(16, self.hm_channels, kernel_size=1)
+
+    @staticmethod
+    def _resize_like(feat: Optional[torch.Tensor], ref: torch.Tensor) -> Optional[torch.Tensor]:
+        if feat is None:
+            return None
+        if feat.shape[-2:] != ref.shape[-2:]:
+            feat = F.interpolate(
+                feat,
+                size=ref.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        return feat
+
+    @staticmethod
+    def _match_channels(x: torch.Tensor, channels: int) -> torch.Tensor:
+        current = x.shape[1]
+        if current == channels:
+            return x
+        if current > channels:
+            return x[:, :channels, :, :]
+
+        pad = torch.zeros(
+            x.shape[0],
+            channels - current,
+            x.shape[2],
+            x.shape[3],
+            device=x.device,
+            dtype=x.dtype,
         )
+        return torch.cat([x, pad], dim=1)
 
-        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(64 + (256 if use_asr else 0), 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
+    def forward(
+        self,
+        sam_feat: torch.Tensor,
+        hv_logits: torch.Tensor,
+        hm_logits: torch.Tensor,
+        feat_s2: Optional[torch.Tensor] = None,
+        feat_s1: Optional[torch.Tensor] = None,
+        feat_half: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hm_logits = self._match_channels(hm_logits, self.hm_channels)
 
-        self.up3 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(32 + (64 if use_asr else 0), 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-        )
+        if hv_logits.shape[-2:] != sam_feat.shape[-2:]:
+            hv_logits = F.interpolate(
+                hv_logits,
+                size=sam_feat.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
 
-        self.up4 = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
-        self.conv4 = nn.Sequential(
-            nn.Conv2d(16, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-        )
+        if hm_logits.shape[-2:] != sam_feat.shape[-2:]:
+            hm_logits = F.interpolate(
+                hm_logits,
+                size=sam_feat.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
 
-        self.hv_out = nn.Conv2d(16, 2, kernel_size=1)
-        self.hm_out = nn.Conv2d(16, hm_channels, kernel_size=1)
-
-    def forward(self, sam_feat, hv_logits, hm_logits, feat_s2=None, feat_s1=None, feat_half=None):
         x = torch.cat([sam_feat, hv_logits, hm_logits], dim=1)
         x = self.init_conv(x)
 
+        if self.asr_variant == "legacy":
+            if self.use_asr and feat_s2 is not None:
+                feat_s2 = self._resize_like(feat_s2, x)
+                x = torch.cat([x, feat_s2], dim=1)
+
+            x = self.up1(x)
+
+            if self.use_asr and feat_s1 is not None:
+                feat_s1 = self._resize_like(feat_s1, x)
+                x = torch.cat([x, feat_s1], dim=1)
+
+            x = self.conv1(x)
+            x = self.up2(x)
+
+            if self.use_asr and feat_half is not None:
+                feat_half = self._resize_like(feat_half, x)
+                x = torch.cat([x, feat_half], dim=1)
+
+            x = self.conv2(x)
+            x = self.up3(x)
+            x = self.conv3(x)
+
+            return self.hv_out(x), self.hm_out(x)
+
         x = self.up1(x)
+
         if self.use_asr and feat_s2 is not None:
+            feat_s2 = self._resize_like(feat_s2, x)
             x = torch.cat([x, feat_s2], dim=1)
+
         x = self.conv1(x)
-
         x = self.up2(x)
+
         if self.use_asr and feat_s1 is not None:
+            feat_s1 = self._resize_like(feat_s1, x)
             x = torch.cat([x, feat_s1], dim=1)
+
         x = self.conv2(x)
-
         x = self.up3(x)
-        if self.use_asr and feat_half is not None:
-            x = torch.cat([x, feat_half], dim=1)
-        x = self.conv3(x)
 
+        if self.use_asr and feat_half is not None:
+            feat_half = self._resize_like(feat_half, x)
+            x = torch.cat([x, feat_half], dim=1)
+
+        x = self.conv3(x)
         x = self.up4(x)
         x = self.conv4(x)
 
@@ -109,22 +250,6 @@ class GlobalASRUpsampler(nn.Module):
 class SemanticChannelGate(nn.Module):
     """
     Pathology-aware channel recalibration gate.
-
-    设计目的:
-        病理文本通常是 patch-level / organ-level 全局语义，不具备像素级空间对齐。
-        因此语义分支不应该直接覆盖 SAM 的空间定位特征，而应该只通过通道级权重
-        选择性增强或抑制与染色、形态、密度、边界相关的通道。
-
-    输入:
-        semantic_delta: [B, C, H, W]
-
-    输出:
-        channel_gate: [B, C, 1, 1]
-
-    当前版本:
-        channel_gate = max_gate * sigmoid(gate_logits)
-
-    这样即使 gate 被学习打开，也不会让语义残差完全压过视觉底盘。
     """
 
     def __init__(
@@ -156,11 +281,6 @@ class SemanticChannelGate(nn.Module):
 class PhysicalAdapter(nn.Module):
     """
     将低频 / 高频视觉特征转换成 CoOp context modulation 参数。
-
-    当前版本：
-        1. low/high 都先通过 _to_vector() 统一转成 [B, C]。
-        2. 支持输入 [B, C] 或 [B, C, H, W]。
-        3. 显式检查通道维，维度不符时直接抛出可读错误。
     """
 
     def __init__(self, feat_dim_low: int, feat_dim_high: int, ctx_dim: int):
@@ -226,13 +346,7 @@ class PhysicalAdapter(nn.Module):
 
 class DualPromptLearner(nn.Module):
     """
-    CoOp-style prompt learner for CONCH text encoder.
-
-    关键修复:
-        1. 只让 ctx_general / ctx_specific / physical_adapter 参与训练。
-        2. CONCH 的 token_embedding / transformer / ln_final / text_projection
-           不注册为本模块参数，避免 train.py 中 prompt_learner.parameters()
-           把整个 CONCH 文本编码器误解冻。
+    CoOp-style prompt learner for CONCH text encoder。
     """
 
     def __init__(self, clip_model, num_organs=21, n_ctx_gen=8, n_ctx_spec=8, embed_dim=256):
@@ -416,11 +530,33 @@ class TextSam(Sam):
         use_coop: bool = True,
         use_ot: bool = False,
         use_asr: bool = True,
+        asr_variant: str = "legacy",
+        asr_regression: Optional[bool] = None,
         max_semantic_gate: float = 0.10,
         max_delta_ratio: float = 0.10,
         init_delta_ratio: float = 0.02,
     ):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
+
+        asr_variant = str(asr_variant).lower().strip()
+        if asr_variant not in ("legacy", "freqpath"):
+            raise ValueError(f"asr_variant must be 'legacy' or 'freqpath', got {asr_variant}")
+
+        if asr_regression is None:
+            asr_regression = False
+
+        self.asr_variant = asr_variant
+        self.asr_regression = bool(asr_regression)
+
+        if self.asr_regression:
+            if use_pnurl or use_coop or use_ot:
+                print(
+                    "🔒 ASR regression mode enabled: forcing PNuRL=False, CoOp=False, OT=False, "
+                    "and using base prompt 'Cell nuclei'."
+                )
+            use_pnurl = False
+            use_coop = False
+            use_ot = False
 
         self.use_pnurl = use_pnurl
         self.use_coop = use_coop
@@ -434,7 +570,18 @@ class TextSam(Sam):
         self.max_delta_ratio = float(max_delta_ratio)
         self.init_delta_ratio = float(init_delta_ratio)
 
-        print("🚀 Initializing MP-SAM / FreqPath-SAM with CONCH...")
+        print(
+            f"🚀 Initializing MP-SAM / FreqPath-SAM with CONCH | "
+            f"ASR={use_asr}, asr_variant={self.asr_variant}, asr_regression={self.asr_regression}"
+        )
+
+        if hasattr(self.mask_decoder, "asr_variant"):
+            if getattr(self.mask_decoder, "asr_variant") != self.asr_variant:
+                print(
+                    f"⚠️ mask_decoder.asr_variant={getattr(self.mask_decoder, 'asr_variant')} "
+                    f"but TextSam.asr_variant={self.asr_variant}. "
+                    "Please update build_sam.py to pass the same asr_variant into MaskDecoder."
+                )
 
         hf_auth_token = os.environ.get("HF_TOKEN")
         if not hf_auth_token:
@@ -507,6 +654,7 @@ class TextSam(Sam):
                 embed_dim=embed_dim,
                 use_asr=True,
                 hm_channels=2,
+                asr_variant=self.asr_variant,
             )
 
         for param in self.image_encoder.parameters():
@@ -594,12 +742,6 @@ class TextSam(Sam):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """
-        返回通道级语义门控 [B, C, 1, 1]。
-
-        兼容旧 checkpoint：如果旧模型没有 semantic_channel_gate，则动态补一个。
-        正式训练建议从新 full-architecture checkpoint 开始。
-        """
         if not hasattr(self.pnurl, "semantic_channel_gate"):
             self.pnurl.semantic_channel_gate = SemanticChannelGate(
                 embed_dim=semantic_delta.shape[1],
@@ -617,20 +759,6 @@ class TextSam(Sam):
         semantic_delta: torch.Tensor,
         channel_gate: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        执行受控语义残差注入，并返回诊断。
-
-        Args:
-            image_embeddings: [B, C, H, W]
-            semantic_delta: [B, C, H, W]
-            channel_gate: [B, C, 1, 1]
-
-        Returns:
-            refined_image_embeddings
-            injected_delta
-            injected_delta_norm
-            injection_ratio
-        """
         if semantic_delta.shape != image_embeddings.shape:
             raise ValueError(
                 f"semantic_delta shape mismatch: expected {tuple(image_embeddings.shape)}, "
@@ -674,8 +802,13 @@ class TextSam(Sam):
 
         for x in batched_input:
             organ_indices_list.append(self._get_int_value(x.get("organ_id", 20), default=20))
-            attribute_texts.append(self._safe_text(x.get("attribute_text", "Cell nuclei"), "Cell nuclei"))
-            base_texts.append(self._safe_text(x.get("text_prompt", "Cell nuclei"), "Cell nuclei"))
+
+            if self.asr_regression:
+                attribute_texts.append("Cell nuclei")
+                base_texts.append("Cell nuclei")
+            else:
+                attribute_texts.append(self._safe_text(x.get("attribute_text", "Cell nuclei"), "Cell nuclei"))
+                base_texts.append(self._safe_text(x.get("text_prompt", "Cell nuclei"), "Cell nuclei"))
 
         organ_indices = torch.tensor(organ_indices_list, dtype=torch.long, device=device)
 
@@ -833,6 +966,8 @@ class TextSam(Sam):
             "use_pnurl": torch.tensor(float(self.use_pnurl), device=device),
             "use_coop": torch.tensor(float(self.use_coop), device=device),
             "use_ot": torch.tensor(0.0, device=device),
+            "asr_variant_legacy": torch.tensor(float(self.asr_variant == "legacy"), device=device),
+            "asr_regression": torch.tensor(float(self.asr_regression), device=device),
         }
 
         fused_image_embeddings = refined_image_embeddings
@@ -885,8 +1020,17 @@ class TextSam(Sam):
                 hm_out_i = heatmap_logits_out[i:i + 1, :, :input_h, :input_w]
 
                 if (input_h, input_w) != (target_h, target_w):
-                    hv_out_i = F.interpolate(hv_out_i, size=(target_h, target_w), mode="nearest")
-                    hm_out_i = F.interpolate(hm_out_i, size=(target_h, target_w), mode="bilinear", align_corners=False)
+                    hv_out_i = F.interpolate(
+                        hv_out_i,
+                        size=(target_h, target_w),
+                        mode="nearest",
+                    )
+                    hm_out_i = F.interpolate(
+                        hm_out_i,
+                        size=(target_h, target_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
             else:
                 hv_out_i = hv_logits_out[i].unsqueeze(0) if hv_logits_out is not None else None
                 hm_out_i = heatmap_logits_out[i].unsqueeze(0)
@@ -999,17 +1143,18 @@ class TextSam(Sam):
                 sub_low_freq_prompt = None
                 sub_high_freq_prompt = None
 
-                if curr_low_freq_prompt is not None:
-                    if curr_low_freq_prompt.dim() == 2:
-                        sub_low_freq_prompt = curr_low_freq_prompt.expand(current_batch, -1).contiguous()
-                    elif curr_low_freq_prompt.dim() == 3:
-                        sub_low_freq_prompt = curr_low_freq_prompt.expand(current_batch, -1, -1).contiguous()
+                if self.asr_variant == "freqpath":
+                    if curr_low_freq_prompt is not None:
+                        if curr_low_freq_prompt.dim() == 2:
+                            sub_low_freq_prompt = curr_low_freq_prompt.expand(current_batch, -1).contiguous()
+                        elif curr_low_freq_prompt.dim() == 3:
+                            sub_low_freq_prompt = curr_low_freq_prompt.expand(current_batch, -1, -1).contiguous()
 
-                if curr_high_freq_prompt is not None:
-                    if curr_high_freq_prompt.dim() == 2:
-                        sub_high_freq_prompt = curr_high_freq_prompt.expand(current_batch, -1).contiguous()
-                    elif curr_high_freq_prompt.dim() == 3:
-                        sub_high_freq_prompt = curr_high_freq_prompt.expand(current_batch, -1, -1).contiguous()
+                    if curr_high_freq_prompt is not None:
+                        if curr_high_freq_prompt.dim() == 2:
+                            sub_high_freq_prompt = curr_high_freq_prompt.expand(current_batch, -1).contiguous()
+                        elif curr_high_freq_prompt.dim() == 3:
+                            sub_high_freq_prompt = curr_high_freq_prompt.expand(current_batch, -1, -1).contiguous()
 
                 sub_mask, sub_iou = self.mask_decoder(
                     image_embeddings=sub_img_embed,
@@ -1019,8 +1164,8 @@ class TextSam(Sam):
                     multimask_output=multimask_output,
                     cnn_feat_s1=sub_cnn_s1,
                     cnn_feat_s2=sub_cnn_s2,
-                    low_freq_prompt=sub_low_freq_prompt,
-                    high_freq_prompt=sub_high_freq_prompt,
+                    attr_prompt=sub_low_freq_prompt,
+                    morph_feat=sub_high_freq_prompt,
                 )
 
                 chunk_masks.append(sub_mask)
