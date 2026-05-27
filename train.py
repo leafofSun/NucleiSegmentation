@@ -1,11 +1,12 @@
 import argparse
 import datetime
 import gc
+import hashlib
 import os
 import random
 import traceback
 from typing import Dict, Iterable, List, Optional, Tuple
-
+import json
 import cv2
 import numpy as np
 import torch
@@ -149,6 +150,46 @@ def parse_args():
     parser.add_argument("--pnurl_weight", type=float, default=0.1, help="Weight for PNuRL attribute/classification loss")
     parser.add_argument("--attr_weight", type=float, default=None, help="Backward-compatible alias for pnurl_weight")
     parser.add_argument("--density_map_weight", type=float, default=0.5)
+    parser.add_argument(
+        "--pnurl_loss_weight",
+        type=float,
+        default=None,
+        help="Alias/override for --pnurl_weight. Useful for attr-only PNuRL warmup.",
+    )
+    parser.add_argument(
+        "--density_loss_weight",
+        type=float,
+        default=None,
+        help="Alias/override for --density_map_weight. Set 0.0 for attr-only PNuRL warmup.",
+    )
+
+    # PNuRL v3 optimizer routing.
+    # These multipliers are applied to --lr.  They let the attribute heads learn faster
+    # while keeping density / semantic residual branches conservative.
+    parser.add_argument("--pnurl_attr_lr_mult", type=float, default=1.7, help="LR multiplier for PNuRL attribute classifiers")
+    parser.add_argument("--pnurl_prompt_bank_lr_mult", type=float, default=1.0, help="LR multiplier for PNuRL attribute prompt bank")
+    parser.add_argument("--pnurl_density_lr_mult", type=float, default=0.3, help="LR multiplier for PNuRL density decoder")
+    parser.add_argument("--pnurl_delta_lr_mult", type=float, default=0.1, help="LR multiplier for PNuRL semantic delta adapter")
+    parser.add_argument("--pnurl_other_lr_mult", type=float, default=0.3, help="LR multiplier for remaining PNuRL parameters")
+    parser.add_argument("--disable_attr_acc_logging", action="store_true", default=False, help="Disable per-attribute accuracy logging")
+    parser.add_argument(
+        "--resume_skip_pnurl",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip all pnurl.* weights when loading --resume. "
+            "Use this when starting MGST/PNuRL-v3 from a visual baseline or an old PNuRL checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--resume_filter_mismatch",
+        action="store_true",
+        default=True,
+        help=(
+            "Filter out checkpoint tensors whose shapes do not match the current model before load_state_dict. "
+            "This avoids RuntimeError from size-mismatched PNuRL-v3 modules."
+        ),
+    )
 
     parser.add_argument("--cnn_lr_ratio", type=float, default=None, help="LR ratio for ResNet/CNN high-frequency branch")
     parser.add_argument("--prompt_generator_lr_mult", type=float, default=None, help="LR multiplier for prompt generator")
@@ -186,6 +227,10 @@ def parse_args():
 
     if args.attr_weight is not None:
         args.pnurl_weight = args.attr_weight
+    if args.pnurl_loss_weight is not None:
+        args.pnurl_weight = args.pnurl_loss_weight
+    if args.density_loss_weight is not None:
+        args.density_map_weight = args.density_loss_weight
 
 
     if args.asr_regression:
@@ -256,6 +301,65 @@ def resize_pos_embed(state_dict, model_state_dict):
     return new_state_dict
 
 
+
+def filter_checkpoint_state_dict_for_model(
+    state_dict: Dict[str, torch.Tensor],
+    model_state_dict: Dict[str, torch.Tensor],
+    skip_prefixes: Tuple[str, ...] = (),
+    filter_mismatch: bool = True,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, int], List[Tuple[str, Tuple[int, ...], Tuple[int, ...]]]]:
+    """Filter checkpoint tensors before load_state_dict.
+
+    Why this is needed:
+        load_state_dict(strict=False) ignores missing/unexpected keys, but shape-mismatched keys
+        can still raise RuntimeError. PNuRL-v3 changes several parameter shapes, so old PNuRL
+        checkpoints must be filtered before loading.
+
+    Returns:
+        filtered_state_dict:
+            Tensor dict safe to pass to model.load_state_dict(..., strict=False).
+
+        stats:
+            loaded / skipped_prefix / skipped_mismatch / skipped_missing counts.
+
+        mismatch_examples:
+            Up to 20 examples of shape-mismatched keys for logging.
+    """
+    filtered = {}
+    stats = {
+        "loaded": 0,
+        "skipped_prefix": 0,
+        "skipped_mismatch": 0,
+        "skipped_missing": 0,
+    }
+    mismatch_examples = []
+
+    for k, v in state_dict.items():
+        if skip_prefixes and any(k.startswith(prefix) for prefix in skip_prefixes):
+            stats["skipped_prefix"] += 1
+            continue
+
+        if k not in model_state_dict:
+            # Missing-from-current-model is fine under strict=False.
+            filtered[k] = v
+            stats["skipped_missing"] += 1
+            continue
+
+        target = model_state_dict[k]
+
+        if filter_mismatch and hasattr(v, "shape") and hasattr(target, "shape"):
+            if tuple(v.shape) != tuple(target.shape):
+                stats["skipped_mismatch"] += 1
+                if len(mismatch_examples) < 20:
+                    mismatch_examples.append((k, tuple(v.shape), tuple(target.shape)))
+                continue
+
+        filtered[k] = v
+        stats["loaded"] += 1
+
+    return filtered, stats, mismatch_examples
+
+
 def hover_post_process(prob_map, hv_map, prob_thresh=0.45, marker_thresh=0.4, min_marker_size=10):
     mask = prob_map > prob_thresh
     if not np.any(mask):
@@ -298,7 +402,7 @@ def set_named_requires_grad(module: Optional[nn.Module], flag: bool, include_key
 def set_semantic_gate_state(raw_model: nn.Module, stage: str):
     close_value = -12.0
     warm_value = -10.0
-    open_value = -5.0
+    open_value = -3.0
     gate_trainable = stage == "semantic_injection"
 
     pnurl = getattr(raw_model, "pnurl", None)
@@ -444,6 +548,8 @@ def apply_stage_policy(model: nn.Module, stage: str, args=None, logger=None, ran
             "Segmentation loss can update bounded PNuRL/CoOp/gate. "
             "Image adapters stay frozen unless --stage_c_train_image_adapter is set."
         )
+    if rank == 0 and logger is not None:
+        logger.info(f"FREQPATH_ABLATION={os.environ.get('FREQPATH_ABLATION', 'both')}")
 
     if rank == 0 and logger is not None:
         trainable = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
@@ -452,6 +558,372 @@ def apply_stage_policy(model: nn.Module, stage: str, args=None, logger=None, ran
         logger.info(f"Trainable parameters: {trainable:,} / {total:,} ({trainable / max(total, 1):.2%})")
 
     return raw_model
+
+
+ATTRIBUTE_LOGIT_KEYS = ("color", "shape", "arrange", "size", "density")
+ATTRIBUTE_LOG_DISPLAY = {
+    "color": "C",
+    "shape": "Sh",
+    "arrange": "Ar",
+    "size": "Sz",
+    "density": "De",
+}
+
+
+ATTRIBUTE_LOSS_KEYS = {
+    "color": ("pnurl_loss_color", "pnurl_attr_loss_color", "loss_color"),
+    "shape": ("pnurl_loss_shape", "pnurl_attr_loss_shape", "loss_shape"),
+    "arrange": ("pnurl_loss_arrange", "pnurl_attr_loss_arrange", "loss_arrange", "pnurl_loss_arrangement"),
+    "size": ("pnurl_loss_size", "pnurl_attr_loss_size", "loss_size"),
+    "density": ("pnurl_loss_density", "pnurl_attr_loss_density", "loss_density"),
+}
+
+
+def _get_pnurl_submodule(model: nn.Module) -> Optional[nn.Module]:
+    raw_model = unwrap_model(model)
+    return getattr(raw_model, "pnurl", None)
+
+
+def _infer_attr_class_counts_from_knowledge(knowledge_path: str, split: str = "train") -> Optional[Dict[str, List[float]]]:
+    """
+    Infer per-attribute class counts from medical_knowledge_v2.json.
+
+    Expected label order:
+        [color, shape, arrangement/arrange, size, density]
+    """
+    if not knowledge_path:
+        print("[DEBUG] attr count failed: empty knowledge_path")
+        return None
+
+    knowledge_path = os.path.expanduser(str(knowledge_path))
+
+    if not os.path.exists(knowledge_path):
+        print(f"[DEBUG] attr count failed: path does not exist: {knowledge_path}")
+        return None
+
+    try:
+        with open(knowledge_path, "r", encoding="utf-8") as f:
+            db = json.load(f)
+    except Exception as exc:
+        print(f"[DEBUG] attr count failed: json load error: {exc}")
+        return None
+
+    attr_names = ["color", "shape", "arrange", "size", "density"]
+
+    counts = {
+        "color": [0.0, 0.0],
+        "shape": [0.0, 0.0, 0.0],
+        "arrange": [0.0, 0.0],
+        "size": [0.0, 0.0, 0.0],
+        "density": [0.0, 0.0, 0.0],
+    }
+
+    desired_split = None if split is None else str(split).lower().strip()
+
+    scanned = 0
+    split_hit = 0
+    label_hit = 0
+    bad_label = 0
+
+    split_counter = {}
+
+    for sample_key, entry in db.items():
+        if sample_key == "__meta__" or not isinstance(entry, dict):
+            continue
+
+        scanned += 1
+
+        entry_split = entry.get("split", None)
+        if entry_split is None:
+            entry_split = str(sample_key).replace("\\", "/").split("/")[0]
+
+        entry_split = str(entry_split).lower().strip()
+        split_counter[entry_split] = split_counter.get(entry_split, 0) + 1
+
+        if desired_split is not None and entry_split != desired_split:
+            continue
+
+        split_hit += 1
+
+        labels = entry.get("attr_labels", None)
+        if labels is None:
+            labels = entry.get("labels", None)
+
+        if labels is None:
+            bad_label += 1
+            continue
+
+        if isinstance(labels, dict):
+            labels = [
+                labels.get("color", None),
+                labels.get("shape", None),
+                labels.get("arrange", labels.get("arrangement", None)),
+                labels.get("size", None),
+                labels.get("density", None),
+            ]
+
+        try:
+            labels = list(labels)
+        except Exception:
+            bad_label += 1
+            continue
+
+        if len(labels) < 5:
+            bad_label += 1
+            continue
+
+        clean_labels = []
+        ok = True
+
+        for x in labels[:5]:
+            try:
+                clean_labels.append(int(x))
+            except Exception:
+                ok = False
+                break
+
+        if not ok:
+            bad_label += 1
+            continue
+
+        label_hit += 1
+
+        for idx, attr_name in enumerate(attr_names):
+            cls = int(clean_labels[idx])
+
+            if cls == 255 or cls < 0:
+                continue
+
+            if cls >= len(counts[attr_name]):
+                counts[attr_name].extend([0.0] * (cls + 1 - len(counts[attr_name])))
+
+            counts[attr_name][cls] += 1.0
+
+    if label_hit <= 0:
+        print(
+            "[DEBUG] attr count failed | "
+            f"path={knowledge_path} | "
+            f"desired_split={desired_split} | "
+            f"scanned={scanned} | "
+            f"split_counter={split_counter} | "
+            f"split_hit={split_hit} | "
+            f"label_hit={label_hit} | "
+            f"bad_label={bad_label}"
+        )
+        return None
+
+    for attr_name in counts:
+        counts[attr_name] = [max(1.0, float(x)) for x in counts[attr_name]]
+
+    print(
+        "[DEBUG] attr count success | "
+        f"path={knowledge_path} | "
+        f"desired_split={desired_split} | "
+        f"scanned={scanned} | "
+        f"split_counter={split_counter} | "
+        f"split_hit={split_hit} | "
+        f"label_hit={label_hit} | "
+        f"bad_label={bad_label} | "
+        f"counts={counts}"
+    )
+
+    return counts
+
+
+def configure_pnurl_class_counts(model: nn.Module, args, logger=None, rank: int = 0):
+    """Pass true train-split attr class counts to PNuRL-v3 if supported."""
+    pnurl = _get_pnurl_submodule(model)
+
+    if pnurl is None:
+        if rank == 0 and logger is not None:
+            logger.info("PNuRL attr class counts: skipped because model has no pnurl module.")
+        return
+
+    if not hasattr(pnurl, "set_attr_class_counts"):
+        if rank == 0 and logger is not None:
+            logger.info("PNuRL attr class counts: module does not expose set_attr_class_counts(); using defaults.")
+        return
+
+    knowledge_path = getattr(args, "knowledge_path", "")
+
+    counts = _infer_attr_class_counts_from_knowledge(knowledge_path, split="train")
+
+    if counts is None:
+        if rank == 0 and logger is not None:
+            logger.info(f"PNuRL attr class counts: not found in {knowledge_path}; using module defaults.")
+        return
+
+    try:
+        pnurl.set_attr_class_counts(counts)
+
+        if rank == 0 and logger is not None:
+            logger.info(f"PNuRL attr class counts loaded from knowledge file: {counts}")
+
+    except Exception as exc:
+        if rank == 0 and logger is not None:
+            logger.warning(f"Failed to configure PNuRL attr class counts with dict counts: {exc}")
+
+        try:
+            ordered_counts = [
+                counts["color"],
+                counts["shape"],
+                counts["arrange"],
+                counts["size"],
+                counts["density"],
+            ]
+
+            pnurl.set_attr_class_counts(ordered_counts)
+
+            if rank == 0 and logger is not None:
+                logger.info(f"PNuRL attr class counts loaded as ordered list: {ordered_counts}")
+
+        except Exception as exc2:
+            if rank == 0 and logger is not None:
+                logger.warning(f"Failed to configure PNuRL attr class counts with ordered list: {exc2}")
+
+def _get_output_scalar(out: Dict, candidates: Tuple[str, ...], device: torch.device) -> torch.Tensor:
+    for key in candidates:
+        value = out.get(key, None)
+        if value is None:
+            continue
+        if torch.is_tensor(value):
+            return value.to(device=device).float().mean()
+        try:
+            return torch.tensor(float(value), device=device)
+        except Exception:
+            continue
+    return torch.tensor(float("nan"), device=device)
+
+
+def _compute_attr_ce_loss_for_logging(
+    out: Dict,
+    attr_label,
+    attr_key: str,
+    attr_index: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Fallback per-attribute CE loss for logging.
+
+    TextSam may not propagate PNuRL-v3's pnurl_loss_shape / pnurl_loss_size fields.
+    This helper computes a diagnostic CE directly from out["attr_logits"] and the
+    sample's attr_labels so AttrLoss no longer becomes nan.
+    """
+    attr_logits = out.get("attr_logits", None)
+    if not isinstance(attr_logits, dict):
+        return torch.tensor(float("nan"), device=device)
+
+    logits = attr_logits.get(attr_key, None)
+    if logits is None or not torch.is_tensor(logits):
+        return torch.tensor(float("nan"), device=device)
+
+    label = _as_attr_label_tensor(attr_label, device=device)
+    if label is None or label.numel() <= attr_index:
+        return torch.tensor(float("nan"), device=device)
+
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+    if logits.dim() < 2 or logits.shape[0] < 1:
+        return torch.tensor(float("nan"), device=device)
+
+    target = int(label[attr_index].item())
+    if target < 0 or target == 255 or target >= logits.shape[1]:
+        return torch.tensor(float("nan"), device=device)
+
+    target_tensor = torch.tensor([target], device=device, dtype=torch.long)
+    return F.cross_entropy(logits[:1].float(), target_tensor)
+
+
+def _format_attr_loss(stats: Dict[str, float]) -> str:
+    parts = []
+    valid_values = []
+    for key in ATTRIBUTE_LOGIT_KEYS:
+        value = stats.get(f"attr_loss_{key}", float("nan"))
+        if value is not None and not np.isnan(value):
+            valid_values.append(float(value))
+            parts.append(f"{ATTRIBUTE_LOG_DISPLAY[key]}:{value:.3f}")
+        else:
+            parts.append(f"{ATTRIBUTE_LOG_DISPLAY[key]}:nan")
+    mean_value = float(np.mean(valid_values)) if valid_values else float("nan")
+    if np.isnan(mean_value):
+        return "Mean:nan, " + ", ".join(parts)
+    return f"Mean:{mean_value:.3f}, " + ", ".join(parts)
+
+
+def _pnurl_named_params_by_keywords(
+    pnurl: Optional[nn.Module],
+    keywords: Tuple[str, ...],
+    exclude_keywords: Tuple[str, ...] = (),
+):
+    if pnurl is None:
+        return []
+
+    selected = []
+    for name, p in pnurl.named_parameters():
+        if exclude_keywords and any(k in name for k in exclude_keywords):
+            continue
+        if any(k in name for k in keywords):
+            selected.append((name, p))
+    return selected
+
+
+def _add_pnurl_v2_param_groups(
+    add_named_params,
+    pnurl: Optional[nn.Module],
+    base_lr: float,
+    args,
+):
+    """Split PNuRL into diagnostic optimizer groups.
+
+    Main goal:
+        - attribute_classifiers learn faster;
+        - attribute_prompt_bank uses base LR;
+        - density_decoder and semantic_delta_adapter are conservative;
+        - any remaining PNuRL parameters are still optimized but at a low LR.
+
+    PyTorch AdamW accepts per-parameter-group learning rates, so this is safer
+    than forcing all PNuRL submodules to share a single LR.
+    """
+    if pnurl is None:
+        return
+
+    attr_lr = base_lr * float(getattr(args, "pnurl_attr_lr_mult", 1.7))
+    bank_lr = base_lr * float(getattr(args, "pnurl_prompt_bank_lr_mult", 1.0))
+    density_lr = base_lr * float(getattr(args, "pnurl_density_lr_mult", 0.3))
+    delta_lr = base_lr * float(getattr(args, "pnurl_delta_lr_mult", 0.1))
+    other_lr = base_lr * float(getattr(args, "pnurl_other_lr_mult", 0.3))
+
+    add_named_params(
+        "pnurl_attribute_classifiers",
+        _pnurl_named_params_by_keywords(pnurl, ("attribute_classifiers",)),
+        attr_lr,
+    )
+    add_named_params(
+        "pnurl_attribute_prompt_bank",
+        _pnurl_named_params_by_keywords(pnurl, ("attribute_prompt_bank",)),
+        bank_lr,
+    )
+    add_named_params(
+        "pnurl_density_decoder",
+        _pnurl_named_params_by_keywords(pnurl, ("density_decoder",)),
+        density_lr,
+    )
+    add_named_params(
+        "pnurl_semantic_delta_adapter",
+        _pnurl_named_params_by_keywords(
+            pnurl,
+            (
+                "semantic_delta_adapter",
+                "delta_adapter",
+                "semantic_delta",
+            ),
+            exclude_keywords=("semantic_channel_gate", "channel_gate", "semantic_gate", "residual_gate"),
+        ),
+        delta_lr,
+    )
+
+    # Keep remaining trainable PNuRL parameters. Previously added parameters are
+    # skipped by the add_named_params/seen mechanism.
+    add_named_params("pnurl_other", list(pnurl.named_parameters()), other_lr)
 
 
 def build_optimizer_by_stage(model: nn.Module, stage: str, args, logger=None, rank: int = 0):
@@ -515,7 +987,12 @@ def build_optimizer_by_stage(model: nn.Module, stage: str, args, logger=None, ra
         )
 
     elif stage == "pnurl_warmup":
-        add_named_params("pnurl", module_named_params(getattr(raw_model, "pnurl", None)), base_lr)
+        _add_pnurl_v2_param_groups(
+            add_named_params=add_named_params,
+            pnurl=getattr(raw_model, "pnurl", None),
+            base_lr=base_lr,
+            args=args,
+        )
 
     elif stage == "semantic_injection":
         add_named_params(
@@ -532,7 +1009,12 @@ def build_optimizer_by_stage(model: nn.Module, stage: str, args, logger=None, ra
             ),
             base_lr * 0.5,
         )
-        add_named_params("pnurl", module_named_params(getattr(raw_model, "pnurl", None)), base_lr * 0.3)
+        _add_pnurl_v2_param_groups(
+            add_named_params=add_named_params,
+            pnurl=getattr(raw_model, "pnurl", None),
+            base_lr=base_lr,
+            args=args,
+        )
         add_named_params("prompt_learner", module_named_params(getattr(raw_model, "prompt_learner", None)), base_lr * 0.5)
         add_named_params("prompt_generator", module_named_params(getattr(raw_model, "prompt_generator", None)), base_lr * 0.1)
 
@@ -604,6 +1086,137 @@ def _split_decoder_params(mask_decoder: Optional[nn.Module]):
         else:
             old_params.append((name, p))
     return new_params, old_params
+
+
+def _trainable_param_signature(model: nn.Module) -> Tuple[List[Tuple[str, Tuple[int, ...], int]], int, str]:
+    """
+    Return a deterministic signature of trainable parameters.
+
+    DDP only synchronizes parameters that require gradients. If one rank freezes everything
+    while another rank opens Stage C modules, DDP will fail with a vague "same model" error.
+    This signature makes that failure explicit before wrapping the model with DDP.
+    """
+    raw_model = unwrap_model(model)
+    signature: List[Tuple[str, Tuple[int, ...], int]] = []
+    total_numel = 0
+
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        shape = tuple(int(x) for x in param.shape)
+        numel = int(param.numel())
+        signature.append((name, shape, numel))
+        total_numel += numel
+
+    digest_src = "\n".join(f"{name}|{shape}|{numel}" for name, shape, numel in signature)
+    digest = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()[:16]
+    return signature, total_numel, digest
+
+
+def debug_trainable_signature(
+    model: nn.Module,
+    rank: int,
+    logger=None,
+    tag: str = "before_ddp",
+    max_items: int = 40,
+):
+    signature, total_numel, digest = _trainable_param_signature(model)
+    msg = (
+        f"[DDP DEBUG][rank={rank}][{tag}] "
+        f"trainable_param_tensors={len(signature)}, "
+        f"trainable_numel={total_numel:,}, "
+        f"digest={digest}"
+    )
+
+    if logger is not None:
+        logger.info(msg)
+        for name, shape, numel in signature[:max_items]:
+            logger.info(f"[DDP DEBUG][rank={rank}] trainable: {name} | shape={shape} | numel={numel:,}")
+        if len(signature) > max_items:
+            logger.info(f"[DDP DEBUG][rank={rank}] ... {len(signature) - max_items} more trainable tensors")
+    else:
+        print(msg, flush=True)
+        for name, shape, numel in signature[:max_items]:
+            print(f"[DDP DEBUG][rank={rank}] trainable: {name} | shape={shape} | numel={numel}", flush=True)
+        if len(signature) > max_items:
+            print(f"[DDP DEBUG][rank={rank}] ... {len(signature) - max_items} more trainable tensors", flush=True)
+
+
+def assert_same_trainable_across_ranks(
+    model: nn.Module,
+    device: torch.device,
+    logger=None,
+    tag: str = "before_ddp",
+):
+    """
+    Fail early if different ranks have different trainable parameter sets.
+
+    This directly catches the previous failure mode:
+    rank0 opened Stage C modules, while rank1 had zero trainable parameters.
+    """
+    signature, total_numel, digest = _trainable_param_signature(model)
+
+    if len(signature) == 0:
+        raise RuntimeError(
+            f"No trainable parameters on this process at {tag}. "
+            "Check apply_stage_policy(), phase/use_pnurl/use_coop/use_asr, and rank-gated freeze/unfreeze logic."
+        )
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    local_summary = {
+        "rank": rank,
+        "trainable_tensors": len(signature),
+        "trainable_numel": int(total_numel),
+        "digest": digest,
+        "first_names": [name for name, _, _ in signature[:8]],
+        "last_names": [name for name, _, _ in signature[-8:]],
+    }
+    gathered: List[Optional[Dict]] = [None for _ in range(world_size)]
+    dist.all_gather_object(gathered, local_summary)
+
+    if rank == 0 and logger is not None:
+        logger.info(f"[DDP CHECK][{tag}] trainable signatures across ranks:")
+        for item in gathered:
+            logger.info(
+                f"  rank={item['rank']} | tensors={item['trainable_tensors']} | "
+                f"numel={item['trainable_numel']:,} | digest={item['digest']}"
+            )
+
+    base = gathered[0]
+    mismatches = [
+        item for item in gathered
+        if (
+            item["trainable_tensors"] != base["trainable_tensors"]
+            or item["trainable_numel"] != base["trainable_numel"]
+            or item["digest"] != base["digest"]
+        )
+    ]
+
+    if mismatches:
+        local_detail = (
+            f"[DDP CHECK][rank={rank}][{tag}] local first_names={local_summary['first_names']} "
+            f"local last_names={local_summary['last_names']}"
+        )
+        if logger is not None:
+            logger.error(local_detail)
+            logger.error(f"[DDP CHECK][{tag}] gathered={gathered}")
+        else:
+            print(local_detail, flush=True)
+            print(f"[DDP CHECK][{tag}] gathered={gathered}", flush=True)
+
+        raise RuntimeError(
+            f"DDP trainable parameter mismatch before DDP wrapping at {tag}. "
+            f"rank0=(tensors={base['trainable_tensors']}, numel={base['trainable_numel']}, digest={base['digest']}), "
+            f"local_rank{rank}=(tensors={local_summary['trainable_tensors']}, "
+            f"numel={local_summary['trainable_numel']}, digest={local_summary['digest']}). "
+            "This usually means model freeze/unfreeze, module creation, checkpoint loading, or ablation logic "
+            "ran differently across ranks."
+        )
 
 
 # ==================================================================================================
@@ -866,6 +1479,82 @@ def _write_scalar_if_finite(writer, tag: str, value: float, step: int):
     writer.add_scalar(tag, value, step)
 
 
+def _as_attr_label_tensor(attr_label, device: torch.device) -> Optional[torch.Tensor]:
+    if attr_label is None:
+        return None
+
+    if isinstance(attr_label, torch.Tensor):
+        label = attr_label.detach().to(device=device).view(-1).long()
+    else:
+        try:
+            label = torch.as_tensor(attr_label, device=device).view(-1).long()
+        except Exception:
+            return None
+
+    if label.numel() < len(ATTRIBUTE_LOGIT_KEYS):
+        return None
+
+    return label[: len(ATTRIBUTE_LOGIT_KEYS)]
+
+
+def _accumulate_attribute_accuracy(out: Dict, attr_label, correct: Dict[str, int], total: Dict[str, int], device: torch.device):
+    attr_logits = out.get("attr_logits", None)
+    if not isinstance(attr_logits, dict):
+        return
+
+    label = _as_attr_label_tensor(attr_label, device=device)
+    if label is None:
+        return
+
+    for idx, key in enumerate(ATTRIBUTE_LOGIT_KEYS):
+        logits = attr_logits.get(key, None)
+        if logits is None or not torch.is_tensor(logits):
+            continue
+
+        logits = logits.detach()
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        if logits.dim() < 2 or logits.shape[0] < 1:
+            continue
+
+        target = int(label[idx].item())
+        if target < 0 or target == 255 or target >= logits.shape[1]:
+            continue
+
+        pred = int(torch.argmax(logits[0].float(), dim=-1).item())
+        correct[key] += int(pred == target)
+        total[key] += 1
+
+
+def _format_attr_acc(stats: Dict[str, float]) -> str:
+    parts = []
+    valid_values = []
+    for key in ATTRIBUTE_LOGIT_KEYS:
+        value = stats.get(f"attr_acc_{key}", float("nan"))
+        if value is not None and not np.isnan(value):
+            valid_values.append(float(value))
+            parts.append(f"{ATTRIBUTE_LOG_DISPLAY[key]}:{value:.3f}")
+        else:
+            parts.append(f"{ATTRIBUTE_LOG_DISPLAY[key]}:nan")
+
+    mean_value = float(np.mean(valid_values)) if valid_values else float("nan")
+    if np.isnan(mean_value):
+        return "Mean:nan, " + ", ".join(parts)
+    return f"Mean:{mean_value:.3f}, " + ", ".join(parts)
+
+
+def _current_attr_acc_mean(meters: Dict[str, List[float]]) -> float:
+    values = []
+    for key in ATTRIBUTE_LOGIT_KEYS:
+        meter_key = f"attr_acc_{key}"
+        if meter_key not in meters or len(meters[meter_key]) == 0:
+            continue
+        value = meters[meter_key][-1]
+        if value is not None and not np.isnan(value):
+            values.append(float(value))
+    return float(np.mean(values)) if values else float("nan")
+
+
 def _autocast_context(args):
     if not torch.cuda.is_available():
         return torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=False)
@@ -904,6 +1593,16 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         "semantic_delta_direction_norm": [],
         "semantic_stability": [],
         "injection_penalty": [],
+        "attr_acc_color": [],
+        "attr_acc_shape": [],
+        "attr_acc_arrange": [],
+        "attr_acc_size": [],
+        "attr_acc_density": [],
+        "attr_loss_color": [],
+        "attr_loss_shape": [],
+        "attr_loss_arrange": [],
+        "attr_loss_size": [],
+        "attr_loss_density": [],
     }
 
     optimizer.zero_grad(set_to_none=True)
@@ -957,6 +1656,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 "semantic_stability": 0.0,
                 "injection_penalty": 0.0,
             }
+            attr_correct = {key: 0 for key in ATTRIBUTE_LOGIT_KEYS}
+            attr_total = {key: 0 for key in ATTRIBUTE_LOGIT_KEYS}
+            attr_loss_accum = {key: 0.0 for key in ATTRIBUTE_LOGIT_KEYS}
+            attr_loss_count = {key: 0 for key in ATTRIBUTE_LOGIT_KEYS}
 
             for i, out in enumerate(outputs):
                 pred_mask, pred_iou, gt_mask = _get_best_mask_and_iou(out, labels[i])
@@ -1008,6 +1711,29 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 accum["semantic_stability"] += float(loss_semantic_stability.detach().item())
                 accum["injection_penalty"] += float(loss_injection_penalty.detach().item())
 
+                for attr_idx, attr_key in enumerate(ATTRIBUTE_LOGIT_KEYS):
+                    loss_value = _get_output_scalar(out, ATTRIBUTE_LOSS_KEYS.get(attr_key, ()), device=args.device)
+                    if not (torch.is_tensor(loss_value) and torch.isfinite(loss_value).all()):
+                        loss_value = _compute_attr_ce_loss_for_logging(
+                            out=out,
+                            attr_label=model_input[i].get("attr_labels", None),
+                            attr_key=attr_key,
+                            attr_index=attr_idx,
+                            device=args.device,
+                        )
+                    if torch.is_tensor(loss_value) and torch.isfinite(loss_value).all():
+                        attr_loss_accum[attr_key] += float(loss_value.detach().item())
+                        attr_loss_count[attr_key] += 1
+
+                if not getattr(args, "disable_attr_acc_logging", False):
+                    _accumulate_attribute_accuracy(
+                        out=out,
+                        attr_label=model_input[i].get("attr_labels", None),
+                        correct=attr_correct,
+                        total=attr_total,
+                        device=args.device,
+                    )
+
             final_loss = loss_batch / max(len(images), 1)
             final_loss = final_loss / args.accumulation_steps
 
@@ -1042,6 +1768,19 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         for key, val in diag.items():
             meters[key].append(val)
 
+        for key in ATTRIBUTE_LOGIT_KEYS:
+            meter_key = f"attr_acc_{key}"
+            if not getattr(args, "disable_attr_acc_logging", False) and attr_total.get(key, 0) > 0:
+                meters[meter_key].append(attr_correct[key] / max(attr_total[key], 1))
+            else:
+                meters[meter_key].append(float("nan"))
+
+            loss_meter_key = f"attr_loss_{key}"
+            if attr_loss_count.get(key, 0) > 0:
+                meters[loss_meter_key].append(attr_loss_accum[key] / max(attr_loss_count[key], 1))
+            else:
+                meters[loss_meter_key].append(float("nan"))
+
         if rank == 0 and writer is not None and batch_idx % 10 == 0:
             global_step = epoch * len(train_loader) + batch_idx
             writer.add_scalar("Train/Loss_Total", current_loss_val, global_step)
@@ -1052,7 +1791,13 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             writer.add_scalar("Train/Loss_Density", meters["density"][-1], global_step)
             writer.add_scalar("Train/Loss_Semantic_Stability", meters["semantic_stability"][-1], global_step)
             writer.add_scalar("Train/Loss_Injection_Penalty", meters["injection_penalty"][-1], global_step)
+            for key in ATTRIBUTE_LOGIT_KEYS:
+                _write_scalar_if_finite(writer, f"Train/AttrAcc_{key}", meters[f"attr_acc_{key}"][-1], global_step)
+                _write_scalar_if_finite(writer, f"Train/AttrLoss_{key}", meters[f"attr_loss_{key}"][-1], global_step)
             writer.add_scalar("Train/LR", optimizer.param_groups[0]["lr"], global_step)
+            for group in optimizer.param_groups:
+                group_name = group.get("name", "unnamed")
+                _write_scalar_if_finite(writer, f"Train/LR_{group_name}", group.get("lr", optimizer.param_groups[0]["lr"]), global_step)
 
             for name in [
                 "semantic_channel_gate_mean",
@@ -1077,6 +1822,7 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 HV=f"{meters['hv'][-1]:.3f}",
                 P=f"{meters['pnurl'][-1]:.3f}",
                 D=f"{meters['density'][-1]:.3f}",
+                A=f"{_current_attr_acc_mean(meters):.3f}",
                 S=f"{meters['semantic_stability'][-1]:.4f}",
                 G=f"{diag['semantic_channel_gate_mean']:.4f}" if not np.isnan(diag["semantic_channel_gate_mean"]) else "nan",
                 IR=f"{diag['injection_ratio']:.4f}" if not np.isnan(diag["injection_ratio"]) else "nan",
@@ -1084,7 +1830,17 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
 
         del batched_input, images, labels, model_input, outputs, final_loss
 
-    return {k: float(np.nanmean(v)) if len(v) > 0 else 0.0 for k, v in meters.items()}
+    epoch_stats = {}
+    for k, v in meters.items():
+        if len(v) == 0:
+            epoch_stats[k] = 0.0
+            continue
+        arr = np.asarray(v, dtype=np.float64)
+        if np.all(np.isnan(arr)):
+            epoch_stats[k] = float("nan")
+        else:
+            epoch_stats[k] = float(np.nanmean(arr))
+    return epoch_stats
 
 
 # ==================================================================================================
@@ -1336,6 +2092,11 @@ def main(args):
             f"use_amp={args.use_amp} | cnn_lr_ratio={args.cnn_lr_ratio} | "
             f"prompt_generator_lr_mult={args.prompt_generator_lr_mult} | adapter_lr_ratio={args.adapter_lr_ratio}"
         )
+        logger.info(
+            f"Loss weights | mask={args.mask_weight} | heatmap={args.heatmap_weight} | hv={args.hv_weight} | "
+            f"pnurl={args.pnurl_weight} | density={args.density_map_weight} | "
+            f"semantic_delta_reg={args.semantic_delta_reg_weight} | injection_ratio={args.injection_ratio_weight}"
+        )
         writer = SummaryWriter(log_dir=run_log_dir, flush_secs=60)
     else:
         logger = None
@@ -1429,9 +2190,40 @@ def main(args):
                 checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
                 state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
                 state_dict = resize_pos_embed(state_dict, raw_model.state_dict())
-                missing_keys, unexpected_keys = raw_model.load_state_dict(state_dict, strict=False)
+
+                ckpt_phase = checkpoint.get("phase", "unknown") if isinstance(checkpoint, dict) else "unknown"
+                skip_prefixes = ()
+                # When entering PNuRL-v3 from a visual baseline or old checkpoint, keep visual weights
+                # but reinitialize PNuRL-v3 to avoid incompatible or stale attribute-head weights.
+                auto_skip_pnurl = (
+                    args.phase in ("pnurl_warmup", "semantic_injection")
+                    and str(ckpt_phase).lower() not in ("pnurl_warmup", "semantic_injection")
+                )
+                if getattr(args, "resume_skip_pnurl", False) or auto_skip_pnurl:
+                    skip_prefixes = ("pnurl.",)
+
+                filtered_state_dict, filter_stats, mismatch_examples = filter_checkpoint_state_dict_for_model(
+                    state_dict=state_dict,
+                    model_state_dict=raw_model.state_dict(),
+                    skip_prefixes=skip_prefixes,
+                    filter_mismatch=getattr(args, "resume_filter_mismatch", True),
+                )
+
+                missing_keys, unexpected_keys = raw_model.load_state_dict(filtered_state_dict, strict=False)
+
                 if rank == 0:
-                    logger.info("Model weights loaded. Newly added modules remain initialized by current code.")
+                    logger.info("Model weights loaded with mismatch-safe filtering. Newly added modules remain initialized by current code.")
+                    logger.info(
+                        "Resume filter stats: "
+                        f"loaded={filter_stats['loaded']} | "
+                        f"skipped_prefix={filter_stats['skipped_prefix']} | "
+                        f"skipped_mismatch={filter_stats['skipped_mismatch']} | "
+                        f"skipped_missing={filter_stats['skipped_missing']} | "
+                        f"skip_prefixes={skip_prefixes}"
+                    )
+                    if mismatch_examples:
+                        for key, src_shape, dst_shape in mismatch_examples[:10]:
+                            logger.info(f"  skipped mismatch: {key} ckpt={src_shape} model={dst_shape}")
                     logger.info(f"Missing keys: {len(missing_keys)} | Unexpected keys: {len(unexpected_keys)}")
                     old_arch = checkpoint.get("architecture_version", "unknown") if isinstance(checkpoint, dict) else "unknown"
                     logger.info(f"Checkpoint architecture_version: {old_arch}")
@@ -1444,8 +2236,22 @@ def main(args):
             except Exception as e:
                 if rank == 0:
                     logger.warning(f"Resume failed: {e}")
+                    logger.warning("Training will continue with currently initialized weights. This is not recommended for clean experiments.")
+
+        configure_pnurl_class_counts(raw_model, args=args, logger=logger, rank=rank)
 
         apply_stage_policy(raw_model, args.phase, args=args, logger=logger, rank=rank)
+
+        if world_size > 1:
+            debug_trainable_signature(raw_model, rank=rank, logger=logger if rank == 0 else None, tag="after_stage_policy")
+            assert_same_trainable_across_ranks(
+                raw_model,
+                device=args.device,
+                logger=logger if rank == 0 else None,
+                tag="after_stage_policy",
+            )
+            dist.barrier()
+
         optimizer = build_optimizer_by_stage(raw_model, args.phase, args=args, logger=logger, rank=rank)
 
         if world_size > 1:
@@ -1526,6 +2332,8 @@ def main(args):
                     f"(M:{train_stats['mask']:.3f}, H:{train_stats['heatmap']:.3f}, "
                     f"HV:{train_stats['hv']:.3f}, P:{train_stats['pnurl']:.3f}, D:{train_stats['density']:.3f}, "
                     f"S:{train_stats['semantic_stability']:.4f}) | "
+                    f"AttrAcc({_format_attr_acc(train_stats)}) | "
+                    f"AttrLoss({_format_attr_loss(train_stats)}) | "
                     f"GateMean:{train_stats['semantic_channel_gate_mean']:.6e} | "
                     f"DeltaNorm:{train_stats['semantic_delta_norm']:.6e} | "
                     f"BaseNorm:{train_stats['base_feat_norm']:.6e} | "

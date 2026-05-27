@@ -11,6 +11,7 @@ from skimage.measure import regionprops
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 
+
 # === Optional dependencies ===
 try:
     from sklearn.neighbors import KDTree
@@ -24,20 +25,41 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
+try:
+    from pycocotools import mask as coco_mask
+    PYCOCOTOOLS_AVAILABLE = True
+except ImportError:
+    PYCOCOTOOLS_AVAILABLE = False
+
 
 # ==============================================================================
 # 0. Organ mapping and prompt protocol
 # ==============================================================================
 ORGAN_TO_ID = {
     # PanNuke 19 organs
-    "Adrenal_gland": 0, "Bile-duct": 1, "Bladder": 2, "Breast": 3,
-    "Cervix": 4, "Colon": 5, "Esophagus": 6, "HeadNeck": 7,
-    "Kidney": 8, "Liver": 9, "Lung": 10, "Ovarian": 11,
-    "Pancreatic": 12, "Prostate": 13, "Skin": 14, "Stomach": 15,
-    "Testis": 16, "Thyroid": 17, "Uterus": 18,
+    "Adrenal_gland": 0,
+    "Bile-duct": 1,
+    "Bladder": 2,
+    "Breast": 3,
+    "Cervix": 4,
+    "Colon": 5,
+    "Esophagus": 6,
+    "HeadNeck": 7,
+    "Kidney": 8,
+    "Liver": 9,
+    "Lung": 10,
+    "Ovarian": 11,
+    "Pancreatic": 12,
+    "Prostate": 13,
+    "Skin": 14,
+    "Stomach": 15,
+    "Testis": 16,
+    "Thyroid": 17,
+    "Uterus": 18,
 
     # Extra
-    "Brain": 19, "Generic": 20,
+    "Brain": 19,
+    "Generic": 20,
 }
 
 ID_TO_ORGAN = {v: k for k, v in ORGAN_TO_ID.items()}
@@ -92,7 +114,7 @@ def prompt_uses_gt_attributes(prompt_mode: str) -> bool:
 
 
 # ==============================================================================
-# 1. Dynamic attribute configuration
+# 1. Attribute configuration
 # ==============================================================================
 @dataclass
 class AttributeConfig:
@@ -107,18 +129,24 @@ class AttributeConfig:
 
     @classmethod
     def from_metadata(cls, stats: Optional[Dict[str, Any]]):
+        """
+        Backward-compatible reader for old medical_knowledge.json.
+
+        medical_knowledge_v2.json mainly uses precomputed attr_labels and prompts,
+        so this config is only used for dynamic_gt / fallback crop statistics.
+        """
         if not stats:
             return cls()
 
         return cls(
-            AREA_SMALL=stats.get("th_size_small", 250.0),
-            AREA_LARGE=stats.get("th_size_large", 600.0),
+            AREA_SMALL=stats.get("th_size_small", stats.get("size_q33", 250.0)),
+            AREA_LARGE=stats.get("th_size_large", stats.get("size_q66", 600.0)),
             DENSITY_SPARSE=stats.get("th_dens_sparse", 0.05),
             DENSITY_DENSE=stats.get("th_dens_dense", 0.20),
-            SHAPE_ROUND=stats.get("th_shape_round", 0.6),
-            SHAPE_OVAL=stats.get("th_shape_oval", 0.85),
-            ARRANGE_CLUMPED=stats.get("th_arrange_clumped", 0.6),
-            COLOR_BRIGHT=stats.get("th_color_bright", 200.0),
+            SHAPE_ROUND=stats.get("th_shape_round", stats.get("shape_q33", 0.6)),
+            SHAPE_OVAL=stats.get("th_shape_oval", stats.get("shape_q66", 0.85)),
+            ARRANGE_CLUMPED=stats.get("th_arrange_clumped", stats.get("arrangement_q66", 0.6)),
+            COLOR_BRIGHT=stats.get("th_color_bright", stats.get("color_q50", 200.0)),
         )
 
 
@@ -163,13 +191,38 @@ def _safe_base_prompt(base_prompt: Optional[str]) -> str:
     return str(base_prompt).strip()
 
 
-def _build_organ_static_prompts(base_prompt: str, organ_name: str) -> Tuple[str, str, str]:
-    """
-    Build non-leaking organ-context prompts.
+def _default_visuals() -> Dict[str, str]:
+    return {
+        "color": "deep-purple stained",
+        "shape": "round",
+        "arrangement": "uniformly arranged",
+        "size": "medium-sized",
+        "density": "moderately distributed",
+    }
 
-    These prompts do not use crop-level mask statistics.
+
+def _default_attr_labels() -> List[int]:
+    # [Color, Shape, Arrangement, Size, Density]
+    return [0, 0, 0, 1, 1]
+
+
+def _build_base_prompts() -> Tuple[str, str, str]:
+    return STRICT_BASE_PROMPT, STRICT_BASE_PROMPT, STRICT_BASE_PROMPT
+
+
+def _build_organ_static_prompts(
+    base_prompt: str,
+    organ_name: str,
+    visuals: Optional[Dict[str, str]] = None,
+) -> Tuple[str, str, str]:
     """
-    base_prompt = _safe_base_prompt(base_prompt)
+    Build non-crop-leaking organ + attribute-aware prompts.
+
+    Used as fallback or for organ-prior validation/test prompts.
+    """
+    _ = _safe_base_prompt(base_prompt)
+    visuals = visuals or _default_visuals()
+
     organ_text = format_organ_name(organ_name)
 
     if organ_text == "generic":
@@ -179,18 +232,28 @@ def _build_organ_static_prompts(base_prompt: str, organ_name: str) -> Tuple[str,
         tissue_prefix = f"H&E-stained {organ_text} histopathology patch"
         organ_phrase = f"{organ_text} tissue"
 
-    text_prompt = f"{base_prompt} in {organ_phrase}."
+    color = visuals.get("color", "deep-purple stained")
+    shape = visuals.get("shape", "round")
+    arrangement = visuals.get("arrangement", "uniformly arranged")
+    size = visuals.get("size", "medium-sized")
+    density = visuals.get("density", "moderately distributed")
+
+    text_prompt = f"Cell nuclei in {organ_phrase}."
 
     attribute_text = (
         f"{tissue_prefix}. "
-        f"The image contains cell nuclei in {organ_phrase}. "
-        f"This prompt provides organ and tissue context without using crop-level mask-derived attributes."
+        f"The nuclei are {color}, {size}, {density}, {arrangement}, "
+        f"and {shape} in shape. "
+        f"These attribute-aware prompts describe nuclear staining, size, density, "
+        f"spatial arrangement, and morphology without using crop-level mask-derived statistics."
     )
 
     morphology_text = (
         f"{tissue_prefix}. "
-        f"Focus on nuclear boundaries, touching nuclei, contour clarity, and instance-level delineation. "
-        f"This prompt does not use ground-truth mask-derived shape, size, density, or arrangement statistics."
+        f"Focus on nuclear morphology and boundaries. "
+        f"The nuclei tend to be {shape}, {size}, {density}, and {arrangement}. "
+        f"Emphasize touching nuclei separation, contour clarity, boundary sharpness, "
+        f"and instance-level delineation."
     )
 
     return text_prompt, attribute_text, morphology_text
@@ -209,7 +272,7 @@ def _build_dynamic_gt_prompts(
     This function uses crop-level attributes estimated from the GT mask.
     It must not be used for normal validation/test.
     """
-    base_prompt = _safe_base_prompt(base_prompt)
+    _ = _safe_base_prompt(base_prompt)
     organ_text = format_organ_name(organ_name)
 
     if organ_text == "generic":
@@ -232,7 +295,7 @@ def _build_dynamic_gt_prompts(
         )
     else:
         text_prompt = (
-            f"{base_prompt} in {organ_phrase}; "
+            f"Cell nuclei in {organ_phrase}; "
             f"nuclei are {density} and {arrangement}."
         )
 
@@ -240,7 +303,7 @@ def _build_dynamic_gt_prompts(
         f"{tissue_prefix}. "
         f"The cell nuclei are {color}, {shape} in morphology, {size}, "
         f"{density}, and {arrangement}. "
-        f"These attributes describe nuclear staining appearance, tissue context, "
+        f"These crop-level attributes describe nuclear staining appearance, tissue context, "
         f"size, density, and spatial arrangement."
     )
 
@@ -268,50 +331,42 @@ def build_pathology_prompts(
 
     Formal prompt protocol:
         base:
-            Return "Cell nuclei" only. No organ, no GT-derived attributes.
+            Return "Cell nuclei" only. No organ, no attributes.
 
         organ_static:
-            Use only organ / tissue context. No GT mask statistics.
+            Use organ / tissue context + image-level attribute-aware prompts.
+            This is the main PromptNu-style non-crop-leaking mode.
 
         dynamic_gt:
-            Use GT mask-derived shape / size / density / arrangement / color.
+            Use GT mask-derived crop-level shape / size / density / arrangement / color.
             This is allowed only for training or oracle/debug experiments.
 
         dynamic_pred:
             Reserved for future predicted-attribute prompts.
-            Current implementation uses the same non-leaking organ-level prompt as organ_static.
-
-    Returns:
-        text_prompt:
-            General text prompt for TextGuidedPointGenerator.
-
-        attribute_text:
-            Low-frequency semantic text for PNuRL / CONCH branch.
-
-        morphology_text:
-            High-frequency morphology text for future morphology branch.
+            Current implementation uses the same non-crop-leaking attribute-aware prompt
+            as organ_static.
     """
     canonical_mode, _ = normalize_prompt_mode(prompt_mode, default="organ_static")
 
     if canonical_mode == "base":
-        return STRICT_BASE_PROMPT, STRICT_BASE_PROMPT, STRICT_BASE_PROMPT
+        return _build_base_prompts()
 
     if canonical_mode == "organ_static":
-        return _build_organ_static_prompts(base_prompt, organ_name)
+        return _build_organ_static_prompts(
+            base_prompt=base_prompt,
+            organ_name=organ_name,
+            visuals=visuals,
+        )
 
     if canonical_mode == "dynamic_pred":
-        # Placeholder. Later this should consume model-predicted attributes.
-        # It must not use GT mask statistics.
-        return _build_organ_static_prompts(base_prompt, organ_name)
+        return _build_organ_static_prompts(
+            base_prompt=base_prompt,
+            organ_name=organ_name,
+            visuals=visuals,
+        )
 
     if canonical_mode == "dynamic_gt":
-        visuals = visuals or {
-            "color": "deep-purple stained",
-            "shape": "round",
-            "arrangement": "uniformly arranged",
-            "size": "medium-sized",
-            "density": "moderately distributed",
-        }
+        visuals = visuals or _default_visuals()
         return _build_dynamic_gt_prompts(
             base_prompt=base_prompt,
             organ_name=organ_name,
@@ -320,11 +375,136 @@ def build_pathology_prompts(
             text_suffix=text_suffix,
         )
 
-    return _build_organ_static_prompts(base_prompt, organ_name)
+    return _build_organ_static_prompts(
+        base_prompt=base_prompt,
+        organ_name=organ_name,
+        visuals=visuals,
+    )
 
 
 # ==============================================================================
-# 3. Physical attribute analyzer
+# 3. Knowledge v2 utilities
+# ==============================================================================
+def _to_int_list(x: Any, default: Optional[List[int]] = None, length: int = 5) -> List[int]:
+    default = default or _default_attr_labels()
+
+    if x is None:
+        return list(default)
+
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().view(-1).tolist()
+    elif isinstance(x, np.ndarray):
+        x = x.reshape(-1).tolist()
+    elif isinstance(x, (list, tuple)):
+        x = list(x)
+    else:
+        return list(default)
+
+    out = []
+    for item in x[:length]:
+        try:
+            out.append(int(item))
+        except Exception:
+            out.append(0)
+
+    if len(out) < length:
+        out = out + list(default[len(out):length])
+
+    return out
+
+
+def _entry_is_v2(entry: Dict[str, Any]) -> bool:
+    if not isinstance(entry, dict):
+        return False
+
+    required = ["attr_labels", "attribute_text", "morphology_text"]
+    return all(k in entry for k in required)
+
+
+def _normalise_visual_stats_from_entry(entry: Dict[str, Any]) -> Dict[str, str]:
+    stats = entry.get("visual_stats", {}) if isinstance(entry, dict) else {}
+    if not isinstance(stats, dict):
+        stats = {}
+
+    visuals = _default_visuals()
+    for key in ["color", "shape", "arrangement", "size", "density"]:
+        value = stats.get(key, None)
+        if isinstance(value, str) and value.strip():
+            visuals[key] = value.strip()
+
+    return visuals
+
+
+def _normalise_prompts_from_entry(
+    entry: Dict[str, Any],
+    organ_name: str,
+    visuals: Dict[str, str],
+) -> Tuple[str, str, str]:
+    """
+    Use prompts stored in medical_knowledge_v2.json.
+    If any prompt is missing, rebuild a safe one from organ + visuals.
+    """
+    fallback_text, fallback_attr, fallback_morph = _build_organ_static_prompts(
+        base_prompt=STRICT_BASE_PROMPT,
+        organ_name=organ_name,
+        visuals=visuals,
+    )
+
+    text_prompt = entry.get("text_prompt", fallback_text)
+    attribute_text = entry.get("attribute_text", fallback_attr)
+    morphology_text = entry.get("morphology_text", fallback_morph)
+
+    if not isinstance(text_prompt, str) or not text_prompt.strip():
+        text_prompt = fallback_text
+    if not isinstance(attribute_text, str) or not attribute_text.strip():
+        attribute_text = fallback_attr
+    if not isinstance(morphology_text, str) or not morphology_text.strip():
+        morphology_text = fallback_morph
+
+    return text_prompt.strip(), attribute_text.strip(), morphology_text.strip()
+
+
+def _build_from_organ_prior(
+    meta: Dict[str, Any],
+    organ_name: str,
+) -> Tuple[List[int], Dict[str, str], Tuple[str, str, str]]:
+    """
+    Build non-sample-specific prompts from train-split organ priors.
+
+    This is used by default in val/test to avoid using val/test sample-specific
+    GT-derived attributes from medical_knowledge_v2.
+    """
+    organ_priors = meta.get("organ_priors", {}) if isinstance(meta, dict) else {}
+    prior = organ_priors.get(organ_name, None)
+
+    if prior is None:
+        prior = organ_priors.get("Generic", None)
+
+    if prior is None:
+        labels = _default_attr_labels()
+        visuals = _default_visuals()
+    else:
+        labels = _to_int_list(prior.get("attr_labels", None), default=_default_attr_labels())
+        visuals = prior.get("visual_stats", _default_visuals())
+        if not isinstance(visuals, dict):
+            visuals = _default_visuals()
+        merged = _default_visuals()
+        for key in ["color", "shape", "arrangement", "size", "density"]:
+            if isinstance(visuals.get(key, None), str) and visuals[key].strip():
+                merged[key] = visuals[key].strip()
+        visuals = merged
+
+    prompts = _build_organ_static_prompts(
+        base_prompt=STRICT_BASE_PROMPT,
+        organ_name=organ_name,
+        visuals=visuals,
+    )
+
+    return labels, visuals, prompts
+
+
+# ==============================================================================
+# 4. Physical attribute analyzer for dynamic_gt / fallback
 # ==============================================================================
 def _estimate_color_from_nuclei(image: np.ndarray, mask: np.ndarray, config: AttributeConfig) -> Tuple[int, str]:
     """
@@ -333,8 +513,6 @@ def _estimate_color_from_nuclei(image: np.ndarray, mask: np.ndarray, config: Att
     Current PNuRL color head has 2 classes:
         0: deep-purple stained
         1: light-purple stained
-
-    This is intentionally coarse and stable.
     """
     if image is None or image.ndim != 3 or mask.sum() == 0:
         return 0, "deep-purple stained"
@@ -358,27 +536,15 @@ def analyze_physical_attributes(
     area_scale: float = 1.0,
 ) -> Dict[str, Any]:
     """
-    Estimate physical attributes from current crop.
+    Estimate physical attributes from an image/mask pair.
 
     labels order:
-        [Color, Shape, Arrange, Size, Density]
-
-    label spaces:
-        Color:   0 deep-purple, 1 light-purple
-        Shape:   0 round, 1 oval, 2 elongated
-        Arrange: 0 uniform/isolated, 1 disordered/clustered
-        Size:    0 small, 1 medium, 2 large
-        Density: 0 sparse, 1 moderate, 2 dense
+        [Color, Shape, Arrangement, Size, Density]
     """
     default_results = {
-        "visuals": {
-            "color": "deep-purple stained",
-            "shape": "round",
-            "arrangement": "uniformly arranged",
-            "size": "medium-sized",
-            "density": "moderately distributed",
-        },
-        "labels": [0, 0, 0, 1, 1],
+        "visuals": _default_visuals(),
+        "labels": _default_attr_labels(),
+        "source": "default",
     }
 
     if mask is None or mask.sum() == 0:
@@ -405,9 +571,13 @@ def analyze_physical_attributes(
 
     if num_labels <= 1:
         col_lbl, col_txt = _estimate_color_from_nuclei(image, mask, config)
-        default_results["visuals"]["color"] = col_txt
-        default_results["labels"][0] = col_lbl
-        return default_results
+        out = dict(default_results)
+        out["visuals"] = dict(default_results["visuals"])
+        out["labels"] = list(default_results["labels"])
+        out["visuals"]["color"] = col_txt
+        out["labels"][0] = col_lbl
+        out["source"] = "physical_empty_or_single"
+        return out
 
     # 1. Size
     areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float32) * area_scale_factor
@@ -417,9 +587,9 @@ def analyze_physical_attributes(
     th_large = config.AREA_LARGE * area_scale
 
     if mean_area < th_small:
-        size_lbl, size_txt = 0, "small"
+        size_lbl, size_txt = 0, "small-sized"
     elif mean_area > th_large:
-        size_lbl, size_txt = 2, "large, enlarged"
+        size_lbl, size_txt = 2, "large-sized"
     else:
         size_lbl, size_txt = 1, "medium-sized"
 
@@ -444,7 +614,7 @@ def analyze_physical_attributes(
     if count < sparse_count_th:
         den_lbl, den_txt = 0, "sparsely distributed"
     elif count > dense_count_th:
-        den_lbl, den_txt = 2, "densely packed"
+        den_lbl, den_txt = 2, "densely distributed"
     else:
         den_lbl, den_txt = 1, "moderately distributed"
 
@@ -464,7 +634,7 @@ def analyze_physical_attributes(
         except Exception:
             arr_lbl, arr_txt = 0, "uniformly arranged"
     else:
-        arr_lbl, arr_txt = 0, "isolated"
+        arr_lbl, arr_txt = 0, "uniformly arranged"
 
     # 5. Color
     col_lbl, col_txt = _estimate_color_from_nuclei(image, mask, config)
@@ -478,6 +648,7 @@ def analyze_physical_attributes(
             "density": den_txt,
         },
         "labels": [col_lbl, shape_lbl, arr_lbl, size_lbl, den_lbl],
+        "source": "physical",
     }
 
 
@@ -620,7 +791,7 @@ def generate_hv_map(inst_mask: np.ndarray) -> np.ndarray:
 
 
 # ==============================================================================
-# 4. Dataset
+# 5. Dataset
 # ==============================================================================
 class UniversalDataset(data.Dataset):
     def __init__(
@@ -658,13 +829,32 @@ class UniversalDataset(data.Dataset):
 
         self.organ_map = ORGAN_TO_ID
 
+        # Previous code used fixed 20% organ dropout.
+        # It caused organ_id=Generic while text still contained organ-specific terms.
+        # Default is now 0.0. Enable explicitly only for ablation:
+        #   ORGAN_DROPOUT_PROB=0.2
+        self.organ_dropout_prob = float(os.environ.get("ORGAN_DROPOUT_PROB", "0.0"))
+
+        # Normal val/test should not consume val/test sample-specific GT-derived v2 attributes.
+        # Default:
+        #   train/oracle/debug: use sample-level v2 attrs.
+        #   val/test: use train-split organ priors from __meta__.
+        # For explicit oracle/debug check:
+        #   ALLOW_EVAL_SAMPLE_ATTRIBUTES=1
+        self.allow_eval_sample_attributes = os.environ.get("ALLOW_EVAL_SAMPLE_ATTRIBUTES", "0") == "1"
+
         print(f"📖 [DataLoader] Loading Knowledge Base: {knowledge_path}")
-        with open(knowledge_path, "r") as f:
+        with open(knowledge_path, "r", encoding="utf-8") as f:
             full_db = json.load(f)
 
+        self.meta = full_db.get("__meta__", {})
+        self.is_v2 = str(self.meta.get("version", "")).lower().startswith("promptnu_freqpath_v2")
+
+        # Attribute config is only for dynamic_gt / fallback.
         if "__meta__" in full_db:
-            meta = full_db["__meta__"]
-            stats = meta.get("stats", {})
+            stats = self.meta.get("stats", None)
+            if stats is None:
+                stats = self.meta.get("train_thresholds", {})
             self.attr_config = AttributeConfig.from_metadata(stats)
         else:
             print("⚠️ [DataLoader] Warning: '__meta__' not found. Using default thresholds.")
@@ -685,7 +875,7 @@ class UniversalDataset(data.Dataset):
             else:
                 full_img_path = os.path.join(data_root, rel_path)
 
-            full_json_path = full_img_path.replace(".png", ".json")
+            full_json_path = self._image_path_to_json_path(full_img_path)
 
             if os.path.exists(full_img_path) and os.path.exists(full_json_path):
                 self.samples.append(
@@ -693,16 +883,27 @@ class UniversalDataset(data.Dataset):
                         "img_path": full_img_path,
                         "json_path": full_json_path,
                         "data": entry,
+                        "rel_path": rel_path,
                     }
                 )
+            else:
+                skipped += 1
 
         print(
             f"✅ [DataLoader] Mode: {self.raw_mode} | Prompt: {self.prompt_mode} "
             f"(requested: {self.requested_prompt_mode}) | "
+            f"V2={self.is_v2} | "
+            f"OrganDropout={self.organ_dropout_prob:.3f} | "
+            f"AllowEvalSampleAttrs={self.allow_eval_sample_attributes} | "
             f"Loaded: {len(self.samples)} | Skipped: {skipped}"
         )
 
         self.transform = self._get_transforms()
+
+    @staticmethod
+    def _image_path_to_json_path(img_path: str) -> str:
+        stem, _ = os.path.splitext(img_path)
+        return stem + ".json"
 
     def _get_transforms(self):
         """
@@ -745,21 +946,69 @@ class UniversalDataset(data.Dataset):
         )
 
     def _decode_mask(self, json_path: str) -> np.ndarray:
-        with open(json_path, "r") as f:
+        """
+        Decode instance mask from polygon or COCO-RLE annotations.
+
+        Compatible with the usual PanNuke-style json used in your project.
+        """
+        with open(json_path, "r", encoding="utf-8") as f:
             data_json = json.load(f)
 
-        h, w = data_json.get("height", 256), data_json.get("width", 256)
+        if isinstance(data_json, list):
+            data_json = data_json[0] if len(data_json) > 0 and isinstance(data_json[0], dict) else {}
+
+        if "image" in data_json and isinstance(data_json["image"], dict):
+            h = int(data_json["image"].get("height", data_json.get("height", 256)))
+            w = int(data_json["image"].get("width", data_json.get("width", 256)))
+        else:
+            h = int(data_json.get("height", 256))
+            w = int(data_json.get("width", 256))
 
         mask = np.zeros((h, w), dtype=np.int32)
         inst_id = 1
 
-        for ann in data_json.get("annotations", []):
-            for poly in ann.get("segmentation", []):
-                pts = np.array(poly, dtype=np.float32).reshape((-1, 2))
-                if pts.shape[0] >= 3:
-                    pts = np.round(pts).astype(np.int32)
-                    cv2.fillPoly(mask, [pts], inst_id)
+        annotations = data_json.get("annotations", [])
+        if not isinstance(annotations, list):
+            annotations = []
+
+        for ann in annotations:
+            if not isinstance(ann, dict):
+                continue
+
+            seg = ann.get("segmentation", None)
+
+            if isinstance(seg, list):
+                # seg can be [poly] or flat poly.
+                polygons = [seg] if all(isinstance(x, (int, float)) for x in seg) else seg
+
+                for poly in polygons:
+                    try:
+                        pts = np.array(poly, dtype=np.float32).reshape((-1, 2))
+                        if pts.shape[0] >= 3:
+                            pts = np.round(pts).astype(np.int32)
+                            cv2.fillPoly(mask, [pts], inst_id)
+                            inst_id += 1
+                    except Exception:
+                        continue
+
+            elif isinstance(seg, dict) and "counts" in seg and "size" in seg:
+                if not PYCOCOTOOLS_AVAILABLE:
+                    continue
+
+                try:
+                    binary_mask = coco_mask.decode(seg)
+                    if binary_mask.ndim == 3:
+                        binary_mask = np.max(binary_mask, axis=2)
+                    if binary_mask.shape[:2] != mask.shape[:2]:
+                        binary_mask = cv2.resize(
+                            binary_mask.astype(np.uint8),
+                            (w, h),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    mask[binary_mask > 0] = inst_id
                     inst_id += 1
+                except Exception:
+                    continue
 
         return mask
 
@@ -773,11 +1022,66 @@ class UniversalDataset(data.Dataset):
         text_suffix = ""
         return active_mask, task_type, text_suffix
 
+    def _resolve_organ(self, json_data: Dict[str, Any]) -> Tuple[int, str]:
+        if "organ_idx" in json_data:
+            organ_id = int(json_data["organ_idx"])
+            organ_name = ID_TO_ORGAN.get(organ_id, json_data.get("organ_id", "Generic"))
+        else:
+            organ_name = json_data.get("organ_id", "Generic")
+            organ_id = self.organ_map.get(organ_name, 20)
+
+        if organ_name not in self.organ_map:
+            organ_name = "Generic"
+            organ_id = 20
+
+        return int(organ_id), str(organ_name)
+
+    def _use_sample_v2_attributes(self) -> bool:
+        if not self.is_v2:
+            return False
+
+        if self.mode in {"train", "oracle", "debug"}:
+            return True
+
+        return bool(self.allow_eval_sample_attributes)
+
+    def _get_v2_sample_payload(
+        self,
+        json_data: Dict[str, Any],
+        organ_name: str,
+    ) -> Tuple[List[int], Dict[str, str], Tuple[str, str, str], str]:
+        labels = _to_int_list(
+            json_data.get("attr_labels", None),
+            default=_default_attr_labels(),
+        )
+
+        visuals = _normalise_visual_stats_from_entry(json_data)
+
+        text_prompt, attribute_text, morphology_text = _normalise_prompts_from_entry(
+            entry=json_data,
+            organ_name=organ_name,
+            visuals=visuals,
+        )
+
+        return labels, visuals, (text_prompt, attribute_text, morphology_text), "medical_knowledge_v2_sample"
+
+    def _get_organ_prior_payload(
+        self,
+        organ_name: str,
+    ) -> Tuple[List[int], Dict[str, str], Tuple[str, str, str], str]:
+        labels, visuals, prompts = _build_from_organ_prior(
+            meta=self.meta,
+            organ_name=organ_name,
+        )
+
+        return labels, visuals, prompts, "medical_knowledge_v2_organ_prior"
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
         item = self.samples[index]
+        json_data = item["data"]
 
         # 1. Image and instance mask
         image = cv2.imread(item["img_path"])
@@ -806,9 +1110,8 @@ class UniversalDataset(data.Dataset):
         aug_mask_inst = augmented["mask"].numpy().astype(np.int32)
         aug_mask = (aug_mask_inst > 0).astype(np.uint8)
 
-        # 3. Physical attributes
-        # These labels are still used as supervised targets for PNuRL warmup.
-        # Whether they are injected into text prompts is controlled only by prompt_mode.
+        # 3. Crop-level dynamic attributes.
+        # Only used by dynamic_gt mode. Not used by normal organ_static.
         area_scale = 1.0
         task_type = "generic"
         text_suffix = ""
@@ -816,42 +1119,92 @@ class UniversalDataset(data.Dataset):
         img_np = img_tensor.permute(1, 2, 0).numpy()
         img_np = np.clip(img_np, 0, 255).astype(np.uint8)
 
-        analysis = analyze_physical_attributes(
+        crop_analysis = analyze_physical_attributes(
             image=img_np,
             mask=aug_mask,
             config=self.attr_config,
             area_scale=area_scale,
         )
-        visuals = analysis["visuals"]
 
         # 4. Organ metadata
-        json_data = item["data"]
+        organ_id, organ_name = self._resolve_organ(json_data)
 
-        if "organ_idx" in json_data:
-            organ_id = int(json_data["organ_idx"])
-            organ_name = ID_TO_ORGAN.get(organ_id, json_data.get("organ_id", "Generic"))
+        organ_dropout_applied = False
+        if self.mode == "train" and self.organ_dropout_prob > 0.0:
+            if random.random() < self.organ_dropout_prob:
+                organ_id = 20
+                organ_name = "Generic"
+                organ_dropout_applied = True
+
+        # 5. Choose prompt attributes and attr label source.
+        if self.prompt_mode == "base":
+            attr_labels_np = _to_int_list(json_data.get("attr_labels", None), default=_default_attr_labels())
+            prompt_visuals = _normalise_visual_stats_from_entry(json_data)
+            text_prompt, attribute_text, morphology_text = _build_base_prompts()
+            attr_source = "base_prompt_no_text_attribute"
+
+        elif self.prompt_mode == "dynamic_gt":
+            # Explicit oracle/debug mode. Normal val/test has been guarded in __init__.
+            prompt_visuals = crop_analysis["visuals"]
+            attr_labels_np = crop_analysis["labels"]
+            text_prompt, attribute_text, morphology_text = build_pathology_prompts(
+                base_prompt=STRICT_BASE_PROMPT,
+                organ_name=organ_name,
+                visuals=prompt_visuals,
+                task_type=task_type,
+                text_suffix=text_suffix,
+                prompt_mode=self.prompt_mode,
+            )
+            attr_source = "crop_dynamic_gt"
+
         else:
-            organ_name = json_data.get("organ_id", "Generic")
-            organ_id = self.organ_map.get(organ_name, 20)
+            # Main formal mode: organ_static / dynamic_pred.
+            if organ_dropout_applied:
+                labels, prompt_visuals, prompts, attr_source = self._get_organ_prior_payload(
+                    organ_name="Generic",
+                )
+                attr_labels_np = labels
+                text_prompt, attribute_text, morphology_text = prompts
+                attr_source = attr_source + "_after_organ_dropout"
 
-        # Training-time organ dropout must happen before prompt construction,
-        # otherwise the returned organ_id and prompt text can disagree.
-        if self.mode == "train" and random.random() < 0.2:
-            organ_id = 20
-            organ_name = "Generic"
+            elif self._use_sample_v2_attributes() and _entry_is_v2(json_data):
+                labels, prompt_visuals, prompts, attr_source = self._get_v2_sample_payload(
+                    json_data=json_data,
+                    organ_name=organ_name,
+                )
+                attr_labels_np = labels
+                text_prompt, attribute_text, morphology_text = prompts
 
-        base_prompt = json_data.get("text_prompt", STRICT_BASE_PROMPT)
+            elif self.is_v2:
+                labels, prompt_visuals, prompts, attr_source = self._get_organ_prior_payload(
+                    organ_name=organ_name,
+                )
+                attr_labels_np = labels
+                text_prompt, attribute_text, morphology_text = prompts
 
-        text_prompt, attribute_text, morphology_text = build_pathology_prompts(
-            base_prompt=base_prompt,
-            organ_name=organ_name,
-            visuals=visuals,
-            task_type=task_type,
-            text_suffix=text_suffix,
-            prompt_mode=self.prompt_mode,
-        )
+            else:
+                # Backward-compatible fallback for old medical_knowledge.json.
+                # Do not prefer old visual_stats when v2 is available.
+                full_binary_mask = (mask > 0).astype(np.uint8)
+                full_analysis = analyze_physical_attributes(
+                    image=image,
+                    mask=full_binary_mask,
+                    config=self.attr_config,
+                    area_scale=1.0,
+                )
+                prompt_visuals = full_analysis["visuals"]
+                attr_labels_np = full_analysis["labels"]
+                text_prompt, attribute_text, morphology_text = build_pathology_prompts(
+                    base_prompt=STRICT_BASE_PROMPT,
+                    organ_name=organ_name,
+                    visuals=prompt_visuals,
+                    task_type=task_type,
+                    text_suffix=text_suffix,
+                    prompt_mode=self.prompt_mode,
+                )
+                attr_source = "fallback_full_image_physical"
 
-        # 5. Labels / density / HV
+        # 6. Labels / density / HV
         label_tensor = torch.from_numpy(aug_mask).long().unsqueeze(0)
         label_inst_tensor = torch.from_numpy(aug_mask_inst).long().unsqueeze(0)
 
@@ -864,7 +1217,7 @@ class UniversalDataset(data.Dataset):
         gt_hv_map = generate_hv_map(aug_mask_inst)
         gt_hv_map_tensor = torch.from_numpy(gt_hv_map).float()
 
-        attr_labels = torch.tensor(analysis["labels"], dtype=torch.long)
+        attr_labels = torch.tensor(attr_labels_np, dtype=torch.long)
 
         uses_gt_prompt = prompt_uses_gt_attributes(self.prompt_mode)
 
@@ -886,13 +1239,19 @@ class UniversalDataset(data.Dataset):
             "morphology_text": morphology_text,
 
             # Attribute labels for PNuRL supervision.
-            # These labels can be used in training loss, but they are not necessarily used
-            # to build text prompts. prompt_uses_gt_attributes marks that difference.
+            # v2 train uses sample-level full-image attribute labels.
+            # v2 val/test uses train-split organ priors by default to avoid GT-derived prompt leakage.
             "attr_labels": attr_labels,
 
             # Debug / metadata
-            "visual_attributes": visuals,
+            "visual_attributes": prompt_visuals,
+            "crop_visual_attributes": crop_analysis["visuals"],
+            "metadata_visual_stats": json_data.get("visual_stats", {}),
+            "metadata_attr_labels": json_data.get("attr_labels", None),
+            "attr_label_source": attr_source,
+            "organ_dropout_applied": bool(organ_dropout_applied),
             "name": os.path.basename(item["img_path"]),
+            "rel_path": item.get("rel_path", ""),
             "original_size": (self.image_size, self.image_size),
             "task_type": task_type,
             "prompt_mode": self.prompt_mode,

@@ -33,21 +33,9 @@ class GlobalASRUpsampler(nn.Module):
     """
     全局高分辨率 HV / heatmap 上采样器。
 
-    这里显式拆成两种模式：
-
-    1. legacy:
-       用于回归旧版纯视觉 ASR。
-       - heatmap 输出 1 通道
-       - 只做 SAM coarse HV/heatmap + ResNet 细节融合
-       - 不引入语义高低频调制
-       - 默认输出到 512 级别，不额外 up4 到 1024
-
-    2. freqpath:
-       用于后续论文主线。
-       - 保留当前 FreqPath/Frequency-aware 版本
-       - heatmap 可为 2 通道
-       - 保留 up4 到更高分辨率
-       - 与后续低频语义 / 高频形态约束配合
+    说明：
+    - legacy 模式用于稳定继承旧 ASR checkpoint。
+    - freqpath 模式保留为结构实验，但 TextSam 默认不会用它切换全局上采样器。
     """
 
     def __init__(
@@ -65,28 +53,28 @@ class GlobalASRUpsampler(nn.Module):
                 f"GlobalASRUpsampler asr_variant must be 'legacy' or 'freqpath', got {asr_variant}"
             )
 
-        self.use_asr = use_asr
+        self.use_asr = bool(use_asr)
         self.asr_variant = asr_variant
-        self.hm_channels = 1 if asr_variant == "legacy" else int(hm_channels)
+        self.hm_channels = 1 if self.asr_variant == "legacy" else int(hm_channels)
 
         if self.asr_variant == "legacy":
             self.init_conv = nn.Conv2d(embed_dim + 2 + self.hm_channels, 256, kernel_size=3, padding=1)
 
             self.up1 = nn.ConvTranspose2d(
-                256 + (512 if use_asr else 0),
+                256 + (512 if self.use_asr else 0),
                 128,
                 kernel_size=2,
                 stride=2,
             )
             self.conv1 = nn.Sequential(
-                nn.Conv2d(128 + (256 if use_asr else 0), 128, kernel_size=3, padding=1),
+                nn.Conv2d(128 + (256 if self.use_asr else 0), 128, kernel_size=3, padding=1),
                 nn.BatchNorm2d(128),
                 nn.ReLU(inplace=True),
             )
 
             self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
             self.conv2 = nn.Sequential(
-                nn.Conv2d(64 + (64 if use_asr else 0), 64, kernel_size=3, padding=1),
+                nn.Conv2d(64 + (64 if self.use_asr else 0), 64, kernel_size=3, padding=1),
                 nn.BatchNorm2d(64),
                 nn.ReLU(inplace=True),
             )
@@ -106,21 +94,21 @@ class GlobalASRUpsampler(nn.Module):
 
             self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
             self.conv1 = nn.Sequential(
-                nn.Conv2d(128 + (512 if use_asr else 0), 128, kernel_size=3, padding=1),
+                nn.Conv2d(128 + (512 if self.use_asr else 0), 128, kernel_size=3, padding=1),
                 nn.BatchNorm2d(128),
                 nn.ReLU(inplace=True),
             )
 
             self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
             self.conv2 = nn.Sequential(
-                nn.Conv2d(64 + (256 if use_asr else 0), 64, kernel_size=3, padding=1),
+                nn.Conv2d(64 + (256 if self.use_asr else 0), 64, kernel_size=3, padding=1),
                 nn.BatchNorm2d(64),
                 nn.ReLU(inplace=True),
             )
 
             self.up3 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
             self.conv3 = nn.Sequential(
-                nn.Conv2d(32 + (64 if use_asr else 0), 32, kernel_size=3, padding=1),
+                nn.Conv2d(32 + (64 if self.use_asr else 0), 32, kernel_size=3, padding=1),
                 nn.BatchNorm2d(32),
                 nn.ReLU(inplace=True),
             )
@@ -281,6 +269,7 @@ class SemanticChannelGate(nn.Module):
 class PhysicalAdapter(nn.Module):
     """
     将低频 / 高频视觉特征转换成 CoOp context modulation 参数。
+    支持输入 [B, C] 或 [B, C, H, W]。
     """
 
     def __init__(self, feat_dim_low: int, feat_dim_high: int, ctx_dim: int):
@@ -347,6 +336,9 @@ class PhysicalAdapter(nn.Module):
 class DualPromptLearner(nn.Module):
     """
     CoOp-style prompt learner for CONCH text encoder。
+
+    只让 ctx_general / ctx_specific / physical_adapter 参与训练；
+    CONCH token_embedding / transformer / ln_final / text_projection 不注册为本模块参数。
     """
 
     def __init__(self, clip_model, num_organs=21, n_ctx_gen=8, n_ctx_spec=8, embed_dim=256):
@@ -558,21 +550,21 @@ class TextSam(Sam):
             use_coop = False
             use_ot = False
 
-        self.use_pnurl = use_pnurl
-        self.use_coop = use_coop
+        self.use_pnurl = bool(use_pnurl)
+        self.use_coop = bool(use_coop)
 
         if use_ot:
             print("⚠️ use_ot=True was passed, but OT is disabled in this version of TextSam.")
         self.use_ot = False
 
-        self.use_asr = use_asr
+        self.use_asr = bool(use_asr)
         self.max_semantic_gate = float(max_semantic_gate)
         self.max_delta_ratio = float(max_delta_ratio)
         self.init_delta_ratio = float(init_delta_ratio)
 
         print(
             f"🚀 Initializing MP-SAM / FreqPath-SAM with CONCH | "
-            f"ASR={use_asr}, asr_variant={self.asr_variant}, asr_regression={self.asr_regression}"
+            f"ASR={self.use_asr}, asr_variant={self.asr_variant}, asr_regression={self.asr_regression}"
         )
 
         if hasattr(self.mask_decoder, "asr_variant"):
@@ -605,7 +597,7 @@ class TextSam(Sam):
             embed_dim=embed_dim,
         )
         for param in self.prompt_learner.parameters():
-            param.requires_grad = use_coop
+            param.requires_grad = self.use_coop
 
         self.pnurl = PNuRL(
             embed_dim=embed_dim,
@@ -624,7 +616,7 @@ class TextSam(Sam):
         )
 
         for param in self.pnurl.parameters():
-            param.requires_grad = use_pnurl
+            param.requires_grad = self.use_pnurl
 
         self.prompt_generator = TextGuidedPointGenerator(
             embed_dim=embed_dim,
@@ -650,11 +642,14 @@ class TextSam(Sam):
             self.cnn_stage1 = resnet.layer1
             self.cnn_stage2 = resnet.layer2
 
+            # 关键修正：
+            # TextSam.asr_variant == "freqpath" 时，只让 MaskDecoder 进入 freqpath。
+            # GlobalASRUpsampler 必须保持 legacy，以便继承 legacy_asr_* checkpoint 的 HV/heatmap 权重。
             self.global_asr_upsampler = GlobalASRUpsampler(
                 embed_dim=embed_dim,
                 use_asr=True,
                 hm_channels=2,
-                asr_variant=self.asr_variant,
+                asr_variant="legacy",
             )
 
         for param in self.image_encoder.parameters():
@@ -667,10 +662,10 @@ class TextSam(Sam):
             param.requires_grad = True
 
         for param in self.pnurl.parameters():
-            param.requires_grad = use_pnurl
+            param.requires_grad = self.use_pnurl
 
         for param in self.prompt_learner.parameters():
-            param.requires_grad = use_coop
+            param.requires_grad = self.use_coop
 
     def _tokenize_to_input_ids(self, texts: List[str], device: torch.device) -> torch.Tensor:
         tokenized = self.tokenizer(
@@ -774,6 +769,41 @@ class TextSam(Sam):
 
         return refined_image_embeddings, injected_delta, injected_delta_norm, injection_ratio
 
+    def _rescale_semantic_delta(
+        self,
+        semantic_delta: torch.Tensor,
+        image_embeddings: torch.Tensor,
+        target_ratio: float = 0.02,
+        max_scale: float = 10000.0,
+    ) -> torch.Tensor:
+        if semantic_delta is None:
+            return semantic_delta
+
+        with torch.no_grad():
+            base_norm = (
+                image_embeddings.detach()
+                .float()
+                .norm(dim=1, keepdim=True)
+                .mean(dim=(2, 3), keepdim=True)
+                .clamp_min(1e-6)
+            )
+
+            delta_norm = (
+                semantic_delta.detach()
+                .float()
+                .norm(dim=1, keepdim=True)
+                .mean(dim=(2, 3), keepdim=True)
+                .clamp_min(1e-6)
+            )
+
+            scale = (base_norm * float(target_ratio)) / delta_norm
+            scale = torch.clamp(scale, min=0.0, max=float(max_scale))
+
+        return semantic_delta * scale.to(
+            device=semantic_delta.device,
+            dtype=semantic_delta.dtype,
+        )
+
     def forward(self, batched_input, multimask_output=False):
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         image_embeddings = self.image_encoder(input_images)
@@ -860,6 +890,15 @@ class TextSam(Sam):
                 raise KeyError(f"PNuRL output missing required keys: {missing_keys}")
 
             semantic_delta = pnurl_out["semantic_delta"].to(dtype=image_embeddings.dtype)
+
+            if getattr(self, "semantic_injection_enabled", False):
+                semantic_delta = self._rescale_semantic_delta(
+                    semantic_delta=semantic_delta,
+                    image_embeddings=image_embeddings,
+                    target_ratio=min(float(self.max_delta_ratio), 0.02),
+                    max_scale=10000.0,
+                )
+
             attr_logits = pnurl_out.get("attr_logits", {})
             density_map = pnurl_out.get("density_map", None)
 
@@ -1155,6 +1194,49 @@ class TextSam(Sam):
                             sub_high_freq_prompt = curr_high_freq_prompt.expand(current_batch, -1).contiguous()
                         elif curr_high_freq_prompt.dim() == 3:
                             sub_high_freq_prompt = curr_high_freq_prompt.expand(current_batch, -1, -1).contiguous()
+
+                freqpath_ablation = os.environ.get("FREQPATH_ABLATION", "both").lower().strip()
+
+                low_prompt_enabled = self.asr_variant == "freqpath" and freqpath_ablation in (
+                "low",
+                "low_only",
+                "both",
+                "full",
+                )
+                high_prompt_enabled = self.asr_variant == "freqpath" and freqpath_ablation in (
+                "high",
+                "high_only",
+                "both",
+                "full",
+                )
+
+                if self.asr_variant == "freqpath":
+                    if freqpath_ablation in ("low", "low_only"):
+                        # Low-frequency structure prompt only: low_freq_prompt -> attr_prompt.
+                        sub_high_freq_prompt = None
+                    elif freqpath_ablation in ("high", "high_only"):
+                        # High-frequency morphology/boundary prompt only: high_freq_prompt -> morph_feat.
+                        sub_low_freq_prompt = None
+                    elif freqpath_ablation in ("none", "off"):
+                        # Keep the FreqPath architecture but disable PNuRL low/high prompts.
+                        sub_low_freq_prompt = None
+                        sub_high_freq_prompt = None
+                    elif freqpath_ablation in ("both", "full"):
+                        pass
+                    else:
+                        raise ValueError(
+                            f"Unknown FREQPATH_ABLATION={freqpath_ablation}. "
+                            "Use one of: low, high, both, none."
+                        )
+
+                diagnostics["freqpath_low_prompt_enabled"] = torch.tensor(
+                    float(low_prompt_enabled),
+                    device=device,
+                )
+                diagnostics["freqpath_high_prompt_enabled"] = torch.tensor(
+                    float(high_prompt_enabled),
+                    device=device,
+                )
 
                 sub_mask, sub_iou = self.mask_decoder(
                     image_embeddings=sub_img_embed,

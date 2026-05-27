@@ -16,10 +16,9 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-# 👇 新增：通用环境变量清洗器（自动剔除所有非 ASCII 脏字符）
+# 自动剔除所有非 ASCII 脏字符，避免环境变量里隐藏字符导致底层库异常
 for _key, _value in list(os.environ.items()):
     if isinstance(_value, str):
-        # 强制只保留标准 ASCII 字符 (0-127)，肉眼不可见的幽灵字符会被瞬间蒸发
         os.environ[_key] = "".join(c for c in _value if ord(c) < 128).strip()
 
 import torch
@@ -93,7 +92,7 @@ def build_test_prompts(organ_name: str, prompt_mode: str = "organ_static"):
     """
     测试阶段 prompt。
 
-    注意:
+    注意：
         不使用 mask 统计出来的 shape / density / arrangement。
         这样避免测试时 GT 信息泄漏。
 
@@ -212,13 +211,13 @@ def strip_module_prefix(state_dict):
     if not has_module_prefix:
         return state_dict
 
-    return {
-        k.replace("module.", "", 1): v
-        for k, v in state_dict.items()
-    }
+    return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 
 
 def load_model_checkpoint(model, checkpoint_path, device):
+    if checkpoint_path is None or not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt.get("model", ckpt)
     state_dict = strip_module_prefix(state_dict)
@@ -231,6 +230,15 @@ def load_model_checkpoint(model, checkpoint_path, device):
 
     print(f"✅ Loaded checkpoint: {checkpoint_path}")
     print(f"   Missing keys: {len(missing_keys)} | Unexpected keys: {len(unexpected_keys)}")
+
+    if isinstance(ckpt, dict):
+        print(f"   Checkpoint architecture_version: {ckpt.get('architecture_version', 'N/A')}")
+        print(
+            "   Checkpoint phase="
+            f"{ckpt.get('phase', 'N/A')} | "
+            f"asr_variant={ckpt.get('asr_variant', 'N/A')} | "
+            f"asr_regression={ckpt.get('asr_regression', 'N/A')}"
+        )
 
     return model
 
@@ -311,7 +319,8 @@ def tta_inference_8x_batch(model, image_rgb, organ_id, organ_name, args):
     all_hvs = []
     first_attr_logits = {}
 
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    autocast_enabled = bool(device.type == "cuda")
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
         input_samples = []
 
         for i in range(len(transforms)):
@@ -551,7 +560,8 @@ def load_filtered_gt(img_path):
 
         return instance_map
 
-    except Exception:
+    except Exception as exc:
+        print(f"[WARN] Failed to load GT for {img_path}: {exc}")
         return None
 
 
@@ -572,7 +582,6 @@ def save_prediction(pred_mask, img_path, output_dir):
     if max_val <= 65535:
         cv2.imwrite(png_path, pred_mask.astype(np.uint16))
     else:
-        # PNG uint16 不够时，仍保留 npy 作为完整实例图。
         vis = (pred_mask > 0).astype(np.uint8) * 255
         cv2.imwrite(png_path, vis)
 
@@ -594,10 +603,17 @@ def process_chunk(worker_id, image_files_chunk, args):
 
     fine_tuned_ckpt = args.checkpoint
 
-    # 构建 vanilla SAM。这里不加载 checkpoint，后面直接加载 TextSam 权重。
+    if fine_tuned_ckpt is None or not os.path.isfile(fine_tuned_ckpt):
+        raise FileNotFoundError(f"checkpoint not found: {fine_tuned_ckpt}")
+
+    # 构建基础 SAM / TextSam 所需组件。
+    # 注意：这里不要把 fine-tuned checkpoint 当成 base checkpoint 加载。
+    original_checkpoint = args.checkpoint
     args.checkpoint = None
+
     vanilla_sam = sam_model_registry[args.model_type](args)
-    args.checkpoint = fine_tuned_ckpt
+
+    args.checkpoint = original_checkpoint
 
     model = TextSam(
         image_encoder=vanilla_sam.image_encoder,
@@ -606,20 +622,31 @@ def process_chunk(worker_id, image_files_chunk, args):
         clip_model_name=args.clip_model,
         num_organs=args.num_organs,
         num_heads=args.num_heads,
-
-        # OT 已从当前主线移除，测试固定关闭。
         sg_epsilon=0.05,
         sg_iters=3,
         use_pnurl=args.use_pnurl,
         use_coop=args.use_coop,
         use_ot=False,
         use_asr=args.use_asr,
+        asr_variant=args.asr_variant,
+        asr_regression=args.asr_regression,
+        max_semantic_gate=args.max_semantic_gate,
+        max_delta_ratio=args.max_delta_ratio,
+        init_delta_ratio=args.init_delta_ratio,
     ).to(device)
 
     del vanilla_sam
 
-    model = load_model_checkpoint(model, args.checkpoint, device)
+    model = load_model_checkpoint(model, fine_tuned_ckpt, device)
     model.eval()
+
+    print(
+        f"[Worker {worker_id}] device={device} | "
+        f"asr_variant={args.asr_variant} | "
+        f"asr_regression={args.asr_regression} | "
+        f"use_asr={args.use_asr} | use_pnurl={args.use_pnurl} | use_coop={args.use_coop} | "
+        f"max_semantic_gate={args.max_semantic_gate}"
+    )
 
     chunk_metrics = defaultdict(list)
 
@@ -692,6 +719,8 @@ def parse_args():
 
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--sam_checkpoint", type=str, default="workdir/models/sam-med2d_b.pth")
+
     parser.add_argument("--save_pred", action="store_true")
     parser.add_argument("--output_dir", type=str, default="test_predictions")
 
@@ -710,6 +739,25 @@ def parse_args():
     parser.add_argument("--use_pnurl", action="store_true", default=False)
     parser.add_argument("--use_coop", action="store_true", default=False)
     parser.add_argument("--use_asr", action="store_true", default=False)
+
+    parser.add_argument(
+        "--asr_variant",
+        type=str,
+        default="legacy",
+        choices=["legacy", "freqpath"],
+        help="ASR path used to build TextSam. Must match checkpoint architecture.",
+    )
+
+    parser.add_argument(
+        "--asr_regression",
+        action="store_true",
+        default=False,
+        help="Use pure visual ASR regression mode. Usually False for semantic/freqpath testing.",
+    )
+
+    parser.add_argument("--max_semantic_gate", type=float, default=0.03)
+    parser.add_argument("--max_delta_ratio", type=float, default=0.02)
+    parser.add_argument("--init_delta_ratio", type=float, default=0.005)
 
     parser.add_argument(
         "--prompt_mode",
@@ -738,6 +786,9 @@ def main(args):
     if not os.path.isdir(args.data_path):
         raise FileNotFoundError(f"data_path does not exist or is not a directory: {args.data_path}")
 
+    if args.checkpoint is None or not os.path.isfile(args.checkpoint):
+        raise FileNotFoundError(f"checkpoint not found: {args.checkpoint}")
+
     image_files = [
         os.path.join(args.data_path, f)
         for f in os.listdir(args.data_path)
@@ -765,7 +816,17 @@ def main(args):
     print(f"\n🚀 System Detected {num_gpus} GPUs. Launching {len(chunks)} parallel Workers.")
     print(f"🔥 Testing Pipeline: overlap={args.overlap}, patch_size={args.patch_size}, TTA=8x, MultiMask=ON")
     print(f"🧠 Prompt mode: {args.prompt_mode}")
-    print(f"🧩 Modules: use_asr={args.use_asr}, use_pnurl={args.use_pnurl}, use_coop={args.use_coop}, use_ot=False")
+    print(
+        f"🧩 Modules: use_asr={args.use_asr}, use_pnurl={args.use_pnurl}, "
+        f"use_coop={args.use_coop}, use_ot=False"
+    )
+    print(
+        f"🧬 ASR: asr_variant={args.asr_variant}, asr_regression={args.asr_regression}, "
+        f"max_semantic_gate={args.max_semantic_gate}, "
+        f"max_delta_ratio={args.max_delta_ratio}, init_delta_ratio={args.init_delta_ratio}"
+    )
+    print(f"📦 Checkpoint: {args.checkpoint}")
+    print(f"📂 Data path: {args.data_path}")
 
     tasks = []
     for i, chunk in enumerate(chunks):
