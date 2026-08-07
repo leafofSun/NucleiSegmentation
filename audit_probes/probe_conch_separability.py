@@ -1040,6 +1040,22 @@ def _load_conch_low_memory_mmap(
         if any(not name.startswith("text_decoder.") for name in missing):
             raise RuntimeError("checkpoint is missing non-decoder CONCH parameters")
         model.text_decoder = None
+    rebuilt_nonpersistent_buffers: List[str] = []
+    # TextTransformer.attn_mask is registered with persistent=False, so it is
+    # intentionally absent from both the released checkpoint and state_dict().
+    # Meta construction therefore leaves it on meta; rebuild the same causal
+    # mask on CPU before encode_text.
+    if model.text.attn_mask.is_meta:
+        model.text.attn_mask = model.text.build_attention_mask()
+        rebuilt_nonpersistent_buffers.append("text.attn_mask")
+    remaining_text_meta_buffers = [
+        name for name, value in model.text.named_buffers() if value.is_meta
+    ]
+    if remaining_text_meta_buffers:
+        raise RuntimeError(
+            "low-memory CONCH load left required text buffers on meta: "
+            + ", ".join(remaining_text_meta_buffers[:10])
+        )
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
@@ -1049,6 +1065,7 @@ def _load_conch_low_memory_mmap(
         "config_sha256": sha256_file(config_path.resolve()),
         "missing_keys": missing,
         "unexpected_keys": unexpected,
+        "rebuilt_nonpersistent_buffers": rebuilt_nonpersistent_buffers,
     }
 
 
