@@ -148,6 +148,9 @@ class ProbeConchSeparabilityCpuTests(unittest.TestCase):
                 prompt_texts=np.asarray(bundle.raw_prompt_texts),
                 literal_embeddings=rng.normal(size=(2, 8)),
                 literal_texts=np.asarray(LITERAL_PROMPTS),
+                checkpoint_path=np.asarray("/offline/conch.bin"),
+                checkpoint_sha256=np.asarray("a" * 64),
+                encoding_function_source=np.asarray("offline_fixture:1"),
             )
             with self.assertRaisesRegex(ValueError, "prompt_ids"):
                 load_preencoded_embeddings(path, bundle)
@@ -167,7 +170,8 @@ class ProbeConchSeparabilityCpuTests(unittest.TestCase):
                 literal_embeddings=rng.normal(size=(2, 9)),
                 literal_texts=np.asarray(LITERAL_PROMPTS),
                 checkpoint_path=np.asarray("/offline/conch.bin"),
-                checkpoint_sha256=np.asarray("NOT_FOUND"),
+                checkpoint_sha256=np.asarray("a" * 64),
+                encoding_function_source=np.asarray("offline_fixture:1"),
             )
             args = argparse.Namespace(
                 prompt_set="A",
@@ -179,6 +183,7 @@ class ProbeConchSeparabilityCpuTests(unittest.TestCase):
                 conch_cache_path=None,
                 device="cpu",
                 hf_hub_offline=True,
+                low_memory_mmap=False,
                 embeddings_input=str(encoded),
                 write_encoding_request=None,
                 freeze_dir=None,
@@ -193,6 +198,27 @@ class ProbeConchSeparabilityCpuTests(unittest.TestCase):
                 self.assertTrue((output / variant / "cosine_matrix.csv").is_file())
                 self.assertTrue((output / variant / "cosine_heatmap.svg").is_file())
                 self.assertTrue((output / variant / "intermediates.npz").is_file())
+
+    def test_preencoded_contract_requires_provenance(self) -> None:
+        bundle = load_set_a(SCHEMA)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "encoded.npz"
+            np.savez_compressed(
+                path,
+                prompt_embeddings=np.ones((15, 8)),
+                prompt_ids=np.asarray(bundle.raw_prompt_ids),
+                prompt_texts=np.asarray(bundle.raw_prompt_texts),
+                literal_embeddings=np.ones((2, 8)),
+                literal_texts=np.asarray(LITERAL_PROMPTS),
+            )
+            with self.assertRaisesRegex(ValueError, "missing required keys"):
+                load_preencoded_embeddings(path, bundle)
+
+    def test_centering_variants_reject_zero_residuals(self) -> None:
+        identical = np.ones((15, 8), dtype=np.float64)
+        for variant in ("V1", "V2_k1", "V2_k2", "V3"):
+            with self.assertRaisesRegex(ValueError, "zero-norm"):
+                transform_variant(identical, 5, variant)
 
 
 if __name__ == "__main__":

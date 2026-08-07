@@ -20,6 +20,7 @@ import argparse
 import csv
 import hashlib
 import html
+import inspect
 import json
 import math
 import os
@@ -52,7 +53,8 @@ DEFAULT_SERVER_CONCH_CHECKPOINT = Path(
 DEFAULT_SERVER_CONCH_CACHE = Path("/hy-tmp/NuSeg/hf_cache/hub")
 CONCH_HF_SOURCE = "hf_hub:MahmoodLab/conch"
 CONCH_MODEL_NAME = "conch_ViT-B-16"
-ENCODER_SOURCE = "tools/build_l1a_text_prototype_bank.py:53-73"
+ENCODER_SOURCE = "audit_probes/probe_conch_separability.py:encode_with_project_conch_path"
+PROJECT_ENCODER_REFERENCE = "tools/build_l1a_text_prototype_bank.py:53-73"
 TRAINING_ENCODER_SOURCE = "segment_anything/modeling/sam.py:3115-3134,3226-3234"
 
 LEVEL_ORDER: Tuple[str, ...] = ("low", "mid", "high")
@@ -272,6 +274,35 @@ def path_and_sha(path: Path) -> Dict[str, str]:
     return {
         "path": str(resolved),
         "sha256": sha256_file(resolved) if resolved.is_file() else "NOT_FOUND",
+    }
+
+
+def callable_source(function: Any) -> Dict[str, Any]:
+    """Return an exact, hash-bound source location for audit provenance."""
+
+    source_path = Path(inspect.getsourcefile(function) or __file__).resolve()
+    return {
+        "path": str(source_path),
+        "line": int(inspect.getsourcelines(function)[1]),
+        "sha256": sha256_file(source_path),
+        "callable": function.__name__,
+    }
+
+
+def project_encoding_references() -> Dict[str, Dict[str, Any]]:
+    builder = (PROJECT_ROOT / "tools/build_l1a_text_prototype_bank.py").resolve()
+    training = (PROJECT_ROOT / "segment_anything/modeling/sam.py").resolve()
+    return {
+        "offline_bank_builder": {
+            **path_and_sha(builder),
+            "lines": "53-73",
+            "contract": "tokenizer max_length=77; encode_text().float(); F.normalize(eps=1e-8)",
+        },
+        "training_text_path": {
+            **path_and_sha(training),
+            "lines": "3115-3134,3226-3234",
+            "contract": "tokenizer max_length=77; model.encode_text(...).float()",
+        },
     }
 
 
@@ -582,7 +613,7 @@ def transform_variant(
         mean = base.mean(axis=0, keepdims=True)
         extras["global_mean"] = mean
         extras["centered_before_normalization"] = base - mean
-        transformed = l2_normalize(base - mean)
+        transformed = l2_normalize(base - mean, reject_zero=True)
     elif variant in ("V2_k1", "V2_k2"):
         k = 1 if variant == "V2_k1" else 2
         mean = base.mean(axis=0, keepdims=True)
@@ -595,16 +626,20 @@ def transform_variant(
         extras["centered_before_projection"] = centered
         extras["principal_components"] = principal_components
         extras["removed_projection"] = projected
-        transformed = l2_normalize(residual)
+        transformed = l2_normalize(residual, reject_zero=True)
     elif variant == "V3":
         shaped = base.reshape(num_attributes, 3, base.shape[1])
         means = shaped.mean(axis=1, keepdims=True)
         extras["attribute_means"] = means[:, 0, :]
         extras["centered_before_normalization"] = (shaped - means).reshape(base.shape)
-        transformed = l2_normalize((shaped - means).reshape(base.shape))
+        transformed = l2_normalize(
+            (shaped - means).reshape(base.shape), reject_zero=True
+        )
     elif variant == "V4":
         shaped = base.reshape(num_attributes, 3, base.shape[1])
-        axes = l2_normalize(shaped[:, 2, :] - shaped[:, 0, :])
+        axes = l2_normalize(
+            shaped[:, 2, :] - shaped[:, 0, :], reject_zero=True
+        )
         alpha = np.asarray((-1.0, 0.0, 1.0), dtype=np.float64)
         transformed = (axes[:, None, :] * alpha[None, :, None]).reshape(base.shape)
         mid = shaped[:, 1, :]
@@ -905,6 +940,9 @@ def load_preencoded_embeddings(
             "prompt_texts",
             "literal_embeddings",
             "literal_texts",
+            "checkpoint_path",
+            "checkpoint_sha256",
+            "encoding_function_source",
         }
         missing = sorted(required.difference(data.files))
         if missing:
@@ -923,14 +961,15 @@ def load_preencoded_embeddings(
         prompt_embeddings = np.asarray(data["prompt_embeddings"], dtype=np.float64)
         literal_embeddings = np.asarray(data["literal_embeddings"], dtype=np.float64)
         metadata = {
-            "checkpoint_path": _npz_scalar_string(data, "checkpoint_path") or "NOT_FOUND",
-            "checkpoint_sha256": _npz_scalar_string(data, "checkpoint_sha256")
-            or "NOT_FOUND",
-            "encoding_function_source": _npz_scalar_string(
-                data, "encoding_function_source"
+            key: _npz_scalar_string(data, key)
+            for key in (
+                "checkpoint_path",
+                "checkpoint_sha256",
+                "encoding_function_source",
             )
-            or ENCODER_SOURCE,
         }
+        if any(value is None or not value.strip() for value in metadata.values()):
+            raise ValueError("pre-encoded provenance fields must be non-empty scalars")
     if prompt_embeddings.ndim != 2 or prompt_embeddings.shape[0] != len(texts):
         raise ValueError("pre-encoded prompt_embeddings has invalid shape")
     if literal_embeddings.shape != (2, prompt_embeddings.shape[1]):
@@ -942,17 +981,78 @@ def load_preencoded_embeddings(
     return prompt_embeddings, literal_embeddings, metadata
 
 
+def _load_conch_low_memory_mmap(
+    torch_module: Any,
+    checkpoint_path: Path,
+    device: str,
+) -> Tuple[Any, Dict[str, Any]]:
+    """Load the identical CoCa weights without a checkpoint/model double copy.
+
+    The official factory materializes a float32 model and then a second float32
+    state dict, which exceeds the server's 2 GiB cgroup in NO_GPU_MODE.  This
+    path changes only storage construction: parameters are created on ``meta``
+    and assigned directly from a read-only mmap of the same checkpoint.
+    """
+
+    if str(device) != "cpu":
+        raise ValueError("--low-memory-mmap is registered only for CPU execution")
+    from conch.open_clip_custom.coca_model import CoCa, resize_pos_embed
+    from conch.open_clip_custom.factory import CFG_DIR
+
+    config_path = Path(CFG_DIR) / f"{CONCH_MODEL_NAME}.json"
+    model_config = json.loads(config_path.read_text(encoding="utf-8"))
+    model_config.pop("custom_text", None)
+    with torch_module.device("meta"):
+        model = CoCa(**model_config)
+
+    state_dict = torch_module.load(
+        str(checkpoint_path),
+        map_location="cpu",
+        weights_only=True,
+        mmap=True,
+    )
+    if isinstance(state_dict, Mapping) and "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    if not isinstance(state_dict, Mapping) or not state_dict:
+        raise ValueError("CONCH checkpoint did not contain a non-empty state dict")
+    first_key = next(iter(state_dict))
+    if str(first_key).startswith("module"):
+        state_dict = {str(key)[7:]: value for key, value in state_dict.items()}
+    resize_pos_embed(state_dict, model)
+    incompatible = model.load_state_dict(state_dict, strict=False, assign=True)
+    missing = list(incompatible.missing_keys)
+    unexpected = list(incompatible.unexpected_keys)
+    del state_dict
+    remaining_meta = [name for name, value in model.state_dict().items() if value.is_meta]
+    if remaining_meta:
+        raise RuntimeError(
+            "low-memory CONCH load left meta tensors: " + ", ".join(remaining_meta[:10])
+        )
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model, {
+        "mode": "meta_init_plus_read_only_mmap_assign",
+        "config_path": str(config_path.resolve()),
+        "config_sha256": sha256_file(config_path.resolve()),
+        "missing_keys": missing,
+        "unexpected_keys": unexpected,
+    }
+
+
 def encode_with_project_conch_path(
     texts: Sequence[str],
     checkpoint_path: Optional[Path],
     cache_path: Optional[Path],
     device: str,
     hf_hub_offline: bool,
-) -> Tuple[np.ndarray, Dict[str, str]]:
+    low_memory_mmap: bool = False,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Inference-only encoding using the exact audited project CONCH contract."""
 
     try:
         import torch
+        from torch.nn import functional as F
         from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer
     except ImportError as exc:  # pragma: no cover - depends on server environment
         raise RuntimeError(
@@ -983,16 +1083,28 @@ def encode_with_project_conch_path(
         source = CONCH_HF_SOURCE
         checkpoint_sha = "NOT_FOUND"
 
-    kwargs: Dict[str, Any] = {"device": device}
-    if cache_path is not None:
-        kwargs["cache_dir"] = str(cache_path.expanduser().resolve())
-    if source == CONCH_HF_SOURCE:
-        kwargs["hf_auth_token"] = os.environ.get("HF_TOKEN")
-    model, _ = create_model_from_pretrained(CONCH_MODEL_NAME, source, **kwargs)
-    model.to(device)
-    model.eval()
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
+    if low_memory_mmap:
+        if resolved_checkpoint is None:
+            raise ValueError("--low-memory-mmap requires a local checkpoint file")
+        model, load_audit = _load_conch_low_memory_mmap(
+            torch, resolved_checkpoint, device
+        )
+    else:
+        kwargs: Dict[str, Any] = {"device": device}
+        if cache_path is not None:
+            kwargs["cache_dir"] = str(cache_path.expanduser().resolve())
+        if source == CONCH_HF_SOURCE:
+            kwargs["hf_auth_token"] = os.environ.get("HF_TOKEN")
+        model, _ = create_model_from_pretrained(CONCH_MODEL_NAME, source, **kwargs)
+        model.to(device)
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        load_audit = {
+            "mode": "project_create_model_from_pretrained",
+            "missing_keys": "NOT_REPORTED_BY_FACTORY",
+            "unexpected_keys": "NOT_REPORTED_BY_FACTORY",
+        }
     tokenizer = get_tokenizer()
     tokenized = tokenizer(
         list(texts),
@@ -1012,11 +1124,19 @@ def encode_with_project_conch_path(
     tokens = tokens.to(device)
     with torch.inference_mode():
         embeddings = model.encode_text(tokens).float()
+        embeddings = F.normalize(embeddings, dim=-1, eps=1e-8)
     result = embeddings.detach().cpu().numpy().astype(np.float64, copy=False)
     metadata = {
         "checkpoint_path": str(resolved_checkpoint) if resolved_checkpoint else source,
         "checkpoint_sha256": checkpoint_sha,
-        "encoding_function_source": ENCODER_SOURCE,
+        "encoding_function_source": (
+            f"{callable_source(encode_with_project_conch_path)['path']}:"
+            f"{callable_source(encode_with_project_conch_path)['line']}"
+        ),
+        "encoding_function": callable_source(encode_with_project_conch_path),
+        "project_encoding_references": project_encoding_references(),
+        "normalization_contract": "torch.float32 F.normalize(dim=-1, eps=1e-8)",
+        "model_load_audit": load_audit,
     }
     return result, metadata
 
@@ -1044,7 +1164,12 @@ def write_encoding_request(path: Path, bundle: PromptBundle, schema_path: Path, 
             ],
             "schema": path_and_sha(schema_path),
             "global27_templates": path_and_sha(global_path),
-            "encoding_function_source": ENCODER_SOURCE,
+            "encoding_function_source": (
+                f"{callable_source(encode_with_project_conch_path)['path']}:"
+                f"{callable_source(encode_with_project_conch_path)['line']}"
+            ),
+            "encoding_function": callable_source(encode_with_project_conch_path),
+            "project_encoding_references": project_encoding_references(),
             "training_encoding_function_source": TRAINING_ENCODER_SOURCE,
             "tokenizer_contract": {
                 "padding": "max_length",
@@ -1167,7 +1292,7 @@ def freeze_selected_bank(
     variant: str,
     embeddings: np.ndarray,
     metrics: Mapping[str, Any],
-    checkpoint_metadata: Mapping[str, str],
+    checkpoint_metadata: Mapping[str, Any],
 ) -> Dict[str, Any]:
     if bundle.prompt_set not in ("A", "B"):
         raise ValueError("only Set-A or Set-B can be frozen as an RSGR Local-5 bank")
@@ -1183,6 +1308,10 @@ def freeze_selected_bank(
         "suitable_for_adoption", False
     ):
         raise ValueError("refusing to freeze V4: a mid-axis residual exceeds 50%")
+    if checkpoint_metadata.get("checkpoint_sha256") in (None, "", "NOT_FOUND"):
+        raise ValueError("refusing to freeze without an exact CONCH checkpoint SHA256")
+    if checkpoint_metadata.get("encoding_function_source") in (None, "", "NOT_FOUND"):
+        raise ValueError("refusing to freeze without encoding-function provenance")
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - local machine lacks torch
@@ -1219,6 +1348,8 @@ def freeze_selected_bank(
         "geometric_variant": variant,
         "conch_checkpoint_path": checkpoint_metadata["checkpoint_path"],
         "conch_checkpoint_sha256": checkpoint_metadata["checkpoint_sha256"],
+        "encoding_function_source": checkpoint_metadata["encoding_function_source"],
+        "embeddings_input": checkpoint_metadata.get("embeddings_input", "DIRECT_INFERENCE"),
         "prompts_sha256": sha256_file(prompts_path),
         "structure_bank_sha256": sha256_file(structure_path),
         "boundary_bank_sha256": sha256_file(boundary_path),
@@ -1255,19 +1386,16 @@ def run_probe(args: argparse.Namespace) -> Dict[str, Any]:
             "path": str(embeddings_input),
             "sha256": sha256_file(embeddings_input),
         }
+        checkpoint_metadata["embeddings_input"] = dict(embedding_source)
         if args.conch_checkpoint_path:
             supplied = Path(args.conch_checkpoint_path).expanduser().resolve()
             if not supplied.is_file():
                 raise FileNotFoundError(f"CONCH checkpoint NOT_FOUND: {supplied}")
             supplied_sha = sha256_file(supplied)
             recorded_sha = checkpoint_metadata["checkpoint_sha256"]
-            if recorded_sha not in ("NOT_FOUND", supplied_sha):
+            if recorded_sha != supplied_sha:
                 raise ValueError("pre-encoded checkpoint SHA256 differs from supplied checkpoint")
-            checkpoint_metadata = {
-                **checkpoint_metadata,
-                "checkpoint_path": str(supplied),
-                "checkpoint_sha256": supplied_sha,
-            }
+            checkpoint_metadata["checkpoint_verification_path"] = str(supplied)
     else:
         checkpoint_path = (
             Path(args.conch_checkpoint_path) if args.conch_checkpoint_path else None
@@ -1279,6 +1407,7 @@ def run_probe(args: argparse.Namespace) -> Dict[str, Any]:
             cache_path,
             args.device,
             args.hf_hub_offline,
+            bool(getattr(args, "low_memory_mmap", False)),
         )
         raw_count = len(bundle.raw_prompt_texts)
         raw_embeddings = combined[:raw_count]
@@ -1303,8 +1432,16 @@ def run_probe(args: argparse.Namespace) -> Dict[str, Any]:
         "prototype_count": len(bundle.attribute_names) * 3,
         "literal_prompt_count": 2,
         "embedding_dim": int(prototypes.shape[1]),
-        "encoding_function_source": checkpoint_metadata.get(
-            "encoding_function_source", ENCODER_SOURCE
+        "encoding_function_source": checkpoint_metadata["encoding_function_source"],
+        "encoding_function": checkpoint_metadata.get("encoding_function", "NOT_RECORDED"),
+        "project_encoding_references": checkpoint_metadata.get(
+            "project_encoding_references", project_encoding_references()
+        ),
+        "normalization_contract": checkpoint_metadata.get(
+            "normalization_contract", "RECORDED_IN_PREENCODED_SOURCE"
+        ),
+        "model_load_audit": checkpoint_metadata.get(
+            "model_load_audit", "RECORDED_IN_PREENCODED_SOURCE"
         ),
         "training_encoding_function_source": TRAINING_ENCODER_SOURCE,
         "embedding_source": embedding_source,
@@ -1493,6 +1630,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--hf_hub_offline", "--hf-hub-offline", action="store_true")
     parser.add_argument(
+        "--low_memory_mmap",
+        "--low-memory-mmap",
+        action="store_true",
+        help=(
+            "CPU-only exact-float32 loader using meta initialization plus a read-only "
+            "checkpoint mmap; avoids the factory's checkpoint/model double allocation"
+        ),
+    )
+    parser.add_argument(
         "--embeddings_input",
         "--embeddings-input",
         default=None,
@@ -1521,6 +1667,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.output_dir = str(DEFAULT_OUTPUT_ROOT / f"{args.prompt_set}_{timestamp}")
     if args.write_encoding_request and args.embeddings_input:
         parser.error("--write-encoding-request and --embeddings-input are mutually exclusive")
+    if args.low_memory_mmap and args.embeddings_input:
+        parser.error("--low-memory-mmap is incompatible with --embeddings-input")
+    if args.low_memory_mmap and args.device != "cpu":
+        parser.error("--low-memory-mmap requires --device cpu")
     run_probe(args)
     return 0
 
