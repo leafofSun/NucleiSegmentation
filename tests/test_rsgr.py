@@ -109,6 +109,11 @@ class TestRSGRLocal5(unittest.TestCase):
             bad_meta.write_text(json.dumps(payload))
             with self.assertRaisesRegex(ValueError, "schema SHA256"):
                 load_prototype_banks(BANK, bad_meta)
+            payload = json.loads(META.read_text())
+            payload["class_names"] = ["high", "medium", "low"]
+            bad_meta.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError, "level/class order"):
+                load_prototype_banks(BANK, bad_meta)
 
     def test_08_soft_weighted_sum(self):
         probability = torch.tensor([[[[0.25, 0.25, 0.5]]]])

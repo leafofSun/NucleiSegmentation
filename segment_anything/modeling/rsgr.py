@@ -178,6 +178,8 @@ def load_prototype_banks(
     metadata = json.loads(meta_path.read_text(encoding="utf-8"))
     if metadata.get("schema_version") != "rsgr_local5_conch_bank_v1":
         raise ValueError("unsupported Local-5 prototype metadata version")
+    if metadata.get("backend") != "conch":
+        raise ValueError("Local-5 prototype metadata backend must be conch")
     if metadata.get("bank_sha256") != sha256_file(bank_path):
         raise ValueError("Local-5 prototype bank SHA256 mismatch")
     if metadata.get("schema_sha256") != sha256_file(schema_path):
@@ -186,11 +188,24 @@ def load_prototype_banks(
         group: [row["name"] for row in attributes_for_group(schema, group)]
         for group in ("structure", "boundary")
     }
+    expected_classes = list(schema["classes"])
     if metadata.get("attribute_names") != expected_names:
         raise ValueError("Local-5 prototype attribute name/order mismatch")
+    if metadata.get("class_names") != expected_classes:
+        raise ValueError("Local-5 prototype level/class order mismatch")
+    if "level_order" in metadata and metadata.get("level_order") != expected_classes:
+        raise ValueError("Local-5 prototype level/class order mismatch")
     payload = torch.load(str(bank_path), map_location="cpu", weights_only=True)
-    if not isinstance(payload, Mapping) or payload.get("backend") != "conch":
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schema_version") != "rsgr_local5_conch_bank_v1"
+        or payload.get("backend") != "conch"
+    ):
         raise ValueError("prototype file must be a formal CONCH mapping")
+    if payload.get("attribute_names") != expected_names:
+        raise ValueError("Local-5 payload attribute name/order mismatch")
+    if payload.get("class_names") != expected_classes:
+        raise ValueError("Local-5 payload level/class order mismatch")
     banks = []
     for group in ("structure", "boundary"):
         value = payload.get(f"{group}_prototypes")

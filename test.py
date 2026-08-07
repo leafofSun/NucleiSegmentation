@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import hashlib
 import os
 import math
 import cv2
@@ -24,6 +25,23 @@ for _key, _value in list(os.environ.items()):
         os.environ[_key] = "".join(c for c in _value if ord(c) < 128).strip()
 
 _SEMANTIC_DIAG_PRINTED = False
+
+
+def _sha256_file_for_audit(path):
+    """Return a streaming SHA256 used only for immutable test provenance."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sha256_tensors_for_audit(tensors):
+    """Hash tensor values in a fixed order without changing model state."""
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
 
 
 import torch
@@ -947,6 +965,14 @@ def _build_test_model(args, device, rank=0, is_rank0=True):
     if fine_tuned_ckpt is None or not os.path.isfile(fine_tuned_ckpt):
         raise FileNotFoundError(f"checkpoint not found: {fine_tuned_ckpt}")
 
+    _rsgr_enabled = bool(getattr(args, "enable_rsgr", False))
+    _rsgr_prototype_path = getattr(args, "rsgr_prototype_path", None)
+    _rsgr_bank_sha256 = (
+        _sha256_file_for_audit(_rsgr_prototype_path)
+        if _rsgr_prototype_path and os.path.isfile(_rsgr_prototype_path)
+        else "NOT_FOUND"
+    )
+
     # ── [TEST_CONFIG] (rank0 only) ──
     if is_rank0:
         print("=" * 60)
@@ -968,6 +994,9 @@ def _build_test_model(args, device, rank=0, is_rank0=True):
         print(f"  conch_cache_path={getattr(args, 'conch_cache_path', None)}")
         print(f"  use_asr={args.use_asr}")
         print(f"  asr_variant={args.asr_variant}")
+        print(f"  rsgr_enabled={_rsgr_enabled}")
+        print(f"  rsgr_prototype_path={_rsgr_prototype_path}")
+        print(f"  rsgr_bank_sha256={_rsgr_bank_sha256}")
         # ── PromptNu-guided v3 ──
         print(f"  enable_promptnu_guided_v3={getattr(args, 'enable_promptnu_guided_v3', False)}")
         print(f"  promptnu_guided_v3_struct_weight={getattr(args, 'promptnu_guided_v3_struct_weight', 1.0)}")
@@ -1131,7 +1160,40 @@ def _build_test_model(args, device, rank=0, is_rank0=True):
         spatial_structure_guidance_init=float(getattr(args, "spatial_structure_guidance_init", 0.05)),
         spatial_boundary_guidance_init=float(getattr(args, "spatial_boundary_guidance_init", 0.05)),
         spatial_instance_attr_mode=str(getattr(args, "spatial_instance_attr_mode", "none")),
-    ).to(device)
+        # ── RSGR Local-5 inference wiring ──
+        enable_rsgr=_rsgr_enabled,
+        rsgr_mode=str(getattr(args, "rsgr_mode", "no_local")),
+        rsgr_num_regions=int(getattr(args, "rsgr_num_regions", 4)),
+        rsgr_region_size=int(getattr(args, "rsgr_region_size", 192)),
+        rsgr_injection_scale=float(getattr(args, "rsgr_injection_scale", 0.05)),
+        rsgr_max_injection_ratio=float(getattr(args, "rsgr_max_injection_ratio", 0.02)),
+        rsgr_prototype_source=str(getattr(args, "rsgr_prototype_source", "conch")),
+        rsgr_prototype_path=_rsgr_prototype_path,
+        rsgr_prototype_detach=bool(getattr(args, "rsgr_prototype_detach", True)),
+        rsgr_attr_detach=bool(getattr(args, "rsgr_attr_detach", False)),
+        rsgr_shuffle_scope=str(getattr(args, "rsgr_shuffle_scope", "within_sample")),
+        rsgr_random_seed=int(getattr(args, "rsgr_random_seed", 42)),
+        rsgr_overlap_blend=str(getattr(args, "rsgr_overlap_blend", "normalized")),
+    )
+
+    _rsgr_module_built = getattr(model, "rsgr", None) is not None
+    if _rsgr_enabled and not _rsgr_module_built:
+        raise RuntimeError(
+            "enable_rsgr=True but model.rsgr is None; refusing silent RSGR degradation"
+        )
+    _rsgr_expected_buffers = {}
+    if _rsgr_module_built:
+        _rsgr_guard_names = ["structure_prototypes", "boundary_prototypes"]
+        if str(getattr(model.rsgr, "mode", "")) == "random_prototype":
+            _rsgr_guard_names.extend(
+                ["random_structure_prototypes", "random_boundary_prototypes"]
+            )
+        _rsgr_expected_buffers = {
+            name: getattr(model.rsgr, name).detach().cpu().clone()
+            for name in _rsgr_guard_names
+        }
+
+    model = model.to(device)
 
     del vanilla_sam
 
@@ -1202,6 +1264,48 @@ def _build_test_model(args, device, rank=0, is_rank0=True):
         model, fine_tuned_ckpt, device,
         filter_mismatch=getattr(args, "resume_filter_mismatch", False),
     )
+
+    # A checkpoint may contain persistent RSGR prototype buffers.  The CLI bank
+    # and random seed are authoritative for this test invocation; reject any
+    # silent post-construction override so the logged provenance remains true.
+    _rsgr_buffer_mismatches = []
+    for _name, _expected in _rsgr_expected_buffers.items():
+        _actual = getattr(getattr(model, "rsgr", None), _name, None)
+        if _actual is None or not torch.equal(_actual.detach().cpu(), _expected):
+            _rsgr_buffer_mismatches.append(_name)
+    if _rsgr_buffer_mismatches:
+        raise RuntimeError(
+            "checkpoint overrode CLI-selected RSGR prototype buffers: "
+            f"{_rsgr_buffer_mismatches}; refusing false bank provenance"
+        )
+    _rsgr_module_built = getattr(model, "rsgr", None) is not None
+    if _rsgr_enabled and not _rsgr_module_built:
+        raise RuntimeError(
+            "enable_rsgr=True but model.rsgr is None after checkpoint load"
+        )
+    _rsgr_active_prototype_sha256 = "NOT_APPLICABLE"
+    if _rsgr_module_built:
+        if str(getattr(model.rsgr, "mode", "")) == "random_prototype":
+            _rsgr_active_tensors = (
+                model.rsgr.random_structure_prototypes,
+                model.rsgr.random_boundary_prototypes,
+            )
+        else:
+            _rsgr_active_tensors = (
+                model.rsgr.structure_prototypes,
+                model.rsgr.boundary_prototypes,
+            )
+        _rsgr_active_prototype_sha256 = _sha256_tensors_for_audit(
+            _rsgr_active_tensors
+        )
+    if is_rank0:
+        print("[TEST_CONFIG] RSGR Runtime Configuration (post-checkpoint)")
+        print(f"  rsgr_enabled={bool(getattr(model, 'enable_rsgr', False))}")
+        print(f"  rsgr_module_built={_rsgr_module_built}")
+        print(f"  rsgr_prototype_path={_rsgr_prototype_path}")
+        print(f"  rsgr_bank_sha256={_rsgr_bank_sha256}")
+        print(f"  rsgr_active_prototype_sha256={_rsgr_active_prototype_sha256}")
+        print(f"  rsgr_checkpoint_buffer_match={not _rsgr_buffer_mismatches}")
 
     # ── [CONCHLESS] Validate checkpoint text_bank buffers ──
     _is_conchless = bool(getattr(args, "use_checkpoint_text_bank_without_conch", False))
