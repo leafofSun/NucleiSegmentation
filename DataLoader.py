@@ -1,4 +1,26 @@
 import os
+import sys
+
+# PNURL_AUDIT: debug print gating (enabled via PNURL_AUDIT_ENABLED=1 env var)
+_PNURL_AUDIT = os.environ.get("PNURL_AUDIT_ENABLED", "0") == "1"
+_PNURL_AUDIT_DATALOADER_COUNTER = 0
+
+
+def _dataloader_print(*args, **kwargs):
+    """Print only on DDP rank 0 (reads RANK from environment)."""
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        print(*args, **kwargs)
+
+
+# ── Stage D audit-log gating ──
+from training.logging_utils import audit_print
+from training.local_region_text_alignment import (
+    ATTRIBUTE_NAMES as L1A_LOCAL_ATTRIBUTE_NAMES,
+    compute_local_region_targets,
+    load_l0_thresholds,
+    region_coordinates as l1a_region_coordinates,
+)
 import cv2
 import json
 import torch
@@ -790,6 +812,503 @@ def generate_hv_map(inst_mask: np.ndarray) -> np.ndarray:
     return hv_map
 
 
+
+def generate_boundary_uncertainty_targets(
+    inst_mask: np.ndarray,
+    boundary_radius: int = 4,
+    contact_radius: Optional[int] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Generate foreground / background / boundary / uncertainty targets from an instance mask.
+
+    Args:
+        inst_mask:
+            Instance mask, shape [H, W], 0=background, >0=instance id.
+        boundary_radius:
+            Radius used to build per-instance inner/outer boundary ring.
+            Use a larger value after resizing small crops to 1024, e.g. 6-8.
+        contact_radius:
+            Radius used to detect touching / close instances. If None, use boundary_radius.
+
+    Returns:
+        Dict with float32 maps in [0, 1], each shape [H, W]:
+            fg_target:
+                Binary nuclear foreground.
+            bg_target:
+                Conservative background region away from nuclei and boundary rings.
+            boundary_target:
+                Per-instance boundary ring, including inner and outer contours.
+            uncertain_target:
+                Ambiguous boundary/contact region. This includes boundary_target and
+                dilated overlap between neighboring instances.
+    """
+    if inst_mask.ndim != 2:
+        raise ValueError(f"inst_mask must be 2D, got shape={inst_mask.shape}")
+
+    inst_mask = inst_mask.astype(np.int32)
+    h, w = inst_mask.shape
+
+    boundary_radius = int(max(1, boundary_radius))
+    if contact_radius is None:
+        contact_radius = boundary_radius
+    contact_radius = int(max(1, contact_radius))
+
+    fg = (inst_mask > 0).astype(np.uint8)
+
+    boundary_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * boundary_radius + 1, 2 * boundary_radius + 1),
+    )
+    contact_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * contact_radius + 1, 2 * contact_radius + 1),
+    )
+
+    boundary = np.zeros((h, w), dtype=np.uint8)
+    dilated_owner_count = np.zeros((h, w), dtype=np.uint16)
+
+    inst_ids = np.unique(inst_mask)
+    inst_ids = inst_ids[inst_ids > 0]
+
+    for inst_id in inst_ids:
+        one_inst = (inst_mask == inst_id).astype(np.uint8)
+        if one_inst.sum() == 0:
+            continue
+
+        dilated = cv2.dilate(one_inst, boundary_kernel, iterations=1)
+        eroded = cv2.erode(one_inst, boundary_kernel, iterations=1)
+
+        # Inner + outer instance contour ring.
+        ring = (dilated - eroded).clip(0, 1).astype(np.uint8)
+        boundary = np.maximum(boundary, ring)
+
+        # Close/touching nuclei cue. If two instance dilations overlap, that region is ambiguous.
+        contact_dilated = cv2.dilate(one_inst, contact_kernel, iterations=1)
+        dilated_owner_count += contact_dilated.astype(np.uint16)
+
+    contact_region = (dilated_owner_count >= 2).astype(np.uint8)
+    uncertain = np.maximum(boundary, contact_region).astype(np.uint8)
+
+    # Conservative background excludes boundary and near-contact regions.
+    fg_dilated = cv2.dilate(fg, boundary_kernel, iterations=1)
+    bg = ((fg_dilated == 0) & (uncertain == 0)).astype(np.uint8)
+
+    return {
+        "fg_target": fg.astype(np.float32),
+        "bg_target": bg.astype(np.float32),
+        "boundary_target": boundary.astype(np.float32),
+        "uncertain_target": uncertain.astype(np.float32),
+    }
+
+
+# ==============================================================================
+# 4.4b  Dense Boundary Map Generation (Phase B — MultiLevelAttributeHeads)
+# ==============================================================================
+
+
+def generate_dense_boundary_maps(
+    inst_mask: np.ndarray,
+    small_nuclei_area_thresh: float = 500.0,
+) -> Dict[str, np.ndarray]:
+    """
+    从实例掩码生成4张密集边界图，用于 DenseBoundaryHead 监督。
+
+    Args:
+        inst_mask: [H, W] int32, 0=background, >0=instance id
+        small_nuclei_area_thresh: 面积阈值，低于此的核标记为 small_nuclei
+
+    Returns:
+        dict with 4 keys, each [H, W] float32 in [0,1]:
+            boundary_map:      核边界（内+外轮廓）
+            touching_region:   相邻核重叠/接触区域
+            small_nuclei:      小核区域（面积 < threshold）
+            hv_gradient:       HV 图梯度幅值（归一化到 [0,1]）
+    """
+    h, w = inst_mask.shape
+    inst_mask = inst_mask.astype(np.int32)
+    props = regionprops(inst_mask)
+
+    # --- boundary_map: 核边界 (复用 generate_boundary_uncertainty_targets 的逻辑) ---
+    boundary_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    boundary_map = np.zeros((h, w), dtype=np.uint8)
+    dilated_owner = np.zeros((h, w), dtype=np.uint16)
+
+    for prop in props:
+        if prop.label == 0:
+            continue
+        one_inst = (inst_mask == prop.label).astype(np.uint8)
+        if one_inst.sum() == 0:
+            continue
+        dilated = cv2.dilate(one_inst, boundary_kernel, iterations=1)
+        eroded = cv2.erode(one_inst, boundary_kernel, iterations=1)
+        ring = (dilated - eroded).clip(0, 1).astype(np.uint8)
+        boundary_map = np.maximum(boundary_map, ring)
+        dilated_owner += dilated.astype(np.uint16)
+
+    # --- touching_region: 重叠/接触区域 ---
+    touching_region = (dilated_owner >= 2).astype(np.uint8)
+
+    # --- small_nuclei: 面积小于阈值的小核 ---
+    small_map = np.zeros((h, w), dtype=np.uint8)
+    for prop in props:
+        if prop.label == 0:
+            continue
+        if prop.area < small_nuclei_area_thresh:
+            one_inst = (inst_mask == prop.label).astype(np.uint8)
+            small_map = np.maximum(small_map, one_inst)
+
+    # --- hv_gradient: 从 HV 图计算梯度幅值 ---
+    hv_map = generate_hv_map(inst_mask)
+    # 对 HV 两个通道分别计算梯度幅值然后平均
+    grad_x_h = cv2.Sobel(hv_map[0], cv2.CV_32F, 1, 0, ksize=3)
+    grad_y_h = cv2.Sobel(hv_map[0], cv2.CV_32F, 0, 1, ksize=3)
+    grad_x_v = cv2.Sobel(hv_map[1], cv2.CV_32F, 1, 0, ksize=3)
+    grad_y_v = cv2.Sobel(hv_map[1], cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag_h = np.sqrt(grad_x_h ** 2 + grad_y_h ** 2)
+    grad_mag_v = np.sqrt(grad_x_v ** 2 + grad_y_v ** 2)
+    hv_gradient = (grad_mag_h + grad_mag_v) * 0.5
+    # 归一化到 [0,1]
+    max_grad = hv_gradient.max()
+    if max_grad > 1e-6:
+        hv_gradient = hv_gradient / max_grad
+    else:
+        hv_gradient = np.zeros_like(hv_gradient)
+
+    return {
+        "boundary_map": boundary_map.astype(np.float32),
+        "touching_region": touching_region.astype(np.float32),
+        "small_nuclei": small_map.astype(np.float32),
+        "hv_gradient": hv_gradient.astype(np.float32),
+    }
+
+
+# ==============================================================================
+# 4.4c  Instance Morphology Attribute Computation (Phase B)
+# ==============================================================================
+# 6 instance-level attributes:
+#   size, elongation, boundary_irregularity, local_crowding, roundness, solidity
+# Each discretized into 3 classes (low/medium/high).
+
+
+INSTANCE_MORPH_ATTR_NAMES: Tuple[str, ...] = (
+    "size",
+    "elongation",
+    "boundary_irregularity",
+    "local_crowding",
+    "roundness",
+    "solidity",
+)
+NUM_INSTANCE_MORPH_ATTRS: int = 6
+
+
+def _discretize_3class(values: np.ndarray, bins: Tuple[float, float]) -> np.ndarray:
+    """
+    Discretize continuous values into 3 classes (0=low, 1=mid, 2=high).
+    bins: (low_thresh, high_thresh)
+    """
+    result = np.ones_like(values, dtype=np.int64)  # default mid=1
+    result[values < bins[0]] = 0  # low
+    result[values >= bins[1]] = 2  # high
+    return result
+
+
+def compute_instance_morphology_attrs(
+    inst_mask: np.ndarray,
+    min_instance_area: int = 8,
+    max_instances_per_image: int = 128,
+) -> Dict[str, Any]:
+    """
+    计算每个实例的6个形态属性，同时返回 per-sample 聚合标签和 per-instance 标签。
+
+    Args:
+        inst_mask: [H, W] int32, 0=background, >0=instance id
+        min_instance_area: Filter out instances with area < this value (default: 8).
+        max_instances_per_image: Max instances to keep; if exceeded, sort by area
+                                 descending and take top-K (default: 128).
+
+    Returns:
+        dict with:
+            instance_attr_labels: [6] long tensor, per-sample aggregated labels (0/1/2)
+            instance_attr_values: [6] float tensor, per-sample aggregated continuous values
+            per_instance_attr_labels: [N, 6] long tensor, per-instance discretized labels
+            per_instance_attr_values: [N, 6] float tensor, per-instance continuous values
+            per_instance_ids: [N] int64 array, instance IDs in same order as per_instance_attr_labels rows
+            per_instance: list of dicts with per-instance details
+    """
+    from skimage.measure import perimeter
+
+    inst_mask = inst_mask.astype(np.int32)
+    props = regionprops(inst_mask)
+
+    # --- Filter by min_instance_area ---
+    if min_instance_area > 0:
+        props = [p for p in props if p.area >= min_instance_area]
+
+    # --- Truncate by max_instances_per_image ---
+    if max_instances_per_image > 0 and len(props) > max_instances_per_image:
+        # Sort by area descending, keep top-K
+        props = sorted(props, key=lambda p: p.area, reverse=True)[:max_instances_per_image]
+
+    if len(props) == 0:
+        # No instances — return mid (1) as default
+        return {
+            "instance_attr_labels": np.ones(NUM_INSTANCE_MORPH_ATTRS, dtype=np.int64),
+            "instance_attr_values": np.zeros(NUM_INSTANCE_MORPH_ATTRS, dtype=np.float32),
+            "per_instance_attr_labels": np.zeros((0, NUM_INSTANCE_MORPH_ATTRS), dtype=np.int64),
+            "per_instance_attr_values": np.zeros((0, NUM_INSTANCE_MORPH_ATTRS), dtype=np.float32),
+            "per_instance_ids": np.zeros((0,), dtype=np.int64),
+            "per_instance": [],
+        }
+
+    n_inst = len(props)
+    areas = np.zeros(n_inst, dtype=np.float32)
+    eccentricities = np.zeros(n_inst, dtype=np.float32)
+    perimeters = np.zeros(n_inst, dtype=np.float32)
+    roundness_vals = np.zeros(n_inst, dtype=np.float32)
+    solidities = np.zeros(n_inst, dtype=np.float32)
+
+    centroids = []
+    for i, prop in enumerate(props):
+        if prop.label == 0:
+            continue
+        areas[i] = float(prop.area)
+        eccentricities[i] = float(prop.eccentricity)
+        # perimeter (using skimage measure)
+        mask_i = (inst_mask == prop.label).astype(np.uint8)
+        perim = perimeter(mask_i)
+        perimeters[i] = float(perim)
+        # roundness = 4 * pi * area / perimeter^2
+        if perim > 0:
+            roundness_vals[i] = float(4.0 * np.pi * prop.area / (perim * perim))
+        else:
+            roundness_vals[i] = 0.0
+        # solidity = area / convex_area (area_convex for skimage>=0.25, convex_area for legacy)
+        # Use explicit branch to avoid FutureWarning from deprecated property access
+        if hasattr(prop, "area_convex"):
+            _conv_area = float(prop.area_convex)
+        elif hasattr(prop, "convex_area"):
+            _conv_area = float(prop.convex_area)
+        else:
+            _conv_area = 0.0
+        if _conv_area > 0:
+            solidities[i] = float(prop.area / _conv_area)
+        else:
+            solidities[i] = 0.0
+        centroids.append(prop.centroid)
+
+    # boundary_irregularity = perimeter / (2 * sqrt(pi * area)) — higher = more irregular
+    boundary_irregularity = np.zeros(n_inst, dtype=np.float32)
+    for i in range(n_inst):
+        if areas[i] > 0:
+            boundary_irregularity[i] = float(
+                perimeters[i] / (2.0 * np.sqrt(np.pi * areas[i]))
+            )
+        else:
+            boundary_irregularity[i] = 1.0
+
+    # local_crowding: mean distance to k-nearest neighbors (k=min(5, n_inst-1))
+    local_crowding = np.zeros(n_inst, dtype=np.float32)
+    if n_inst >= 2 and len(centroids) == n_inst:
+        centroids_arr = np.array(centroids, dtype=np.float32)
+        k = min(5, n_inst - 1)
+        if SKLEARN_AVAILABLE:
+            from sklearn.neighbors import NearestNeighbors
+            nn = NearestNeighbors(n_neighbors=k + 1, metric="euclidean")
+            nn.fit(centroids_arr)
+            distances, _ = nn.kneighbors(centroids_arr)
+            local_crowding = distances[:, 1:].mean(axis=1)  # exclude self
+        elif SCIPY_AVAILABLE:
+            from scipy.spatial import KDTree
+            tree = KDTree(centroids_arr)
+            # For each point, query k+1 (including self)
+            distances, _ = tree.query(centroids_arr, k=min(k + 1, n_inst))
+            local_crowding = distances[:, 1:].mean(axis=1)
+        else:
+            local_crowding = np.ones(n_inst, dtype=np.float32) * 50.0  # fallback
+
+    # --- Per-instance discretized labels [N, 6] ---
+    per_inst_size_labels = _discretize_3class(areas, bins=(500.0, 2000.0))
+    per_inst_elong_labels = _discretize_3class(eccentricities, bins=(0.4, 0.8))
+    per_inst_irreg_labels = _discretize_3class(boundary_irregularity, bins=(1.2, 2.0))
+    per_inst_crowd_labels = _discretize_3class(local_crowding, bins=(30.0, 80.0))
+    per_inst_round_labels = _discretize_3class(roundness_vals, bins=(0.3, 0.7))
+    per_inst_solid_labels = _discretize_3class(solidities, bins=(0.6, 0.9))
+
+    # Per-instance IDs in same order as props (regionprops iteration order)
+    per_instance_ids = np.array([int(prop.label) for prop in props], dtype=np.int64)
+
+    per_instance_attr_labels = np.stack([
+        per_inst_size_labels, per_inst_elong_labels, per_inst_irreg_labels,
+        per_inst_crowd_labels, per_inst_round_labels, per_inst_solid_labels,
+    ], axis=1)  # [N, 6]
+
+    per_instance_attr_values = np.stack([
+        areas, eccentricities, boundary_irregularity,
+        local_crowding, roundness_vals, solidities,
+    ], axis=1)  # [N, 6]
+
+    # --- Aggregate per-sample: weighted by area (larger instances contribute more) ---
+    weights = areas / (areas.sum() + 1e-8)
+
+    # Compute weighted means
+    avg_size = float(np.average(areas, weights=weights)) if n_inst > 0 else 0.0
+    avg_elongation = float(np.average(eccentricities, weights=weights)) if n_inst > 0 else 0.5
+    avg_irregularity = float(np.average(boundary_irregularity, weights=weights)) if n_inst > 0 else 1.0
+    avg_crowding = float(np.average(local_crowding, weights=weights)) if n_inst > 0 else 50.0
+    avg_roundness = float(np.average(roundness_vals, weights=weights)) if n_inst > 0 else 0.5
+    avg_solidity = float(np.average(solidities, weights=weights)) if n_inst > 0 else 0.8
+
+    # --- Discretize to 3 classes ---
+    size_label = _discretize_3class(
+        np.array([avg_size]),
+        bins=(500.0, 2000.0),
+    )[0]
+    elongation_label = _discretize_3class(
+        np.array([avg_elongation]),
+        bins=(0.4, 0.8),
+    )[0]
+    irregularity_label = _discretize_3class(
+        np.array([avg_irregularity]),
+        bins=(1.2, 2.0),
+    )[0]
+    crowding_label = _discretize_3class(
+        np.array([avg_crowding]),
+        bins=(30.0, 80.0),
+    )[0]
+    roundness_label = _discretize_3class(
+        np.array([avg_roundness]),
+        bins=(0.3, 0.7),
+    )[0]
+    solidity_label = _discretize_3class(
+        np.array([avg_solidity]),
+        bins=(0.6, 0.9),
+    )[0]
+
+    attr_labels = np.array([
+        size_label, elongation_label, irregularity_label,
+        crowding_label, roundness_label, solidity_label,
+    ], dtype=np.int64)
+
+    attr_values = np.array([
+        avg_size, avg_elongation, avg_irregularity,
+        avg_crowding, avg_roundness, avg_solidity,
+    ], dtype=np.float32)
+
+    per_instance = [
+        {
+            "instance_id": int(prop.label),
+            "area": float(areas[i]),
+            "eccentricity": float(eccentricities[i]),
+            "perimeter": float(perimeters[i]),
+            "boundary_irregularity": float(boundary_irregularity[i]),
+            "local_crowding": float(local_crowding[i]),
+            "roundness": float(roundness_vals[i]),
+            "solidity": float(solidities[i]),
+        }
+        for i, prop in enumerate(props)
+    ]
+
+    return {
+        "instance_attr_labels": attr_labels,
+        "instance_attr_values": attr_values,
+        "per_instance_attr_labels": per_instance_attr_labels,
+        "per_instance_attr_values": per_instance_attr_values,
+        "per_instance_ids": per_instance_ids,
+        "per_instance": per_instance,
+    }
+
+
+# ==============================================================================
+# 4.5  Structure & Boundary Attribute Loading (GT-derived pathology attrs)
+# ==============================================================================
+
+STRUCTURE_ATTR_NAMES = [
+    "nuclear_density",
+    "nuclear_area_fraction",
+    "mean_nuclear_size",
+    "nuclear_size_heterogeneity",
+    "spatial_crowding",
+]
+
+BOUNDARY_ATTR_NAMES = [
+    "boundary_density",
+    "nuclear_irregularity",
+    "nuclear_elongation",
+    "small_nuclei_ratio",
+]
+
+# touching_or_crowding_difficulty is excluded from boundary attr head (debug only).
+
+INVALID_ATTR_LABEL = -1
+
+# Labelled class mapping
+ATTR_LABEL_MAP = {
+    "low": 0,
+    "mid": 1,
+    "high": 2,
+    "invalid": INVALID_ATTR_LABEL,
+}
+
+
+def load_structure_boundary_attrs(attr_path: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Load GT-derived structure & boundary attribute samples from a JSONL file.
+
+    Each line is a JSON object with:
+        sample_id      (str) - matching the image stem
+        structure_attrs (dict) - raw continuous values
+        boundary_attrs  (dict) - raw continuous values
+        discretized_labels (dict) - discrete class labels (0=low,1=mid,2=high,-1=invalid)
+
+    Returns:
+        Dict mapping sample_id -> record dict with keys:
+            structure_attr_values: List[float] (5 elements)
+            boundary_attr_values:  List[float] (5 elements, touching_or_crowding_difficulty included raw)
+            structure_attr_labels: List[int]   (5 discretized labels)
+            boundary_attr_labels:  List[int]   (4 discretized labels, touching_or_crowding_difficulty excluded)
+    """
+    records: Dict[str, Dict[str, Any]] = {}
+
+    if not os.path.isfile(attr_path):
+        _dataloader_print(f"⚠️ [DataLoader] structure_boundary_attr_path not found: {attr_path}")
+        return records
+
+    with open(attr_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            sample_id = rec.get("sample_id")
+            if not sample_id:
+                continue
+
+            structure_raw = rec.get("structure_attrs", {})
+            boundary_raw = rec.get("boundary_attrs", {})
+            disc = rec.get("discretized_labels", {})
+
+            # Build ordered value lists
+            structure_values = [float(structure_raw.get(k, 0.0)) for k in STRUCTURE_ATTR_NAMES]
+            boundary_values = [float(boundary_raw.get(k, 0.0)) for k in BOUNDARY_ATTR_NAMES]
+
+            # Build discretised labels; missing -> INVALID_ATTR_LABEL
+            structure_labels = [int(disc.get(k, INVALID_ATTR_LABEL)) for k in STRUCTURE_ATTR_NAMES]
+            boundary_labels = [int(disc.get(k, INVALID_ATTR_LABEL)) for k in BOUNDARY_ATTR_NAMES]
+
+            records[sample_id] = {
+                "structure_attr_values": structure_values,
+                "boundary_attr_values": boundary_values,
+                "structure_attr_labels": structure_labels,
+                "boundary_attr_labels": boundary_labels,
+            }
+
+    return records
+
+
 # ==============================================================================
 # 5. Dataset
 # ==============================================================================
@@ -802,26 +1321,53 @@ class UniversalDataset(data.Dataset):
         crop_size=256,
         mode="train",
         prompt_mode="organ_static",
+        use_structure_boundary_attrs=False,
+        structure_boundary_attr_path=None,
+        min_instance_area=8,
+        max_instances_per_image=128,
+        skip_knowledge_loading=False,
+        phase="unknown",
+        enable_local_region_text_alignment=False,
+        local_region_window_size=192,
+        local_region_thresholds_path=None,
+        local_region_audit=False,
     ):
         self.data_root = data_root
         self.image_size = image_size
         self.crop_size = crop_size
         self.mode = str(mode).lower().strip()
         self.raw_mode = mode
+        self.min_instance_area = min_instance_area
+        self.max_instances_per_image = max_instances_per_image
+        self.phase = phase
+        self.enable_local_region_text_alignment = bool(enable_local_region_text_alignment)
+        self.local_region_window_size = int(local_region_window_size)
+        self.local_region_audit = bool(local_region_audit)
+        self._local_region_audit_count = 0
+        self.local_region_thresholds = None
+        if self.enable_local_region_text_alignment:
+            if self.mode != "train":
+                raise ValueError(
+                    "GT local-region attributes are train-only and must not be "
+                    f"constructed for mode={self.mode!r}"
+                )
+            if not local_region_thresholds_path:
+                raise ValueError("local_region_thresholds_path is required for L1-A")
+            self.local_region_thresholds = load_l0_thresholds(local_region_thresholds_path)
 
         canonical_prompt_mode, raw_prompt_mode = normalize_prompt_mode(prompt_mode, default="organ_static")
         self.requested_prompt_mode = raw_prompt_mode
         self.prompt_mode = canonical_prompt_mode
 
         if raw_prompt_mode != canonical_prompt_mode:
-            print(
+            _dataloader_print(
                 f"⚠️ [DataLoader] prompt_mode='{prompt_mode}' is deprecated or unknown; "
                 f"using canonical prompt_mode='{canonical_prompt_mode}'."
             )
 
         # Hard guard against GT prompt leakage during normal validation/test.
         if self.prompt_mode == "dynamic_gt" and self.mode not in {"train", "oracle", "debug"}:
-            print(
+            _dataloader_print(
                 f"⚠️ [DataLoader] prompt_mode='dynamic_gt' is not allowed in mode='{self.mode}'. "
                 f"Falling back to 'organ_static' to avoid GT-derived prompt leakage."
             )
@@ -843,62 +1389,192 @@ class UniversalDataset(data.Dataset):
         #   ALLOW_EVAL_SAMPLE_ATTRIBUTES=1
         self.allow_eval_sample_attributes = os.environ.get("ALLOW_EVAL_SAMPLE_ATTRIBUTES", "0") == "1"
 
-        print(f"📖 [DataLoader] Loading Knowledge Base: {knowledge_path}")
-        with open(knowledge_path, "r", encoding="utf-8") as f:
-            full_db = json.load(f)
-
-        self.meta = full_db.get("__meta__", {})
-        self.is_v2 = str(self.meta.get("version", "")).lower().startswith("promptnu_freqpath_v2")
-
-        # Attribute config is only for dynamic_gt / fallback.
-        if "__meta__" in full_db:
-            stats = self.meta.get("stats", None)
-            if stats is None:
-                stats = self.meta.get("train_thresholds", {})
-            self.attr_config = AttributeConfig.from_metadata(stats)
-        else:
-            print("⚠️ [DataLoader] Warning: '__meta__' not found. Using default thresholds.")
+        # ------------------------------------------------------------------
+        # Phase B (multilevel_attr_warmup): skip knowledge loading entirely.
+        # Build sample list by scanning data_root/{mode} for .png files.
+        # ------------------------------------------------------------------
+        if skip_knowledge_loading:
+            self.full_db = {}
+            self.meta = {}
+            self.is_v2 = False
             self.attr_config = AttributeConfig()
 
-        self.full_db = {k: v for k, v in full_db.items() if k != "__meta__"}
+            self.samples = []
+            mode_dir = os.path.join(data_root, self.raw_mode)
+            if os.path.isdir(mode_dir):
+                for fname in sorted(os.listdir(mode_dir)):
+                    if not fname.lower().endswith(".png"):
+                        continue
+                    stem = os.path.splitext(fname)[0]
+                    full_img_path = os.path.join(mode_dir, fname)
+                    json_path = os.path.join(mode_dir, stem + ".json")
+                    if os.path.exists(full_img_path) and os.path.exists(json_path):
+                        self.samples.append({
+                            "img_path": full_img_path,
+                            "json_path": json_path,
+                            "data": {},
+                            "rel_path": f"{self.raw_mode}/{fname}",
+                        })
 
-        self.samples = []
-        skipped = 0
+            _dataloader_print(
+                f"📁 [DataLoader] Scanned {mode_dir}: "
+                f"Loaded {len(self.samples)} samples (skip_knowledge_loading=True)"
+            )
+        else:
+            _dataloader_print(f"📖 [DataLoader] Loading Knowledge Base: {knowledge_path}")
+            with open(knowledge_path, "r", encoding="utf-8") as f:
+                raw = f.read()
 
-        for rel_path, entry in self.full_db.items():
-            if entry.get("split") != self.raw_mode:
-                skipped += 1
-                continue
-
-            if os.path.isabs(rel_path):
-                full_img_path = rel_path
+            # Detect format: standard JSON (single dict) vs JSONL (one JSON object per line).
+            raw_stripped = raw.strip()
+            is_jsonl = False
+            if raw_stripped.startswith("{"):
+                try:
+                    _test = json.loads(raw_stripped)
+                    # Single JSON object – standard format (e.g. medical_knowledge.json)
+                    full_db = _test
+                except json.JSONDecodeError:
+                    is_jsonl = True
             else:
-                full_img_path = os.path.join(data_root, rel_path)
+                is_jsonl = True
 
-            full_json_path = self._image_path_to_json_path(full_img_path)
+            if is_jsonl:
+                full_db = {}
+                for line in raw_stripped.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    _sample_id = entry.get("sample_id", "")
+                    _split = entry.get("split", "train")
+                    _fname = entry.get("image_path", f"{_sample_id}.png")
+                    path_key = f"{_split}/{_fname}"
+                    full_db[path_key] = entry
 
-            if os.path.exists(full_img_path) and os.path.exists(full_json_path):
-                self.samples.append(
-                    {
-                        "img_path": full_img_path,
-                        "json_path": full_json_path,
-                        "data": entry,
-                        "rel_path": rel_path,
-                    }
+            self.meta = full_db.pop("__meta__", {})
+            self.is_v2 = str(self.meta.get("version", "")).lower().startswith("promptnu_freqpath_v2")
+
+            # Attribute config is only for dynamic_gt / fallback.
+            if self.meta:
+                stats = self.meta.get("stats", None)
+                if stats is None:
+                    stats = self.meta.get("train_thresholds", {})
+                self.attr_config = AttributeConfig.from_metadata(stats)
+            else:
+                _dataloader_print("⚠️ [DataLoader] Warning: '__meta__' not found. Using default thresholds.")
+                self.attr_config = AttributeConfig()
+
+            self.full_db = full_db
+
+            self.samples = []
+            skipped = 0
+
+            for rel_path, entry in self.full_db.items():
+                if entry.get("split") != self.raw_mode:
+                    skipped += 1
+                    continue
+
+                if os.path.isabs(rel_path):
+                    full_img_path = rel_path
+                else:
+                    full_img_path = os.path.join(data_root, rel_path)
+
+                full_json_path = self._image_path_to_json_path(full_img_path)
+
+                if os.path.exists(full_img_path) and os.path.exists(full_json_path):
+                    self.samples.append(
+                        {
+                            "img_path": full_img_path,
+                            "json_path": full_json_path,
+                            "data": entry,
+                            "rel_path": rel_path,
+                        }
+                    )
+                else:
+                    skipped += 1
+
+            _dataloader_print(
+                f"✅ [DataLoader] Mode: {self.raw_mode} | Prompt: {self.prompt_mode} "
+                f"(requested: {self.requested_prompt_mode}) | "
+                f"V2={self.is_v2} | "
+                f"OrganDropout={self.organ_dropout_prob:.3f} | "
+                f"AllowEvalSampleAttrs={self.allow_eval_sample_attributes} | "
+                f"Loaded: {len(self.samples)} | Skipped: {skipped}"
+            )
+
+        # ------------------------------------------------------------------
+        # Structure & Boundary Attribute Loading (GT-derived pathology attrs)
+        # ------------------------------------------------------------------
+        self.use_structure_boundary_attrs = bool(use_structure_boundary_attrs)
+        self.structure_boundary_attr_path = structure_boundary_attr_path
+        self.structure_boundary_attr_records: Dict[str, Dict[str, Any]] = {}
+        self._sb_loaded = False
+
+        if self.use_structure_boundary_attrs:
+            sb_path = self.structure_boundary_attr_path or os.path.join(
+                os.path.dirname(knowledge_path), "..", "attr_stats",
+                "gt_structure_boundary_attr_samples.jsonl",
+            )
+            self.structure_boundary_attr_records = load_structure_boundary_attrs(sb_path)
+            self._sb_loaded = True
+
+            # Match samples
+            matched = 0
+            missing = 0
+            for sample in self.samples:
+                rel_path = sample.get("rel_path", "")
+                stem = os.path.splitext(os.path.basename(rel_path))[0]
+                if stem in self.structure_boundary_attr_records:
+                    sample["_sb_sample_id"] = stem
+                    matched += 1
+                else:
+                    sample["_sb_sample_id"] = None
+                    missing += 1
+
+            _dataloader_print(
+                f"📊 [DataLoader] Structure & Boundary Attrs: "
+                f"Loaded={len(self.structure_boundary_attr_records)} | "
+                f"Matched={matched} | Missing={missing} | "
+                f"Structure={STRUCTURE_ATTR_NAMES} | "
+                f"Boundary={BOUNDARY_ATTR_NAMES}"
+            )
+
+            if missing > 0:
+                _dataloader_print(
+                    f"⚠️ [DataLoader] {missing}/{len(self.samples)} samples "
+                    f"missing structure/boundary attrs — will return invalid labels."
                 )
-            else:
-                skipped += 1
 
-        print(
-            f"✅ [DataLoader] Mode: {self.raw_mode} | Prompt: {self.prompt_mode} "
-            f"(requested: {self.requested_prompt_mode}) | "
-            f"V2={self.is_v2} | "
-            f"OrganDropout={self.organ_dropout_prob:.3f} | "
-            f"AllowEvalSampleAttrs={self.allow_eval_sample_attributes} | "
-            f"Loaded: {len(self.samples)} | Skipped: {skipped}"
-        )
+            # ── [SB_ATTR_DATA_AUDIT] detailed audit (gated behind audit_mode=debug) ──
+            if self.use_structure_boundary_attrs and self.structure_boundary_attr_records:
+                _first_sb_sample_id = None
+                _first_structure_labels = None
+                _first_boundary_labels = None
+                for sample in self.samples:
+                    _sid = sample.get("_sb_sample_id", None)
+                    if _sid is not None and _sid in self.structure_boundary_attr_records:
+                        _first_sb_sample_id = _sid
+                        _rec = self.structure_boundary_attr_records[_sid]
+                        _first_structure_labels = _rec.get("structure_attr_labels", [])
+                        _first_boundary_labels = _rec.get("boundary_attr_labels", [])
+                        break
+                _attr_path = self.structure_boundary_attr_path or "N/A"
+                _attr_file_exists = os.path.isfile(_attr_path) if _attr_path != "N/A" else False
+                audit_print(
+                    "SB_ATTR_DATA_AUDIT",
+                    f"\n[SB_ATTR_DATA_AUDIT] phase={self.phase} | "
+                    f"use_structure_boundary_attrs={self.use_structure_boundary_attrs} | "
+                    f"structure_boundary_attr_path={_attr_path} | "
+                    f"attr_file_exists={_attr_file_exists} | "
+                    f"loaded_attr_records={len(self.structure_boundary_attr_records)} | "
+                    f"matched_samples={matched} | "
+                    f"missing_samples={missing} | "
+                    f"first_sample_id={_first_sb_sample_id} | "
+                    f"first_structure_attr_labels={_first_structure_labels} | "
+                    f"first_boundary_attr_labels={_first_boundary_labels}",
+                )
 
-        self.transform = self._get_transforms()
+        self.geometry_transform, self.transform = self._get_transforms()
 
     @staticmethod
     def _image_path_to_json_path(img_path: str) -> str:
@@ -911,12 +1587,16 @@ class UniversalDataset(data.Dataset):
         If an image is smaller than crop_size, it is upscaled in __getitem__.
         """
         if self.mode == "train":
-            return A.Compose(
+            geometry = A.Compose(
                 [
                     A.RandomCrop(width=self.crop_size, height=self.crop_size, p=1.0),
                     A.HorizontalFlip(p=0.5),
                     A.VerticalFlip(p=0.5),
                     A.RandomRotate90(p=0.5),
+                ]
+            )
+            appearance_and_resize = A.Compose(
+                [
                     A.ColorJitter(
                         brightness=0.2,
                         contrast=0.2,
@@ -932,10 +1612,13 @@ class UniversalDataset(data.Dataset):
                     ToTensorV2(),
                 ]
             )
+            return geometry, appearance_and_resize
 
-        return A.Compose(
+        geometry = A.Compose(
+            [A.CenterCrop(width=self.crop_size, height=self.crop_size, p=1.0)]
+        )
+        appearance_and_resize = A.Compose(
             [
-                A.CenterCrop(width=self.crop_size, height=self.crop_size, p=1.0),
                 A.Resize(
                     height=self.image_size,
                     width=self.image_size,
@@ -944,6 +1627,7 @@ class UniversalDataset(data.Dataset):
                 ToTensorV2(),
             ]
         )
+        return geometry, appearance_and_resize
 
     def _decode_mask(self, json_path: str) -> np.ndarray:
         """
@@ -1102,13 +1786,45 @@ class UniversalDataset(data.Dataset):
             mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
         # 2. Augmentation
-        augmented = self.transform(image=image, mask=mask)
+        geometric = self.geometry_transform(image=image, mask=mask)
+        local_aug_mask_inst = np.asarray(geometric["mask"]).astype(np.int32)
+        augmented = self.transform(image=geometric["image"], mask=local_aug_mask_inst)
 
         # ToTensorV2 keeps uint8 range; SAM preprocess expects 0-255 scale.
         img_tensor = augmented["image"].float()
 
         aug_mask_inst = augmented["mask"].numpy().astype(np.int32)
         aug_mask = (aug_mask_inst > 0).astype(np.uint8)
+
+        # L1-A labels are recomputed after synchronized crop/flip/rotation and
+        # before ColorJitter/model resize. No pre-augmentation label is reused.
+        local_region_targets = None
+        if self.enable_local_region_text_alignment:
+            local_region_targets = compute_local_region_targets(
+                local_aug_mask_inst,
+                self.local_region_thresholds,
+                window_size=self.local_region_window_size,
+            )
+            if self.local_region_audit and self._local_region_audit_count < 3:
+                sample_path = item["img_path"]
+                local_coordinates = local_region_targets["coordinates"]
+                local_labels = local_region_targets["labels"]
+                local_valid = local_region_targets["valid"]
+                complete_instance_count = local_region_targets["complete_instance_count"]
+                local_region_count = local_region_targets["region_count"]
+                _dataloader_print(
+                    "\n[L1A_LOCAL_REGION_DATA_AUDIT]\n"
+                    f"  sample={os.path.basename(sample_path)}\n"
+                    f"  region_coordinates_before={list(l1a_region_coordinates())}\n"
+                    f"  region_coordinates_after={list(local_coordinates)}\n"
+                    f"  recomputed_label_codes={local_labels.tolist()}\n"
+                    f"  valid_attribute_mask={local_valid.tolist()}\n"
+                    f"  complete_instance_count={complete_instance_count.tolist()}\n"
+                    f"  region_count={local_region_count}\n"
+                    f"  attributes={list(L1A_LOCAL_ATTRIBUTE_NAMES)}",
+                    flush=True,
+                )
+                self._local_region_audit_count += 1
 
         # 3. Crop-level dynamic attributes.
         # Only used by dynamic_gt mode. Not used by normal organ_static.
@@ -1217,11 +1933,88 @@ class UniversalDataset(data.Dataset):
         gt_hv_map = generate_hv_map(aug_mask_inst)
         gt_hv_map_tensor = torch.from_numpy(gt_hv_map).float()
 
+        # Boundary / uncertainty targets for boundary-aware and uncertainty-weighted losses.
+        # After crop_size -> image_size resizing, scale the ring radius so that it remains
+        # roughly equivalent to a 2-pixel band on the original crop.
+        boundary_radius = max(2, int(round(2.0 * float(self.image_size) / float(self.crop_size))))
+        structure_targets = generate_boundary_uncertainty_targets(
+            inst_mask=aug_mask_inst,
+            boundary_radius=boundary_radius,
+            contact_radius=boundary_radius,
+        )
+
+        fg_target_tensor = torch.from_numpy(structure_targets["fg_target"]).float().unsqueeze(0)
+        bg_target_tensor = torch.from_numpy(structure_targets["bg_target"]).float().unsqueeze(0)
+        boundary_target_tensor = torch.from_numpy(structure_targets["boundary_target"]).float().unsqueeze(0)
+        uncertain_target_tensor = torch.from_numpy(structure_targets["uncertain_target"]).float().unsqueeze(0)
+
+        # ==================================================================
+        # 6b. Dense Boundary Maps & Instance Morphology Attrs (Phase B)
+        # ==================================================================
+        # 4 dense boundary maps [1, H, W] each
+        _dense_maps = generate_dense_boundary_maps(aug_mask_inst)
+        dense_boundary_map_tensor = torch.from_numpy(_dense_maps["boundary_map"]).float().unsqueeze(0)
+        touching_region_tensor = torch.from_numpy(_dense_maps["touching_region"]).float().unsqueeze(0)
+        small_nuclei_map_tensor = torch.from_numpy(_dense_maps["small_nuclei"]).float().unsqueeze(0)
+        hv_gradient_map_tensor = torch.from_numpy(_dense_maps["hv_gradient"]).float().unsqueeze(0)
+        # Instance morphology attributes
+        _inst_morph = compute_instance_morphology_attrs(
+            aug_mask_inst,
+            min_instance_area=self.min_instance_area,
+            max_instances_per_image=self.max_instances_per_image,
+        )
+        instance_attr_labels_tensor = torch.from_numpy(_inst_morph["instance_attr_labels"]).long()  # [6]
+        instance_attr_values_tensor = torch.from_numpy(_inst_morph["instance_attr_values"]).float()  # [6]
+        # Per-instance morphology labels [N_i, 6]
+        per_instance_attr_labels_tensor = torch.from_numpy(_inst_morph["per_instance_attr_labels"]).long()  # [N_i, 6]
+        per_instance_attr_values_tensor = torch.from_numpy(_inst_morph["per_instance_attr_values"]).float()  # [N_i, 6]
+        # Per-instance IDs [N_i], same order as per_instance_attr_labels rows
+        per_instance_ids_tensor = torch.from_numpy(_inst_morph["per_instance_ids"]).long()  # [N_i]
+
         attr_labels = torch.tensor(attr_labels_np, dtype=torch.long)
 
         uses_gt_prompt = prompt_uses_gt_attributes(self.prompt_mode)
 
-        return {
+        # ==================================================================
+        # 7. Structure & Boundary Attribute Labels (GT-derived pathology attrs)
+        # ==================================================================
+        # Default: no structure/boundary attrs available.
+        _has_sb = False
+        _structure_attr_labels = [INVALID_ATTR_LABEL] * len(STRUCTURE_ATTR_NAMES)
+        _boundary_attr_labels = [INVALID_ATTR_LABEL] * len(BOUNDARY_ATTR_NAMES)
+        _structure_attr_values = [0.0] * len(STRUCTURE_ATTR_NAMES)
+        _boundary_attr_values = [0.0] * len(BOUNDARY_ATTR_NAMES)
+
+        if self._sb_loaded:
+            sb_sample_id = item.get("_sb_sample_id")
+            if sb_sample_id is not None and sb_sample_id in self.structure_boundary_attr_records:
+                sb_rec = self.structure_boundary_attr_records[sb_sample_id]
+                _structure_attr_labels = list(sb_rec["structure_attr_labels"])
+                _boundary_attr_labels = list(sb_rec["boundary_attr_labels"])
+                _structure_attr_values = list(sb_rec["structure_attr_values"])
+                _boundary_attr_values = list(sb_rec["boundary_attr_values"])
+                _has_sb = True
+            # else: keep invalid defaults (missing sample — warning already printed at init)
+
+        # ==================================================================
+        # PNURL_AUDIT: Debug print first 3 train samples (Item 1)
+        # ==================================================================
+        global _PNURL_AUDIT_DATALOADER_COUNTER
+        if _PNURL_AUDIT and self.mode == "train" and _PNURL_AUDIT_DATALOADER_COUNTER < 3:
+            idx = _PNURL_AUDIT_DATALOADER_COUNTER
+            _dataloader_print(f"\n[PNURL_AUDIT_DATALOADER] sample={idx}", flush=True)
+            _dataloader_print(f"  image_id={os.path.basename(item['img_path'])}", flush=True)
+            _dataloader_print(f"  prompt_mode={self.prompt_mode}", flush=True)
+            _dataloader_print(f"  requested_prompt_mode={self.requested_prompt_mode}", flush=True)
+            _dataloader_print(f"  organ={organ_name} (id={organ_id})", flush=True)
+            _dataloader_print(f"  attr_labels={attr_labels_np}", flush=True)
+            _dataloader_print(f"  attr_source={attr_source}", flush=True)
+            _dataloader_print(f"  text_prompt={text_prompt}", flush=True)
+            _dataloader_print(f"  attribute_text={attribute_text}", flush=True)
+            _dataloader_print(f"  morphology_text={morphology_text}", flush=True)
+            _PNURL_AUDIT_DATALOADER_COUNTER += 1
+
+        result = {
             "image": img_tensor,
 
             # Semantic / instance labels
@@ -1231,6 +2024,10 @@ class UniversalDataset(data.Dataset):
             # Structure supervision
             "gt_heatmap": gt_heatmap_tensor,
             "gt_hv_map": gt_hv_map_tensor,
+            "fg_target": fg_target_tensor,
+            "bg_target": bg_target_tensor,
+            "boundary_target": boundary_target_tensor,
+            "uncertain_target": uncertain_target_tensor,
 
             # Organ and prompts
             "organ_id": int(organ_id),
@@ -1257,14 +2054,65 @@ class UniversalDataset(data.Dataset):
             "prompt_mode": self.prompt_mode,
             "requested_prompt_mode": self.requested_prompt_mode,
             "prompt_uses_gt_attributes": bool(uses_gt_prompt),
+
+            # Structure & Boundary Attributes (GT-derived pathology attrs)
+            # structure_attr_labels:   [nuclear_density, nuclear_area_fraction, mean_nuclear_size,
+            #                           nuclear_size_heterogeneity, spatial_crowding]
+            # boundary_attr_labels:   [boundary_density, nuclear_irregularity, nuclear_elongation,
+            #                           small_nuclei_ratio]
+            # Each label: 0=low, 1=mid, 2=high, -1=invalid
+            # structure_attr_values / boundary_attr_values: raw continuous values from GT computation
+            # has_structure_boundary_attrs: True if the sample was found in the JSONL
+            "structure_attr_labels": torch.tensor(_structure_attr_labels, dtype=torch.long),
+            "boundary_attr_labels": torch.tensor(_boundary_attr_labels, dtype=torch.long),
+            "structure_attr_values": torch.tensor(_structure_attr_values, dtype=torch.float),
+            "boundary_attr_values": torch.tensor(_boundary_attr_values, dtype=torch.float),
+            "has_structure_boundary_attrs": _has_sb,
+
+            # Phase B: Dense Boundary Maps (each [1, H, W] float)
+            "dense_boundary_map": dense_boundary_map_tensor,
+            "dense_touching_region": touching_region_tensor,
+            "dense_small_nuclei": small_nuclei_map_tensor,
+            "dense_hv_gradient": hv_gradient_map_tensor,
+            # Phase B: Instance Morphology Attributes (each [6] long/float)
+            "instance_attr_labels": instance_attr_labels_tensor,      # [6] long (0/1/2)
+            "instance_attr_values": instance_attr_values_tensor,      # [6] float
+            # Phase B: Per-instance morphology labels (variable-length per image)
+            "per_instance_attr_labels": per_instance_attr_labels_tensor,  # [N_i, 6] long
+            "per_instance_attr_values": per_instance_attr_values_tensor,  # [N_i, 6] float
+            # Phase B: Per-instance IDs in same order as attr_labels rows
+            "per_instance_ids": per_instance_ids_tensor,  # [N_i] long
         }
+        if local_region_targets is not None:
+            result["local_region_attr_labels"] = torch.from_numpy(
+                local_region_targets["labels"]
+            ).long()
+            result["local_region_attr_valid"] = torch.from_numpy(
+                local_region_targets["valid"]
+            ).bool()
+            result["local_region_attr_values"] = torch.from_numpy(
+                local_region_targets["values"]
+            ).float()
+            result["local_region_complete_counts"] = torch.from_numpy(
+                local_region_targets["complete_instance_count"]
+            ).long()
+            result["local_region_coordinates"] = torch.tensor(
+                local_region_targets["coordinates"], dtype=torch.long
+            )
+        return result
 
 
 def stack_dict_batched(batch):
     tensor_dict = {}
 
+    # Keys that contain variable-length per-instance tensors (can't be stacked)
+    _per_instance_keys = {"per_instance_attr_labels", "per_instance_attr_values", "per_instance_ids"}
+
     for key, value in batch[0].items():
-        if isinstance(value, torch.Tensor):
+        if key in _per_instance_keys:
+            # Variable-length per-instance data: keep as list of tensors
+            tensor_dict[key] = [sample[key] for sample in batch]
+        elif isinstance(value, torch.Tensor):
             tensor_dict[key] = torch.stack([sample[key] for sample in batch])
         elif isinstance(value, (int, float, str, bool)):
             tensor_dict[key] = [sample[key] for sample in batch]

@@ -1,0 +1,32 @@
+# ============================================================
+# Environment Snapshot — NucleiSegmentation (Old Server)
+# Generated: 2026-06-28
+# ============================================================
+
+# --- Conda Environment ---
+# No conda environment currently activated.
+# Available environments:
+#   base    : /base/mambaforge
+#   my_env  : /root/.conda/envs/my_env
+# Currently using system Python (/usr/bin/python).
+
+CONDA_ENV_NAME          = (none active, system Python)
+
+# --- Python ---
+PYTHON_VERSION          = 3.12.3
+
+# --- PyTorch ---
+PYTORCH_VERSION         = 2.7.0a0+79aa17489c.nv25.04
+TORCHVISION_VERSION     = 0.22.0a0
+
+# --- CUDA ---
+CUDA_VERSION            = 12.9
+CUDA_AVAILABLE          = True
+
+# --- GPU ---
+GPU_COUNT               = 1
+GPU_0                   = NVIDIA GeForce RTX 5090
+
+# --- Additional Info ---
+# torchaudio is not installed in the current environment.
+# The project uses PyTorch built from source (nv25.04 nightly).

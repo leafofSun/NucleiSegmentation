@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "description": "RSGR Local-5 contract; this file is the sole source of attribute order.",
+  "region_layout": {
+    "image_size": 256,
+    "region_size": 192,
+    "region_count": 4,
+    "names": [
+      "top_left",
+      "top_right",
+      "bottom_left",
+      "bottom_right"
+    ],
+    "tile_size": 256,
+    "regions": [
+      [
+        0,
+        0,
+        192,
+        192
+      ],
+      [
+        64,
+        0,
+        256,
+        192
+      ],
+      [
+        0,
+        64,
+        192,
+        256
+      ],
+      [
+        64,
+        64,
+        256,
+        256
+      ]
+    ]
+  },
+  "threshold_source": {
+    "path": "workdir/audits/local_semantic_granularity_l0_20260722/L0_ATTRIBUTE_BIN_THRESHOLDS.json",
+    "sha256": "b3b2c7c9f729df2c50676559eca3dd10d20ce4fe96e147e208fd9823c8991fec",
+    "fit_split": "train",
+    "policy": "complete_only tile-global tertiles"
+  },
+  "label_generator": {
+    "code": "training/local_region_text_alignment.py:compute_local_region_targets",
+    "input": "post-geometric-augmentation 256x256 instance mask",
+    "instance_policy": "complete instances only",
+    "audit": "workdir/audits/local_semantic_granularity_l0_20260722"
+  },
+  "prototype_source": {
+    "bank": "workdir/audits/local_region_text_l1a_20260722/L1A_TEXT_PROTOTYPE_BANK.pt",
+    "metadata": "workdir/audits/local_region_text_l1a_20260722/L1A_TEXT_PROTOTYPE_BANK.json",
+    "encoder": "conch_ViT-B-16",
+    "audit": "workdir/audits/local_region_text_l1a_20260722"
+  },
+  "attributes": [
+    {
+      "name": "nuclear_density",
+      "label_source_name": "nuclear_density",
+      "group": "structure",
+      "class_count": 3,
+      "label_generator": "complete_count / (192 * 192) * 10000",
+      "threshold_source": "threshold_source",
+      "thresholds": {
+        "low_upper_exclusive": 1.373291015625,
+        "medium_upper_inclusive": 2.288818359375
+      },
+      "values": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "train_split": "train",
+      "code": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "audit": "workdir/audits/local_semantic_granularity_l0_20260722",
+      "prompt_texts": [
+        "a sparse local nuclear region",
+        "a moderately populated local nuclear region",
+        "a densely populated local nuclear region"
+      ],
+      "threshold_values": {
+        "low_upper_exclusive": 1.373291015625,
+        "medium_upper_inclusive": 2.288818359375
+      },
+      "training_split_source": "train",
+      "existing_code_location": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "existing_audit_source": "workdir/audits/local_semantic_granularity_l0_20260722"
+    },
+    {
+      "name": "nuclear_size_heterogeneity",
+      "label_source_name": "nuclear_size_heterogeneity",
+      "group": "structure",
+      "class_count": 3,
+      "label_generator": "std(complete_instance_area) / mean(complete_instance_area)",
+      "threshold_source": "threshold_source",
+      "thresholds": {
+        "low_upper_exclusive": 0.4139988898661168,
+        "medium_upper_inclusive": 0.566786470553454
+      },
+      "values": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "train_split": "train",
+      "code": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "audit": "workdir/audits/local_semantic_granularity_l0_20260722",
+      "prompt_texts": [
+        "a local region with uniformly sized nuclei",
+        "a local region with moderately variable nuclear sizes",
+        "a local region with highly heterogeneous nuclear sizes"
+      ],
+      "threshold_values": {
+        "low_upper_exclusive": 0.4139988898661168,
+        "medium_upper_inclusive": 0.566786470553454
+      },
+      "training_split_source": "train",
+      "existing_code_location": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "existing_audit_source": "workdir/audits/local_semantic_granularity_l0_20260722"
+    },
+    {
+      "name": "spatial_crowding",
+      "label_source_name": "spatial_crowding",
+      "group": "structure",
+      "class_count": 3,
+      "label_generator": "100 / median_nearest_complete_instance_centroid_distance",
+      "threshold_source": "threshold_source",
+      "thresholds": {
+        "low_upper_exclusive": 2.2952855806166763,
+        "medium_upper_inclusive": 2.9265746167753273
+      },
+      "values": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "train_split": "train",
+      "code": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "audit": "workdir/audits/local_semantic_granularity_l0_20260722",
+      "prompt_texts": [
+        "a local region with low nuclear crowding",
+        "a local region with moderate nuclear crowding",
+        "a local region with high nuclear crowding"
+      ],
+      "threshold_values": {
+        "low_upper_exclusive": 2.2952855806166763,
+        "medium_upper_inclusive": 2.9265746167753273
+      },
+      "training_split_source": "train",
+      "existing_code_location": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "existing_audit_source": "workdir/audits/local_semantic_granularity_l0_20260722"
+    },
+    {
+      "name": "nuclear_irregularity",
+      "label_source_name": "boundary_irregularity",
+      "group": "boundary",
+      "class_count": 3,
+      "label_generator": "mean(perimeter / (2 * sqrt(pi * area))) over complete instances",
+      "threshold_source": "threshold_source",
+      "thresholds": {
+        "low_upper_exclusive": 1.1028523105441401,
+        "medium_upper_inclusive": 1.1566828278341708
+      },
+      "values": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "train_split": "train",
+      "code": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "audit": "workdir/audits/local_semantic_granularity_l0_20260722",
+      "prompt_texts": [
+        "a local region containing nuclei with smooth boundaries",
+        "a local region containing nuclei with moderately irregular boundaries",
+        "a local region containing nuclei with highly irregular boundaries"
+      ],
+      "threshold_values": {
+        "low_upper_exclusive": 1.1028523105441401,
+        "medium_upper_inclusive": 1.1566828278341708
+      },
+      "training_split_source": "train",
+      "existing_code_location": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "existing_audit_source": "workdir/audits/local_semantic_granularity_l0_20260722"
+    },
+    {
+      "name": "nuclear_elongation",
+      "label_source_name": "nuclear_elongation",
+      "group": "boundary",
+      "class_count": 3,
+      "label_generator": "mean(axis_major_length / max(axis_minor_length, 1e-6)) over complete instances",
+      "threshold_source": "threshold_source",
+      "thresholds": {
+        "low_upper_exclusive": 1.5765929790921982,
+        "medium_upper_inclusive": 1.818553504361147
+      },
+      "values": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "train_split": "train",
+      "code": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "audit": "workdir/audits/local_semantic_granularity_l0_20260722",
+      "prompt_texts": [
+        "a local region containing mostly round nuclei",
+        "a local region containing moderately elongated nuclei",
+        "a local region containing highly elongated nuclei"
+      ],
+      "threshold_values": {
+        "low_upper_exclusive": 1.5765929790921982,
+        "medium_upper_inclusive": 1.818553504361147
+      },
+      "training_split_source": "train",
+      "existing_code_location": "training/local_region_text_alignment.py:compute_local_region_targets",
+      "existing_audit_source": "workdir/audits/local_semantic_granularity_l0_20260722"
+    }
+  ],
+  "schema_name": "rsgr_local5_v1",
+  "classes": [
+    "low",
+    "medium",
+    "high"
+  ]
+}

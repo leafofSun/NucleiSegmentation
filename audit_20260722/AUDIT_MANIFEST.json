@@ -1,0 +1,127 @@
+{
+  "audit_id": "NuSeg-comprehensive-readonly-20260722",
+  "project_root": "/hy-tmp/NuSeg",
+  "audit_output_dir": "/hy-tmp/NuSeg/audit_20260722",
+  "audit_date": "2026-07-22",
+  "timezone": "Asia/Shanghai",
+  "auditor_role": [
+    "chief_research_auditor",
+    "code_auditor",
+    "experiment_reproducibility_auditor"
+  ],
+  "mode": "read_only_project_audit",
+  "final_decision": "RESTRUCTURE",
+  "git": {
+    "metadata_present": false,
+    "branch": "UNKNOWN",
+    "commit": "UNKNOWN",
+    "dirty": "UNKNOWN",
+    "reason": ".git metadata is absent from /hy-tmp/NuSeg"
+  },
+  "environment_snapshot": {
+    "conda_default_env": "UNSET",
+    "python": "3.11.14",
+    "torch": "2.9.1+cu128",
+    "torch_compiled_cuda": "12.8",
+    "gpu_initialized_by_audit": false,
+    "gpu_used_by_audit": false
+  },
+  "safety": {
+    "source_files_modified": false,
+    "config_files_modified": false,
+    "existing_artifacts_modified_or_deleted": false,
+    "training_started": false,
+    "full_test_started": false,
+    "torchrun_started": false,
+    "checkpoint_loaded": false,
+    "large_checkpoint_hashed": false,
+    "secret_files_read": false,
+    "active_training_detected_at_snapshot": false
+  },
+  "inventory": {
+    "model_storage_approx": "78G",
+    "audit_storage_approx": "1.7G",
+    "checkpoint_files_observed": 39,
+    "checkpoint_content_inspected": false,
+    "secret_like_file_observed": ".env (47 bytes; content not read)"
+  },
+  "modules_checked": [
+    "TextSam forward and preprocessing",
+    "image encoder freeze and adapter training",
+    "mask decoder and FreqPath low/high routing",
+    "PromptNu-lite and PromptNu-guided/PNuRL",
+    "multi-level numeric attributes",
+    "SGA gamma gating",
+    "PNuDP Dense fusion",
+    "local-region text alignment L1A",
+    "soft-boundary P4.1",
+    "PanNuke data augmentation and prompt generation",
+    "AJI/PQ metrics",
+    "DDP validation and full-test aggregation",
+    "optimizer parameter grouping",
+    "experiment logs, metrics histories, manifests and checkpoint filenames"
+  ],
+  "commands_executed_categories": [
+    "filesystem inventory using find, du, wc and file metadata",
+    "read-only source and log search using grep, sed and shell text tools",
+    "process snapshot inspection",
+    "Python/Torch version query without CUDA initialization",
+    "small JSON and metrics-history parsing",
+    "audit deliverable format and consistency validation"
+  ],
+  "commands_intentionally_not_executed": [
+    "training commands",
+    "torchrun or distributed launch",
+    "canonical or full test inference",
+    "GPU initialization or CUDA workload",
+    "checkpoint deserialization",
+    "large checkpoint hashing",
+    "source or configuration mutation",
+    "secret or credential file reads",
+    "artifact deletion or cleanup"
+  ],
+  "primary_findings": [
+    "Exp5 is the strongest currently verifiable recipe, but it does not establish single-module causality.",
+    "SGA is genuinely wired into forward, optimization and checkpoints, but its preregistered screening gate failed.",
+    "P4.1 soft-boundary underperformed legacy G2 and should not advance.",
+    "L0 supports semantic granularity mismatch, while L1A failed its primary E5 gate and lacks inference-time instance semantics.",
+    "Validation aggregation and train/full-test protocol differences weaken model-selection comparability.",
+    "The current FreqPath is not a literal spectral transform and should not be described as frequency-domain processing.",
+    "Core conclusions are single-seed and lack matched multi-seed canonical full-tests."
+  ],
+  "recommended_next_experiment": {
+    "name": "RSGR-1 Region-Semantic Grounding Randomization",
+    "fixed_parent": "Exp5 verifiable parent route",
+    "groups": [
+      "no-local",
+      "correct-local",
+      "shuffled-region",
+      "frozen-random-prototype"
+    ],
+    "screening": "4 groups x 5 epochs x 1 seed",
+    "formal_if_advanced": "4 groups x at least 3 preregistered seeds with canonical full-test",
+    "screening_advance_gate": "correct-local vs no-local mAJI >= +0.003, mPQ drop <= 0.002, and correct-local mAJI >= shuffled/random +0.002",
+    "recommended_resources": "2 x 24GB GPUs; approximately 7-10 aggregate GPU-hours for screening based on historical logs"
+  },
+  "evidence_limitations": [
+    "Git metadata is absent, so code version and dirty state cannot be established.",
+    "Exp6 claimed full-test metrics lack a corresponding formal full-test log.",
+    "Exp7 CLIP evidence is incomplete.",
+    "Phase B and Phase C original formal logs are incomplete.",
+    "Most central comparisons are single-seed and validation-only.",
+    "Training validation defaults to partial rank-local evaluation without all-reduce.",
+    "Training validation and full-test postprocessing settings differ."
+  ],
+  "files_created": [
+    "PROJECT_COMPREHENSIVE_AUDIT.md",
+    "PROJECT_EVIDENCE_LEDGER.tsv",
+    "PROJECT_EXPERIMENT_LINEAGE.md",
+    "PROJECT_COMPLETION_MATRIX.md",
+    "PROJECT_INNOVATION_AUDIT.md",
+    "SEMANTIC_GRANULARITY_AUDIT.md",
+    "PROJECT_NEXT_ROUTE.md",
+    "PROJECT_AUDIT_SUMMARY.txt",
+    "AUDIT_MANIFEST.json"
+  ],
+  "deliverable_count": 9
+}

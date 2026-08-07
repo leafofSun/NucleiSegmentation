@@ -18,9 +18,16 @@ PNuRL-v3: MGST Attribute Head + Class-Balanced/Focal Attribute Loss
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import math
+import os
 import torch
+import sys
 import torch.nn as nn
 import torch.nn.functional as F
+
+# PNURL_AUDIT: debug print gating (enabled via PNURL_AUDIT_ENABLED=1 env var)
+_PNURL_AUDIT = os.environ.get("PNURL_AUDIT_ENABLED", "0") == "1"
+_PNURL_AUDIT_FORWARD_COUNTER = 0
+_PNURL_AUDIT_DELTA_COUNTER = 0
 
 
 # ==============================================================================
@@ -207,6 +214,9 @@ class AttributeClassifiers(nn.Module):
 
         if return_feats:
             diagnostics = {
+                # Keep the token with gradient for downstream prompt construction.
+                # PNuRL.forward will pop this key before exposing diagnostics.
+                "mgst_token": token,
                 "mgst_token_norm": token.detach().float().norm(dim=-1).mean(),
                 "local_feat_norm": local_feat.detach().float().norm(dim=1).mean(),
             }
@@ -240,6 +250,7 @@ class AttributePromptBank(nn.Module):
         num_classes_per_attr: List[int],
         color_high_scale: float = 0.0,
         text_context_scale: float = 0.10,
+        attr_token_scale: float = 0.25,
         dropout: float = 0.05,
     ):
         super().__init__()
@@ -284,6 +295,24 @@ class AttributePromptBank(nn.Module):
             nn.Linear(text_dim, text_dim),
         )
 
+        # Direct bridge from the supervised MGST attribute token to prompt space.
+        # This binds low/high prompts to the representation that is trained by
+        # attribute classification, instead of relying only on a free embedding bank.
+        self.low_attr_context = nn.Sequential(
+            nn.Linear(text_dim, text_dim),
+            nn.GELU(),
+            nn.LayerNorm(text_dim),
+            nn.Dropout(dropout),
+            nn.Linear(text_dim, text_dim),
+        )
+        self.high_attr_context = nn.Sequential(
+            nn.Linear(text_dim, text_dim),
+            nn.GELU(),
+            nn.LayerNorm(text_dim),
+            nn.Dropout(dropout),
+            nn.Linear(text_dim, text_dim),
+        )
+
         self.register_buffer(
             "color_high_scale",
             torch.tensor(float(color_high_scale), dtype=torch.float32),
@@ -292,6 +321,11 @@ class AttributePromptBank(nn.Module):
         self.register_buffer(
             "text_context_scale",
             torch.tensor(float(text_context_scale), dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "attr_token_scale",
+            torch.tensor(float(attr_token_scale), dtype=torch.float32),
             persistent=True,
         )
 
@@ -325,6 +359,7 @@ class AttributePromptBank(nn.Module):
         self,
         probs_list: List[torch.Tensor],
         text_embed: Optional[torch.Tensor] = None,
+        attr_token_embed: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if len(probs_list) != 5:
             raise ValueError(f"Expected 5 probability tensors, got {len(probs_list)}.")
@@ -357,6 +392,12 @@ class AttributePromptBank(nn.Module):
             low_prompt = low_prompt + text_scale * self.low_text_context(text_embed.float()).to(dtype=dtype)
             high_prompt = high_prompt + text_scale * self.high_text_context(text_embed.float()).to(dtype=dtype)
 
+        if attr_token_embed is not None:
+            attr_scale = self.attr_token_scale.to(device=device, dtype=dtype).clamp(0.0, 1.0)
+            attr_token_embed = attr_token_embed.to(device=device, dtype=dtype)
+            low_prompt = low_prompt + attr_scale * self.low_attr_context(attr_token_embed.float()).to(dtype=dtype)
+            high_prompt = high_prompt + attr_scale * self.high_attr_context(attr_token_embed.float()).to(dtype=dtype)
+
         diagnostics = {
             "color_sem_norm": color_sem.detach().float().norm(dim=-1).mean(),
             "shape_sem_norm": shape_sem.detach().float().norm(dim=-1).mean(),
@@ -365,6 +406,8 @@ class AttributePromptBank(nn.Module):
             "density_sem_norm": density_sem.detach().float().norm(dim=-1).mean(),
             "low_prompt_raw_norm": low_prompt.detach().float().norm(dim=-1).mean(),
             "high_prompt_raw_norm": high_prompt.detach().float().norm(dim=-1).mean(),
+            "attr_token_context_scale": self.attr_token_scale.detach().float(),
+            "text_context_scale_value": self.text_context_scale.detach().float(),
         }
 
         return low_prompt, high_prompt, diagnostics
@@ -490,6 +533,27 @@ class ControlledSemanticDeltaAdapter(nn.Module):
             "semantic_delta_reg_loss": semantic_delta_reg_loss,
         }
 
+        # ==================================================================
+        # PNURL_AUDIT: semantic_delta_adapter debug prints (Item 3)
+        # ==================================================================
+        global _PNURL_AUDIT_DELTA_COUNTER
+        if _PNURL_AUDIT and _PNURL_AUDIT_DELTA_COUNTER < 6:
+            _PNURL_AUDIT_DELTA_COUNTER += 1
+            _base_norm = image_features.detach().float().norm(dim=1).mean().item()
+            _delta_norm_out = semantic_delta.detach().float().norm(dim=1).mean().item()
+            _ratio_val = semantic_delta_ratio.detach().float().view(-1)
+            _res_scale_val = residual_scale.detach().float().view(-1)
+            print(f"  [SEMANTIC_DELTA_ADAPTER] base_feat_norm={_base_norm:.6f}", flush=True)
+            print(f"  [SEMANTIC_DELTA_ADAPTER] delta_norm={_delta_norm_out:.6e}", flush=True)
+            print(f"  [SEMANTIC_DELTA_ADAPTER] ratio=mean={_ratio_val.mean().item():.6e}  "
+                  f"per_sample={_ratio_val.tolist()}", flush=True)
+            print(f"  [SEMANTIC_DELTA_ADAPTER] residual_scale=mean={_res_scale_val.mean().item():.6f}  "
+                  f"per_sample={_res_scale_val.tolist()}", flush=True)
+            print(f"  [SEMANTIC_DELTA_ADAPTER] delta_direction_norm="
+                  f"{delta_direction.detach().float().norm(dim=1).mean().item():.6f}", flush=True)
+            print(f"  [SEMANTIC_DELTA_ADAPTER] base_rms="
+                  f"{base_rms.detach().float().view(-1).mean().item():.6f}", flush=True)
+
         return semantic_delta, diagnostics
 
 
@@ -515,12 +579,14 @@ class PNuRL(nn.Module):
         focal_gamma: float = 1.5,
         class_balanced_beta: float = 0.999,
         color_loss_weight: float = 0.05,
+        prompt_loss_weight: float = 0.25,
     ):
         super().__init__()
 
         self.feat_dim = int(embed_dim)
         self.embed_dim = int(text_dim)
         self.attr_loss_weight = float(attr_loss_weight)
+        self.prompt_loss_weight = float(prompt_loss_weight)
         self.normalize_text_features = bool(normalize_text_features)
         self.max_delta_ratio = float(max_delta_ratio)
         self.init_delta_ratio = float(init_delta_ratio)
@@ -545,8 +611,25 @@ class PNuRL(nn.Module):
             num_classes_per_attr=num_classes_per_attr,
             color_high_scale=0.0,
             text_context_scale=0.10,
+            attr_token_scale=0.25,
             dropout=0.05,
         )
+
+        # Project the supervised MGST attribute token into the text/prompt space.
+        self.attr_token_projector = nn.Sequential(
+            nn.Linear(embed_dim, text_dim),
+            nn.GELU(),
+            nn.LayerNorm(text_dim),
+            nn.Dropout(0.05),
+            nn.Linear(text_dim, text_dim),
+        )
+
+        # Direct prompt supervision heads. These make attr-only warmup train the
+        # actual prompt vectors, not only the classifier heads.
+        self.low_prompt_size_head = nn.Linear(text_dim, num_classes_per_attr[3])
+        self.low_prompt_density_head = nn.Linear(text_dim, num_classes_per_attr[4])
+        self.low_prompt_arrange_head = nn.Linear(text_dim, num_classes_per_attr[2])
+        self.high_prompt_shape_head = nn.Linear(text_dim, num_classes_per_attr[1])
 
         self.semantic_delta_adapter = ControlledSemanticDeltaAdapter(
             feat_dim=embed_dim,
@@ -639,6 +722,7 @@ class PNuRL(nn.Module):
         text_embed: Optional[torch.Tensor] = None,
         attribute_labels: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]] = None,
         return_loss: bool = True,
+        prompt_mode: Optional[str] = None,  # PNURL_AUDIT: for debug printing only
     ) -> Dict[str, Any]:
         if image_features.dim() != 4:
             raise ValueError(f"image_features must be [B, C, H, W], got {tuple(image_features.shape)}")
@@ -652,11 +736,22 @@ class PNuRL(nn.Module):
         text_context = text_embed if has_external_text else None
 
         attribute_logits, attr_diag = self.attribute_classifiers(image_features, return_feats=True)
+        attr_token = None
+        if attr_diag is not None and "mgst_token" in attr_diag:
+            attr_token = attr_diag.pop("mgst_token")
+
         probs_list = [F.softmax(logits.float(), dim=1).to(dtype=dtype) for logits in attribute_logits]
+
+        attr_token_embed = None
+        if attr_token is not None:
+            attr_token_embed = self.attr_token_projector(attr_token.float()).to(device=device, dtype=dtype)
+            if self.normalize_text_features:
+                attr_token_embed = F.normalize(attr_token_embed.float(), dim=-1, eps=1e-6).to(dtype=dtype)
 
         low_freq_prompt, high_freq_prompt, prompt_diagnostics = self.attribute_prompt_bank(
             probs_list=probs_list,
             text_embed=text_context,
+            attr_token_embed=attr_token_embed,
         )
 
         if self.normalize_text_features:
@@ -667,19 +762,58 @@ class PNuRL(nn.Module):
         if self.normalize_text_features:
             fused_prompt = F.normalize(fused_prompt.float(), dim=-1, eps=1e-6).to(dtype=dtype)
 
+        # ==================================================================
+        # PNURL_AUDIT: Forward debug prints (Item 2)
+        # ==================================================================
+        global _PNURL_AUDIT_FORWARD_COUNTER
+        if _PNURL_AUDIT and _PNURL_AUDIT_FORWARD_COUNTER < 6:
+            _PNURL_AUDIT_FORWARD_COUNTER += 1
+            call_n = _PNURL_AUDIT_FORWARD_COUNTER
+            print(f"\n[PNURL_AUDIT_FORWARD] call={call_n}", flush=True)
+            print(f"  prompt_mode={prompt_mode}", flush=True)
+            if attribute_labels is not None:
+                for i, name in enumerate(["color", "shape", "arrange", "size", "density"]):
+                    print(f"  attr_labels_GT.{name}={attribute_labels[i].tolist()}", flush=True)
+            if attr_token_embed is not None:
+                _ate = attr_token_embed.float().norm(dim=-1)
+                print(f"  attr_token_embed_norm={_ate.mean().item():.6f}  (per_sample={_ate.tolist()})", flush=True)
+            if text_embed is not None:
+                _te = text_embed.float().norm(dim=-1)
+                print(f"  text_embed_norm={_te.mean().item():.6f}  (per_sample={_te.tolist()})", flush=True)
+            _lfn = low_freq_prompt.float().norm(dim=-1)
+            _hfn = high_freq_prompt.float().norm(dim=-1)
+            _ffn = fused_prompt.float().norm(dim=-1)
+            print(f"  low_freq_prompt_norm={_lfn.mean().item():.6f}  (per_sample={_lfn.tolist()})", flush=True)
+            print(f"  high_freq_prompt_norm={_hfn.mean().item():.6f}  (per_sample={_hfn.tolist()})", flush=True)
+            print(f"  fused_prompt_norm={_ffn.mean().item():.6f}  (per_sample={_ffn.tolist()})", flush=True)
+            # Show text_context contribution magnitude (if text is used)
+            if has_external_text and text_embed is not None:
+                tc_scale = prompt_diagnostics.get("text_context_scale_value",
+                    self.attribute_prompt_bank.text_context_scale.detach())
+                print(f"  text_context_scale={tc_scale.item() if hasattr(tc_scale, 'item') else tc_scale:.6f}", flush=True)
+
         semantic_delta, delta_diagnostics = self.semantic_delta_adapter(image_features, fused_prompt)
         density_map = self.density_decoder(image_features)
 
         pnurl_loss = image_features.new_tensor(0.0)
         attr_loss_dict: Dict[str, torch.Tensor] = {}
+        prompt_loss = image_features.new_tensor(0.0)
+        prompt_loss_dict: Dict[str, torch.Tensor] = {}
+        prompt_diag: Dict[str, torch.Tensor] = {}
 
         if return_loss and attribute_labels is not None:
-            pnurl_loss, attr_loss_dict = self.compute_attribute_loss(
+            attr_loss, attr_loss_dict = self.compute_attribute_loss(
                 attribute_logits,
                 attribute_labels,
                 return_dict=True,
             )
-            pnurl_loss = pnurl_loss * self.attr_loss_weight
+            prompt_loss, prompt_loss_dict, prompt_diag = self.compute_prompt_supervision_loss(
+                low_freq_prompt,
+                high_freq_prompt,
+                attribute_labels,
+                return_dict=True,
+            )
+            pnurl_loss = self.attr_loss_weight * attr_loss + self.prompt_loss_weight * prompt_loss
 
         attr_logits = {
             "color": attribute_logits[0],
@@ -709,13 +843,22 @@ class PNuRL(nn.Module):
             "arrange_sem_norm": prompt_diagnostics["arrange_sem_norm"],
             "shape_sem_norm": prompt_diagnostics["shape_sem_norm"],
             "color_sem_norm": prompt_diagnostics["color_sem_norm"],
+            "attr_token_context_scale": prompt_diagnostics["attr_token_context_scale"],
+            "text_context_scale_value": prompt_diagnostics["text_context_scale_value"],
+            "pnurl_prompt_loss": prompt_loss.detach(),
         }
 
         if attr_diag is not None:
             out.update(attr_diag)
 
+        if prompt_diag:
+            out.update(prompt_diag)
+
         for name, loss_value in attr_loss_dict.items():
             out[f"pnurl_loss_{name}"] = loss_value
+
+        for name, loss_value in prompt_loss_dict.items():
+            out[f"pnurl_prompt_loss_{name}"] = loss_value
 
         return out
 
@@ -806,6 +949,77 @@ class PNuRL(nn.Module):
                 return [labels_tensor[:, i].view(batch_size) for i in range(len(self.attribute_names))]
 
         raise TypeError(f"Unsupported attribute_labels type: {type(labels)}.")
+
+    def compute_prompt_supervision_loss(
+        self,
+        low_prompt: torch.Tensor,
+        high_prompt: torch.Tensor,
+        labels: Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor],
+        return_dict: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]]:
+        """Directly supervise prompt vectors.
+
+        This fixes the previous attr-only warmup issue where attribute classifiers
+        learned useful labels, but AttributePromptBank / low_freq_prompt had no
+        direct supervised objective.
+        """
+        device = low_prompt.device
+        batch_size = low_prompt.shape[0]
+        labels_list = self._normalize_attribute_labels(labels, batch_size, device)
+
+        shape_label = labels_list[1]
+        arrange_label = labels_list[2]
+        size_label = labels_list[3]
+        density_label = labels_list[4]
+
+        logits_size = self.low_prompt_size_head(low_prompt.float())
+        logits_density = self.low_prompt_density_head(low_prompt.float())
+        logits_arrange = self.low_prompt_arrange_head(low_prompt.float())
+        logits_shape = self.high_prompt_shape_head(high_prompt.float())
+
+        loss_size = self._balanced_focal_ce(logits_size, size_label, attr_idx=3)
+        loss_density = self._balanced_focal_ce(logits_density, density_label, attr_idx=4)
+        loss_arrange = self._balanced_focal_ce(logits_arrange, arrange_label, attr_idx=2)
+        loss_shape = self._balanced_focal_ce(logits_shape, shape_label, attr_idx=1)
+
+        # Low prompt is the current target of FreqPath low-only experiments.
+        # Shape is included at a lower weight so high_prompt is not completely
+        # unsupervised, but it should not dominate low prompt learning.
+        total = (
+            1.0 * loss_size
+            + 1.0 * loss_density
+            + 0.75 * loss_arrange
+            + 0.25 * loss_shape
+        ) / 3.0
+
+        def _acc(logits: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+            label = label.to(device=logits.device).long().view(-1)
+            valid = (label >= 0) & (label < logits.shape[1]) & (label != 255)
+            if not valid.any():
+                return logits.new_tensor(float("nan"))
+            pred = logits.argmax(dim=1)
+            return (pred[valid] == label[valid]).float().mean()
+
+        loss_dict = {
+            "size": loss_size.detach(),
+            "density": loss_density.detach(),
+            "arrange": loss_arrange.detach(),
+            "shape": loss_shape.detach(),
+        }
+        diagnostics = {
+            "prompt_acc_size": _acc(logits_size, size_label).detach(),
+            "prompt_acc_density": _acc(logits_density, density_label).detach(),
+            "prompt_acc_arrange": _acc(logits_arrange, arrange_label).detach(),
+            "prompt_acc_shape": _acc(logits_shape, shape_label).detach(),
+            "prompt_logits_size_norm": logits_size.detach().float().norm(dim=1).mean(),
+            "prompt_logits_density_norm": logits_density.detach().float().norm(dim=1).mean(),
+            "prompt_logits_arrange_norm": logits_arrange.detach().float().norm(dim=1).mean(),
+            "prompt_logits_shape_norm": logits_shape.detach().float().norm(dim=1).mean(),
+        }
+
+        if return_dict:
+            return total, loss_dict, diagnostics
+        return total
 
     def _balanced_focal_ce(
         self,

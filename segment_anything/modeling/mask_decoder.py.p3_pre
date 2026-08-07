@@ -342,16 +342,10 @@ class FreqPathASRBlock(nn.Module):
             "low_spatial_gate_mean": self._debug_zero_like(x_up),
             "low_spatial_gate_max": self._debug_zero_like(x_up),
             "low_delta_norm": self._debug_zero_like(x_up),
-            "low_spatial_sb_feature_norm": self._debug_zero_like(x_up),
-            "low_spatial_sb_delta_norm": self._debug_zero_like(x_up),
-            "low_spatial_sb_injected_ratio": self._debug_zero_like(x_up),
             "high_prompt_used": self._debug_zero_like(x_up),
             "high_gamma_norm": self._debug_zero_like(x_up),
             "high_gamma_abs_mean": self._debug_zero_like(x_up),
             "high_delta_norm": self._debug_zero_like(x_up),
-            "high_spatial_sb_feature_norm": self._debug_zero_like(x_up),
-            "high_spatial_sb_delta_norm": self._debug_zero_like(x_up),
-            "high_spatial_sb_injected_ratio": self._debug_zero_like(x_up),
             "cnn_projected_norm": self._debug_zero_like(x_up),
             "detail_norm": self._debug_zero_like(x_up),
             "scaled_detail_norm": self._debug_zero_like(x_up),
@@ -401,24 +395,17 @@ class FreqPathASRBlock(nn.Module):
                     f"delta_dtype={_sd.dtype} feature_dtype={x_up.dtype} "
                     f"delta_device={_sd.device} feature_device={x_up.device}"
                 )
-            if os.environ.get("SGA_SB_VERBOSE_DIAGNOSTICS", "0") == "1":
-                print(
-                    "[SGA_SB_SHAPE_AUDIT]\n"
-                    "branch=structure\n"
-                    f"structure_delta_shape={tuple(_sd.shape)}\n"
-                    f"low_feature_shape={tuple(x_up.shape)}\n"
-                    "channel_match=true\n"
-                    "spatial_match=true",
-                    flush=True,
-                )
-            _low_feature_norm = self._debug_norm(x_up)
-            _low_delta_norm = self._debug_norm(_sd)
-            debug["low_spatial_sb_feature_norm"] = _low_feature_norm
-            debug["low_spatial_sb_delta_norm"] = _low_delta_norm
-            debug["low_spatial_sb_injected_ratio"] = (
-                _low_delta_norm / _low_feature_norm.clamp_min(1.0e-12)
+            print(
+                "[SGA_SB_SHAPE_AUDIT]\n"
+                "branch=structure\n"
+                f"structure_delta_shape={tuple(_sd.shape)}\n"
+                f"low_feature_shape={tuple(x_up.shape)}\n"
+                "channel_match=true\n"
+                "spatial_match=true",
+                flush=True,
             )
             x_up = x_up + _sd
+            debug["low_spatial_sb_delta_norm"] = self._debug_norm(_sd)
 
         # 高频 CNN 边界/形态调制。
         if self.has_cnn and cnn_feat is not None:
@@ -460,24 +447,17 @@ class FreqPathASRBlock(nn.Module):
                         f"delta_dtype={_bd.dtype} feature_dtype={cnn_feat.dtype} "
                         f"delta_device={_bd.device} feature_device={cnn_feat.device}"
                     )
-                if os.environ.get("SGA_SB_VERBOSE_DIAGNOSTICS", "0") == "1":
-                    print(
-                        "[SGA_SB_SHAPE_AUDIT]\n"
-                        "branch=boundary\n"
-                        f"boundary_delta_shape={tuple(_bd.shape)}\n"
-                        f"high_feature_shape={tuple(cnn_feat.shape)}\n"
-                        "channel_match=true\n"
-                        "spatial_match=true",
-                        flush=True,
-                    )
-                _high_feature_norm = self._debug_norm(cnn_feat)
-                _high_delta_norm = self._debug_norm(_bd)
-                debug["high_spatial_sb_feature_norm"] = _high_feature_norm
-                debug["high_spatial_sb_delta_norm"] = _high_delta_norm
-                debug["high_spatial_sb_injected_ratio"] = (
-                    _high_delta_norm / _high_feature_norm.clamp_min(1.0e-12)
+                print(
+                    "[SGA_SB_SHAPE_AUDIT]\n"
+                    "branch=boundary\n"
+                    f"boundary_delta_shape={tuple(_bd.shape)}\n"
+                    f"high_feature_shape={tuple(cnn_feat.shape)}\n"
+                    "channel_match=true\n"
+                    "spatial_match=true",
+                    flush=True,
                 )
                 cnn_feat = cnn_feat + _bd
+                debug["high_spatial_sb_delta_norm"] = self._debug_norm(_bd)
 
             c = self.cnn_proj(cnn_feat)
 

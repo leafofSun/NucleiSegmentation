@@ -1,0 +1,1784 @@
+#!/usr/bin/env python3
+"""Two-real-batch SGA-SB graph/update audit.
+
+This is an audit driver, not a training entry point. It deliberately reuses the
+project's training parser, dataset/collate, model/checkpoint builder, stage
+policy, optimizer builder, segmentation helpers, and SGA-SB target/loss code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import gc
+import hashlib
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import random
+import sys
+import traceback
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+# When invoked as ``python tools/audit_sga_sb_p2.py``, Python otherwise places
+# only ``tools/`` on sys.path and cannot resolve the formal root-level train.py.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+DEFAULT_CHECKPOINT = "workdir/models/Visual_baseline/best_model.pth"
+EXPECTED_CHECKPOINT_SHA256 = "7321ee6652c53469d77e2e1af8c9d57e6772936ad12a2cea6a437c8421264f9c"
+EXPECTED_LEGACY_CLIP_KEY_COUNT = 641
+EXPECTED_LEGACY_PROMPT_LEARNER_KEYS = frozenset({
+    "prompt_learner.ctx_general",
+    "prompt_learner.ctx_specific",
+    "prompt_learner.physical_adapter.adapter_low.0.weight",
+    "prompt_learner.physical_adapter.adapter_low.0.bias",
+    "prompt_learner.physical_adapter.adapter_low.2.weight",
+    "prompt_learner.physical_adapter.adapter_low.2.bias",
+    "prompt_learner.physical_adapter.adapter_high.0.weight",
+    "prompt_learner.physical_adapter.adapter_high.0.bias",
+    "prompt_learner.physical_adapter.adapter_high.2.weight",
+    "prompt_learner.physical_adapter.adapter_high.2.bias",
+})
+EXPECTED_LEGACY_SEMANTIC_KEY_COUNT = 651
+KEY_AUDIT_ROOT = Path("workdir/audits/sga_sb_p2_20260713")
+SGA_PREFIXES = (
+    "spatial_structure_head.",
+    "spatial_boundary_head.",
+    "spatial_structure_adapter.",
+    "spatial_boundary_adapter.",
+    "gamma_structure",
+    "gamma_boundary",
+)
+EXPECTED_EMPTY_BUFFERS = {
+    "_structure_text_bank_buffer",
+    "_boundary_text_bank_buffer",
+}
+
+
+class AuditFailure(RuntimeError):
+    pass
+
+
+def build_cli() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Audit SGA-SB graph, gradients, and updates on at most two real training batches."
+    )
+    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--data_path", default="data/PanNuke")
+    parser.add_argument("--mode", choices=("none", "supervision_only", "guidance"), default="guidance")
+    parser.add_argument("--branch", choices=("structure", "boundary", "both"), default="both")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--max_batches", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--output_dir", default="workdir/audits/sga_sb_p2_20260713/results/manual")
+    parser.add_argument("--structure_loss_weight", type=float, default=0.1)
+    parser.add_argument("--boundary_loss_weight", type=float, default=0.1)
+    parser.add_argument("--summarize_root", default=None, help="Summarize completed case directories and exit.")
+    parser.add_argument("--summary_output", default=None)
+    parser.add_argument("--case", choices=("N0", "S1", "G1", "G2", "G3"), default=None)
+    parser.add_argument(
+        "--checkpoint-key-audit-only",
+        action="store_true",
+        help="Construct/load the model and audit checkpoint keys/tensors without data or forward.",
+    )
+    parser.add_argument(
+        "--constructor-smoke-only",
+        action="store_true",
+        help="Audit SGA-SB module/channel state and synthetic additions; no real forward/backward/step.",
+    )
+    parser.add_argument(
+        "--forward-only-smoke",
+        action="store_true",
+        help="Run exactly one real batch forward and stop before losses/backward/optimizer step.",
+    )
+    return parser
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def to_detached_float_tensor(value: Any) -> Any:
+    try:
+        import torch
+        if torch.is_tensor(value):
+            return value.detach().float()
+    except Exception:
+        pass
+    return value
+
+
+def tensor_scalar(value: Any, reduction: str = "norm", default: float = 0.0) -> float:
+    import torch
+
+    if value is None:
+        return float(default)
+    detached = to_detached_float_tensor(value)
+    if not torch.is_tensor(detached):
+        return float(detached)
+    if reduction == "norm":
+        reduced = detached.norm()
+    elif reduction == "abs_mean":
+        reduced = detached.abs().mean()
+    elif reduction == "abs_max":
+        reduced = detached.abs().max()
+    elif reduction == "mean":
+        reduced = detached.mean()
+    else:
+        raise ValueError(f"Unknown diagnostic reduction: {reduction}")
+    return float(reduced.cpu().item())
+
+
+def scalar(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return float(default)
+    try:
+        import torch
+        if torch.is_tensor(value):
+            return tensor_scalar(value, reduction="mean", default=default)
+    except Exception:
+        pass
+    return float(value)
+
+
+def finite_number(value: float) -> bool:
+    return math.isfinite(float(value))
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def append_jsonl(path: Path, data: Any) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def write_tsv(path: Path, rows: Sequence[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def summarize_cases(root: Path, output: Path) -> int:
+    case_rows = []
+    for audit_path in sorted(root.glob("*/audit.json")):
+        with audit_path.open("r", encoding="utf-8") as handle:
+            audit = json.load(handle)
+        summary = audit.get("summary", {})
+        case_rows.append({
+            "case": audit.get("case", audit_path.parent.name),
+            "loss_finite": summary.get("loss_finite", False),
+            "target_valid": summary.get("target_valid", False),
+            "active_optimizer_coverage": summary.get("active_optimizer_coverage", False),
+            "step1": summary.get("step_1_active_updates", "n/a"),
+            "step2": summary.get("step_2_active_updates", "n/a"),
+            "delta_f0": summary.get("delta_f0", 0.0),
+            "delta_f1": summary.get("delta_f1", 0.0),
+            "gamma_grad_f0": summary.get("gamma_grad_f0", 0.0),
+            "gamma_grad_f1": summary.get("gamma_grad_f1", 0.0),
+            "inactive_unchanged": summary.get("inactive_branch_unchanged", False),
+            "mask_diff": summary.get("mask_logits_guidance_diff", 0.0),
+            "result": audit.get("result", "MISSING"),
+        })
+    expected = {
+        "N0_none", "S1_supervision_both", "G1_guidance_structure",
+        "G2_guidance_boundary", "G3_guidance_both",
+    }
+    found = {row["case"] for row in case_rows}
+    lines = [
+        "# SGA-SB P2 Summary",
+        "",
+        "| case | loss finite | target valid | active optimizer coverage | step-1 active updates | step-2 active updates | delta F0 | delta F1 | gamma grad F0 | gamma grad F1 | inactive branch unchanged | mask logits guidance diff | result |",
+        "|---|---|---|---|---|---|---:|---:|---:|---:|---|---:|---|",
+    ]
+    for row in case_rows:
+        lines.append(
+            "| {case} | {loss_finite} | {target_valid} | {active_optimizer_coverage} | "
+            "{step1} | {step2} | {delta_f0:.6e} | {delta_f1:.6e} | "
+            "{gamma_grad_f0:.6e} | {gamma_grad_f1:.6e} | {inactive_unchanged} | "
+            "{mask_diff:.6e} | {result} |".format(**row)
+        )
+    missing = sorted(expected - found)
+    lines.extend(["", f"Completed cases: {len(found & expected)}/5.", f"Missing cases: {missing}."])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if missing or any(row["result"] != "PASS" for row in case_rows):
+        return 1
+    return 0
+
+
+def formal_train_defaults(formal: Any) -> Any:
+    saved_argv = sys.argv[:]
+    try:
+        sys.argv = ["train.py"]
+        return formal.parse_args()
+    finally:
+        sys.argv = saved_argv
+
+
+def configure_formal_args(formal: Any, cli: argparse.Namespace, device: Any) -> Any:
+    args = formal_train_defaults(formal)
+    args.phase = "vision"
+    args.device = device
+    args.seed = cli.seed
+    args.data_path = cli.data_path
+    args.knowledge_path = os.path.join(cli.data_path, "medical_knowledge.json")
+    args.batch_size = cli.batch_size
+    args.num_workers = cli.num_workers
+    args.image_size = 512
+    args.crop_size = 256
+    args.sam_checkpoint = cli.checkpoint
+    args.checkpoint = cli.checkpoint
+    args.model_type = "vit_b"
+    args.prompt_mode = "base"
+    args.eval_prompt_mode = "base"
+    args.encoder_adapter = True
+    args.use_asr = True
+    args.asr_variant = "freqpath"
+    args.asr_regression = False
+    args.asr_regression_stage = "finetune_decoder"
+    args.use_pnurl = False
+    args.use_coop = False
+    args.enable_conch_text_encoder = False
+    args.disable_conch_text_encoder = True
+    args.clip_text_encoder = False
+    args.enable_attr_text_alignment = False
+    args.disable_attr_text_alignment = True
+    args.enable_promptnu_guided_v3 = False
+    args.disable_promptnu_guided_v3 = True
+    args.enable_promptnu_lite_align = False
+    args.disable_promptnu_lite_align = True
+    args.enable_pnudp_dense_train = False
+    args.pnudp_dense_apply_in_eval = False
+    args.enable_numeric_attr_freqpath_guidance = False
+    args.enable_multilevel_attr_heads = False
+    args.enable_structure_boundary_attr_heads = False
+    args.sb_guidance_mode = "none"
+    args.spatial_instance_attr_mode = "none"
+    args.spatial_sb_mode = cli.mode
+    args.spatial_sb_branch = cli.branch
+    args.spatial_structure_loss_weight = cli.structure_loss_weight
+    args.spatial_boundary_loss_weight = cli.boundary_loss_weight
+    args.use_amp = False
+    args.lr = 1e-4
+    args.weight_decay = 1e-2
+    args.phase_b_lr_ratio = 1.0
+    return args
+
+
+def normalize_checkpoint_state(checkpoint: Any) -> Dict[str, Any]:
+    if isinstance(checkpoint, dict):
+        for key in ("model", "model_state_dict", "state_dict"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                checkpoint = value
+                break
+    if not isinstance(checkpoint, dict):
+        raise AuditFailure("Checkpoint does not contain a tensor state dictionary.")
+    # Match the canonical build_sam/train loaders exactly: unwrap only the
+    # top-level state container and never rename individual parameter keys.
+    # Broad per-key prefix stripping can silently turn a true unexpected key
+    # into an apparent intersection and is forbidden in this audit.
+    return dict(checkpoint)
+
+
+def infer_checkpoint_phase(checkpoint: Any) -> str:
+    if not isinstance(checkpoint, dict):
+        return "not_recorded"
+    for key in ("phase", "checkpoint_phase", "training_phase"):
+        value = checkpoint.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            return str(value)
+    for container_key in ("metadata", "meta", "config", "args"):
+        container = checkpoint.get(container_key)
+        if isinstance(container, dict):
+            for key in ("phase", "checkpoint_phase", "training_phase"):
+                value = container.get(key)
+                if isinstance(value, (str, int, float, bool)):
+                    return str(value)
+    return "not_recorded"
+
+
+def is_multilevel_attr_key(key: str) -> bool:
+    return key.startswith("multilevel_attr_heads.") or ".multilevel_attr_heads." in key
+
+
+def is_numeric_route_key(key: str) -> bool:
+    return key.startswith("numeric_attr_freqpath_proj.") or "numeric_attr_freqpath" in key.lower()
+
+
+def is_sga_key(key: str) -> bool:
+    return key.startswith(SGA_PREFIXES)
+
+
+def allowed_sga_prefixes(args: Any) -> Tuple[str, ...]:
+    if args.spatial_sb_mode == "none":
+        return ()
+    branches = ("structure", "boundary") if args.spatial_sb_branch == "both" else (args.spatial_sb_branch,)
+    allowed: List[str] = []
+    for branch in branches:
+        allowed.append(f"spatial_{branch}_head.")
+        if args.spatial_sb_mode == "guidance":
+            allowed.extend((f"spatial_{branch}_adapter.", f"gamma_{branch}"))
+    return tuple(allowed)
+
+
+def sga_key_is_allowed(key: str, allowed: Sequence[str]) -> bool:
+    return any(key.startswith(item) if item.endswith(".") else key == item for item in allowed)
+
+
+def prefix_histogram(keys: Sequence[str]) -> Dict[str, int]:
+    histogram: Dict[str, int] = {}
+    for key in keys:
+        parts = key.split(".")
+        bucket = key if len(parts) <= 2 else ".".join(parts[:2]) + ".*"
+        histogram[bucket] = histogram.get(bucket, 0) + 1
+    return dict(sorted(histogram.items()))
+
+
+def audit_parent_checkpoint(path: Path, checkpoint_hash: str, args: Any, logger: logging.Logger) -> Dict[str, Any]:
+    import torch
+
+    if checkpoint_hash != EXPECTED_CHECKPOINT_SHA256:
+        raise AuditFailure(
+            "Visual baseline checkpoint SHA-256 mismatch: "
+            f"expected={EXPECTED_CHECKPOINT_SHA256} actual={checkpoint_hash}"
+        )
+    raw_checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    state = normalize_checkpoint_state(raw_checkpoint)
+    legacy_clip_keys = sorted(key for key in state if key.startswith("clip_model."))
+    legacy_prompt_learner_keys = sorted(key for key in state if key.startswith("prompt_learner."))
+    multilevel_keys = sorted(key for key in state if is_multilevel_attr_key(key))
+    numeric_route_keys = sorted(key for key in state if is_numeric_route_key(key))
+    sga_keys = sorted(key for key in state if is_sga_key(key))
+    legacy_sb_enabled = bool(
+        args.enable_structure_boundary_attr_heads
+        or args.sb_guidance_mode != "none"
+        or args.spatial_instance_attr_mode != "none"
+    )
+    parent_audit = {
+        "checkpoint_path": str(path),
+        "checkpoint_sha256": checkpoint_hash,
+        "checkpoint_phase": infer_checkpoint_phase(raw_checkpoint),
+        "legacy_clip_key_count": len(legacy_clip_keys),
+        "legacy_prompt_learner_key_count": len(legacy_prompt_learner_keys),
+        "legacy_semantic_key_count": len(legacy_clip_keys) + len(legacy_prompt_learner_keys),
+        "multilevel_attr_key_count": len(multilevel_keys),
+        "numeric_route_key_count": len(numeric_route_keys),
+        "sga_sb_key_count": len(sga_keys),
+        "checkpoint_prefix_histogram": prefix_histogram(sorted(state)),
+        "model_enable_multilevel_attr_heads": bool(args.enable_multilevel_attr_heads),
+        "model_enable_legacy_sb_heads": legacy_sb_enabled,
+        "model_spatial_sb_mode": args.spatial_sb_mode,
+        "model_spatial_sb_branch": args.spatial_sb_branch,
+    }
+    if multilevel_keys or numeric_route_keys or sga_keys:
+        raise AuditFailure(
+            "Visual baseline parent contains forbidden historical route keys: "
+            f"multilevel={len(multilevel_keys)} numeric={len(numeric_route_keys)} sga={len(sga_keys)}"
+        )
+    if args.enable_multilevel_attr_heads:
+        raise AuditFailure("P2 requires model_enable_multilevel_attr_heads=false.")
+    if legacy_sb_enabled:
+        raise AuditFailure("P2 requires all legacy structure/boundary attribute paths disabled.")
+    return parent_audit
+
+
+def audit_checkpoint_load(
+    formal: Any,
+    model: Any,
+    path: Path,
+    args: Any,
+    logger: logging.Logger,
+    parent_audit: Dict[str, Any],
+    write_artifacts: bool,
+) -> Dict[str, Any]:
+    import torch
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    state = normalize_checkpoint_state(checkpoint)
+    initial_model_state = model.state_dict()
+    state = formal.resize_pos_embed(state, initial_model_state)
+    checkpoint_keys = set(state)
+    model_keys = set(initial_model_state)
+    intersection_keys = sorted(checkpoint_keys & model_keys)
+    missing_keys_by_set = sorted(model_keys - checkpoint_keys)
+    unexpected_keys_by_set = sorted(checkpoint_keys - model_keys)
+    shape_mismatch_keys = sorted(
+        key for key in intersection_keys
+        if hasattr(state[key], "shape") and tuple(state[key].shape) != tuple(initial_model_state[key].shape)
+    )
+    filtered, stats, mismatch_examples = formal.filter_checkpoint_state_dict_for_model(
+        state_dict=state,
+        model_state_dict=initial_model_state,
+        skip_prefixes=(),
+        filter_mismatch=True,
+    )
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    allowed_sga = allowed_sga_prefixes(args)
+    missing_sga_keys = sorted(key for key in missing if is_sga_key(key))
+    expected_sga = sorted(key for key in missing_sga_keys if sga_key_is_allowed(key, allowed_sga))
+    disallowed_sga_missing = sorted(set(missing_sga_keys) - set(expected_sga))
+    expected_buffers = sorted(
+        key for key in missing
+        if key in EXPECTED_EMPTY_BUFFERS and key in initial_model_state and initial_model_state[key].numel() == 0
+    )
+    non_sga_missing = sorted(key for key in missing if key not in set(expected_sga + expected_buffers))
+    learned_model_keys = set(dict(model.named_parameters()))
+    missing_non_sga_learned = sorted(key for key in non_sga_missing if key in learned_model_keys)
+    model_sga_state_keys = sorted(key for key in initial_model_state if is_sga_key(key))
+    disallowed_model_sga_keys = sorted(
+        key for key in model_sga_state_keys if not sga_key_is_allowed(key, allowed_sga)
+    )
+
+    model_clip_model_present = getattr(model, "clip_model", None) is not None
+    model_prompt_learner_present = getattr(model, "prompt_learner", None) is not None
+    model_multilevel_heads_present = any(is_multilevel_attr_key(key) for key in initial_model_state)
+    model_numeric_route_present = any(is_numeric_route_key(key) for key in initial_model_state)
+    inactive_text_configuration = bool(
+        not args.enable_conch_text_encoder
+        and not args.clip_text_encoder
+        and not args.use_pnurl
+        and not args.use_coop
+        and not args.enable_attr_text_alignment
+        and not args.enable_promptnu_guided_v3
+        and not args.enable_promptnu_lite_align
+        and not model_clip_model_present
+        and not model_prompt_learner_present
+    )
+    expected_legacy_clip = sorted(
+        key for key in unexpected_keys_by_set
+        if inactive_text_configuration and key.startswith("clip_model.")
+    )
+    expected_legacy_prompt_learner = sorted(
+        key for key in unexpected_keys_by_set
+        if inactive_text_configuration and key in EXPECTED_LEGACY_PROMPT_LEARNER_KEYS
+    )
+    expected_legacy_semantic = sorted(set(expected_legacy_clip + expected_legacy_prompt_learner))
+    missing_legacy_prompt_allowlist = sorted(
+        EXPECTED_LEGACY_PROMPT_LEARNER_KEYS - set(expected_legacy_prompt_learner)
+    )
+    unexpected_nonlegacy = sorted(set(unexpected_keys_by_set) - set(expected_legacy_semantic))
+    forbidden_prefixes = (
+        "image_encoder.", "mask_decoder.", "prompt_encoder.", "cnn_embed.",
+        "numeric_attr_freqpath_proj.", "multilevel_attr_heads.", "spatial_",
+        "pnurl.", "semantic_", "promptnu_", "pnudp_",
+    )
+    forbidden_unexpected = sorted(
+        key for key in unexpected_keys_by_set
+        if key.startswith(forbidden_prefixes)
+        or key.lower().startswith("freq")
+        or key.lower().startswith("asr")
+        or is_multilevel_attr_key(key)
+        or (key.startswith("prompt_learner.") and key not in EXPECTED_LEGACY_PROMPT_LEARNER_KEYS)
+        or key.startswith(("gamma_structure", "gamma_boundary"))
+    )
+
+    parent_with_model = {
+        **parent_audit,
+        "model_clip_model_present": model_clip_model_present,
+        "model_prompt_learner_present": model_prompt_learner_present,
+        "model_multilevel_heads_present": model_multilevel_heads_present,
+        "model_numeric_route_present": model_numeric_route_present,
+    }
+    if write_artifacts:
+        preload_result = {
+            "checkpoint_result": "PRELOAD_CLASSIFICATION_COMPLETE",
+            "checkpoint_sha256": parent_audit["checkpoint_sha256"],
+            "checkpoint_total_key_count": len(checkpoint_keys),
+            "model_total_key_count": len(model_keys),
+            "intersection_key_count": len(intersection_keys),
+            "missing_key_count": len(missing_keys_by_set),
+            "unexpected_key_count": len(unexpected_keys_by_set),
+            "expected_empty_buffer_missing_count": len(expected_buffers),
+            "expected_inactive_legacy_clip_key_count": len(expected_legacy_clip),
+            "expected_inactive_legacy_prompt_learner_key_count": len(expected_legacy_prompt_learner),
+            "expected_inactive_legacy_semantic_key_count": len(expected_legacy_semantic),
+            "legacy_clip_keys": expected_legacy_clip,
+            "legacy_prompt_learner_keys": expected_legacy_prompt_learner,
+            "missing_legacy_prompt_allowlist_keys": missing_legacy_prompt_allowlist,
+            "unexpected_nonlegacy_key_count": len(unexpected_nonlegacy),
+            "unexpected_nonlegacy_keys": unexpected_nonlegacy,
+            "missing_non_sga_learned_key_count": len(missing_non_sga_learned),
+            "missing_non_sga_learned_keys": missing_non_sga_learned,
+            "shape_mismatch_count": len(shape_mismatch_keys),
+            "shape_mismatch_keys": shape_mismatch_keys,
+            "unexpected_prefix_histogram": prefix_histogram(unexpected_keys_by_set),
+            "parent_audit": parent_with_model,
+            "filter_stats": stats,
+        }
+        write_json(KEY_AUDIT_ROOT / "P2_VISUAL_CHECKPOINT_KEY_AUDIT.json", preload_result)
+        (KEY_AUDIT_ROOT / "P2_VISUAL_CHECKPOINT_UNEXPECTED_KEYS.txt").write_text(
+            "\n".join(unexpected_keys_by_set) + "\n", encoding="utf-8"
+        )
+    logger.info("[P2_PARENT_AUDIT]")
+    for key in (
+        "checkpoint_path", "checkpoint_sha256", "legacy_clip_key_count",
+        "legacy_prompt_learner_key_count", "legacy_semantic_key_count",
+        "multilevel_attr_key_count", "numeric_route_key_count", "sga_sb_key_count",
+        "model_clip_model_present", "model_multilevel_heads_present",
+        "model_prompt_learner_present", "model_numeric_route_present",
+        "model_spatial_sb_mode", "model_spatial_sb_branch",
+    ):
+        value = parent_with_model[key]
+        logger.info("%s=%s", key, str(value).lower() if isinstance(value, bool) else value)
+
+    audit_failures: List[str] = []
+    if sorted(unexpected) != unexpected_keys_by_set:
+        audit_failures.append("load_state_dict unexpected-key result differs from full set audit")
+    if len(expected_legacy_clip) != EXPECTED_LEGACY_CLIP_KEY_COUNT:
+        audit_failures.append(
+            "Inactive legacy CLIP classification failed: "
+            f"expected={EXPECTED_LEGACY_CLIP_KEY_COUNT} classified={len(expected_legacy_clip)}"
+        )
+    if set(expected_legacy_prompt_learner) != EXPECTED_LEGACY_PROMPT_LEARNER_KEYS:
+        audit_failures.append(
+            "Inactive legacy prompt-learner exact allowlist mismatch: "
+            f"missing={missing_legacy_prompt_allowlist} classified={expected_legacy_prompt_learner}"
+        )
+    if len(expected_legacy_semantic) != EXPECTED_LEGACY_SEMANTIC_KEY_COUNT:
+        audit_failures.append(
+            "Inactive legacy semantic count mismatch: "
+            f"expected={EXPECTED_LEGACY_SEMANTIC_KEY_COUNT} classified={len(expected_legacy_semantic)}"
+        )
+    if not inactive_text_configuration:
+        audit_failures.append("Historical semantic keys require every text/semantic module to be disabled and absent.")
+    if unexpected_nonlegacy or forbidden_unexpected:
+        audit_failures.append(
+            f"Unexpected nonlegacy checkpoint keys: nonlegacy={unexpected_nonlegacy[:20]} "
+            f"forbidden={forbidden_unexpected[:20]}"
+        )
+    if non_sga_missing or missing_non_sga_learned:
+        audit_failures.append(
+            f"Unexpected non-SGA missing keys: keys={non_sga_missing[:20]} "
+            f"learned={missing_non_sga_learned[:20]}"
+        )
+    if disallowed_sga_missing or disallowed_model_sga_keys:
+        audit_failures.append(
+            "SGA-SB mode/branch initialization mismatch: "
+            f"disallowed_missing={disallowed_sga_missing[:20]} "
+            f"disallowed_model={disallowed_model_sga_keys[:20]}"
+        )
+    if shape_mismatch_keys or stats.get("skipped_mismatch", 0):
+        audit_failures.append(
+            f"Checkpoint/model shape mismatch: keys={shape_mismatch_keys[:20]} examples={mismatch_examples[:20]}"
+        )
+
+    formal.load_sam_checkpoint_with_asr_mapping(model, args=args, logger=logger, rank=0)
+    loaded_model_state = model.state_dict()
+    exact_equal_keys: List[str] = []
+    allclose_keys: List[str] = []
+    value_mismatch_keys: List[str] = []
+    core_shape_mismatch_keys: List[str] = []
+    core_value_mismatch_keys: List[str] = []
+    core_prefixes = (
+        "image_encoder.", "prompt_encoder.", "mask_decoder.", "cnn_embed.",
+        "cnn_stage", "global_asr_upsampler.", "image_adapter.",
+    )
+
+    def is_core_key(key: str) -> bool:
+        lowered = key.lower()
+        return (
+            key.startswith(core_prefixes)
+            or "freq" in lowered
+            or "asr" in lowered
+            or "image_adapter" in lowered
+        )
+
+    for key in intersection_keys:
+        source = state[key]
+        target = loaded_model_state[key]
+        if hasattr(source, "shape") and tuple(source.shape) != tuple(target.shape):
+            if is_core_key(key):
+                core_shape_mismatch_keys.append(key)
+            continue
+        if not torch.is_tensor(source) or not torch.is_tensor(target):
+            continue
+        source_cast = source.detach().to(device=target.device, dtype=target.dtype)
+        target_detached = target.detach()
+        if torch.equal(source_cast, target_detached):
+            exact_equal_keys.append(key)
+        elif (source_cast.is_floating_point() or source_cast.is_complex()) and torch.allclose(
+            source_cast, target_detached, rtol=1e-6, atol=1e-7, equal_nan=True
+        ):
+            allclose_keys.append(key)
+        else:
+            value_mismatch_keys.append(key)
+            if is_core_key(key):
+                core_value_mismatch_keys.append(key)
+
+    core_exact_equal_keys = [key for key in exact_equal_keys if is_core_key(key)]
+    core_allclose_keys = [key for key in allclose_keys if is_core_key(key)]
+
+    result = {
+        "checkpoint_sha256": parent_audit["checkpoint_sha256"],
+        "checkpoint_total_key_count": len(checkpoint_keys),
+        "model_total_key_count": len(model_keys),
+        "intersection_key_count": len(intersection_keys),
+        "missing_key_count": len(missing_keys_by_set),
+        "missing_keys": sorted(missing),
+        "unexpected_key_count": len(unexpected_keys_by_set),
+        "expected_empty_buffer_missing_count": len(expected_buffers),
+        "expected_empty_buffer_missing": expected_buffers,
+        "expected_new_sga_sb_initialization_count": len(expected_sga),
+        "expected_new_sga_sb_initialization": expected_sga,
+        "allowed_sga_sb_prefixes": list(allowed_sga),
+        "disallowed_sga_sb_missing_keys": disallowed_sga_missing,
+        "expected_inactive_legacy_clip_key_count": len(expected_legacy_clip),
+        "expected_inactive_legacy_prompt_learner_key_count": len(expected_legacy_prompt_learner),
+        "expected_inactive_legacy_semantic_key_count": len(expected_legacy_semantic),
+        "legacy_clip_keys": expected_legacy_clip,
+        "legacy_prompt_learner_keys": expected_legacy_prompt_learner,
+        "missing_legacy_prompt_allowlist_keys": missing_legacy_prompt_allowlist,
+        "unexpected_nonlegacy_key_count": len(unexpected_nonlegacy),
+        "unexpected_nonlegacy_keys": unexpected_nonlegacy,
+        "missing_non_sga_learned_key_count": len(missing_non_sga_learned),
+        "missing_non_sga_learned_keys": missing_non_sga_learned,
+        "shape_mismatch_count": len(shape_mismatch_keys),
+        "shape_mismatch_keys": shape_mismatch_keys,
+        "exact_equal_count": len(exact_equal_keys),
+        "allclose_count": len(allclose_keys),
+        "value_mismatch_count": len(value_mismatch_keys),
+        "value_mismatch_keys": value_mismatch_keys,
+        "core_shape_mismatch_count": len(core_shape_mismatch_keys),
+        "core_shape_mismatch_keys": core_shape_mismatch_keys,
+        "core_value_mismatch_count": len(core_value_mismatch_keys),
+        "core_value_mismatch_keys": core_value_mismatch_keys,
+        "core_tensor_audit": {
+            "exact_equal_count": len(core_exact_equal_keys),
+            "allclose_count": len(core_allclose_keys),
+            "shape_mismatch_count": len(core_shape_mismatch_keys),
+            "value_mismatch_count": len(core_value_mismatch_keys),
+            "shape_mismatch_keys": core_shape_mismatch_keys,
+            "value_mismatch_keys": core_value_mismatch_keys,
+            "allclose_rtol": 1e-6,
+            "allclose_atol": 1e-7,
+        },
+        "allclose_rtol": 1e-6,
+        "allclose_atol": 1e-7,
+        "unexpected_prefix_histogram": prefix_histogram(unexpected_keys_by_set),
+        "parent_audit": parent_with_model,
+        "filter_stats": stats,
+        "checkpoint_result": "PASS",
+        "failures": audit_failures,
+    }
+    if len(expected_buffers) != len(EXPECTED_EMPTY_BUFFERS):
+        audit_failures.append(
+            "Expected exactly two zero-length text-bank compatibility omissions: "
+            f"found={expected_buffers}"
+        )
+    if args.spatial_sb_mode == "none" and model_sga_state_keys:
+        audit_failures.append(f"N0 model unexpectedly contains SGA-SB state keys: {model_sga_state_keys[:20]}")
+    if value_mismatch_keys or core_shape_mismatch_keys or core_value_mismatch_keys:
+        audit_failures.append(
+            f"Loaded tensor equality audit failed: value={value_mismatch_keys[:20]} "
+            f"core_shape={core_shape_mismatch_keys[:20]} core_value={core_value_mismatch_keys[:20]}"
+        )
+    result["checkpoint_result"] = "FAIL" if audit_failures else "PASS"
+    result["failures"] = audit_failures
+    if write_artifacts:
+        write_json(KEY_AUDIT_ROOT / "P2_VISUAL_CHECKPOINT_KEY_AUDIT.json", result)
+        (KEY_AUDIT_ROOT / "P2_VISUAL_CHECKPOINT_UNEXPECTED_KEYS.txt").write_text(
+            "\n".join(unexpected_keys_by_set) + "\n", encoding="utf-8"
+        )
+
+    del checkpoint, state, initial_model_state, filtered, loaded_model_state
+    del source, target, source_cast, target_detached
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logger.info("[P2_CHECKPOINT_AUDIT]")
+    summary_fields = {
+        "checkpoint_sha256": result["checkpoint_sha256"],
+        "missing_learned_keys": result["missing_non_sga_learned_key_count"],
+        "expected_empty_buffer_missing": result["expected_empty_buffer_missing_count"],
+        "unexpected_total": result["unexpected_key_count"],
+        "legacy_clip_keys": result["expected_inactive_legacy_clip_key_count"],
+        "legacy_prompt_learner_keys": result["expected_inactive_legacy_prompt_learner_key_count"],
+        "expected_inactive_legacy_semantic_keys": result["expected_inactive_legacy_semantic_key_count"],
+        "unexpected_nonlegacy_keys": result["unexpected_nonlegacy_key_count"],
+        "core_shape_mismatch_count": result["core_shape_mismatch_count"],
+        "core_value_mismatch_count": result["core_value_mismatch_count"],
+        "checkpoint_result": result["checkpoint_result"],
+    }
+    for key, value in summary_fields.items():
+        logger.info("%s=%s", key, value)
+    if audit_failures:
+        raise AuditFailure("; ".join(audit_failures))
+    return result
+
+
+def build_model_input(batch: Dict[str, Any], args: Any) -> List[Dict[str, Any]]:
+    import torch
+    images = batch["image"]
+    organ_ids = batch.get("organ_id")
+    text_prompts = batch.get("text_prompt", ["Cell nuclei"] * len(images))
+    attribute_texts = batch.get("attribute_text", ["Cell nuclei"] * len(images))
+    attr_labels = batch.get("attr_labels")
+    label_inst = batch.get("label_inst")
+    items = []
+    for index in range(len(images)):
+        organ = 20
+        if organ_ids is not None:
+            value = organ_ids[index]
+            organ = int(value.item()) if torch.is_tensor(value) else int(value)
+        item = {
+            "image": images[index],
+            "original_size": (args.image_size, args.image_size),
+            "organ_id": organ,
+            "text_prompt": text_prompts[index],
+            "attribute_text": attribute_texts[index],
+            "attr_labels": attr_labels[index] if attr_labels is not None else None,
+        }
+        if label_inst is not None:
+            item["label_inst"] = label_inst[index]
+        items.append(item)
+    return items
+
+
+def eval_safe_input(model_input: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    safe = []
+    for item in model_input:
+        clean = {key: value for key, value in item.items() if key not in {
+            "label_inst", "structure_target", "boundary_target",
+        }}
+        safe.append(clean)
+    return safe
+
+
+def stack_optional(outputs: Sequence[Dict[str, Any]], key: str) -> Optional[Any]:
+    import torch
+    values = [output.get(key) for output in outputs]
+    if not values or any(value is None for value in values):
+        return None
+    normalized = []
+    for value in values:
+        if value.ndim == 4 and value.shape[0] == 1:
+            value = value.squeeze(0)
+        normalized.append(value)
+    return torch.stack(normalized, dim=0)
+
+
+def tensor_stats(tensor: Any, binary: bool = False) -> Dict[str, Any]:
+    import torch
+    data = tensor.detach().float()
+    result = {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "min": float(data.min().item()),
+        "max": float(data.max().item()),
+        "mean": float(data.mean().item()),
+        "std": float(data.std(unbiased=False).item()),
+        "finite_ratio": float(torch.isfinite(data).float().mean().item()),
+    }
+    if binary:
+        result["unique_values"] = [float(value) for value in torch.unique(data).cpu().tolist()]
+        result["positive_ratio"] = float((data > 0).float().mean().item())
+    return result
+
+
+def make_targets(formal_targets: Any, label_inst: Any, outputs: Sequence[Dict[str, Any]], mode: str, branch: str) -> Dict[str, Any]:
+    import torch
+    if mode == "none":
+        return {"structure_target": None, "boundary_target": None, "stats": {}}
+    label_inst = label_inst.to(dtype=torch.float32)
+    structure_logits = stack_optional(outputs, "structure_logits")
+    boundary_logits = stack_optional(outputs, "boundary_logits")
+    use_structure = branch in ("structure", "both")
+    use_boundary = branch in ("boundary", "both")
+    structure_target = None
+    boundary_target = None
+    stats = {}
+    if use_structure:
+        if structure_logits is None:
+            raise AuditFailure("Active structure branch returned no structure logits.")
+        target_size = tuple(structure_logits.shape[-2:])
+        if torch.count_nonzero(label_inst).item() == 0:
+            structure_target = torch.zeros(
+                (label_inst.shape[0], 1, *target_size),
+                device=label_inst.device,
+                dtype=torch.float32,
+            )
+        else:
+            structure_target = formal_targets.generate_structure_target(
+                label_inst, kernel_size=31, target_size=target_size
+            ).to(device=structure_logits.device, dtype=torch.float32)
+        stats["structure"] = tensor_stats(structure_target)
+        if structure_target.shape != structure_logits.shape:
+            raise AuditFailure(f"Structure target/logit mismatch: {structure_target.shape} vs {structure_logits.shape}")
+        if stats["structure"]["finite_ratio"] != 1.0 or stats["structure"]["min"] < 0 or stats["structure"]["max"] > 1:
+            raise AuditFailure("Structure target is non-finite or outside [0,1].")
+    if use_boundary:
+        if boundary_logits is None:
+            raise AuditFailure("Active boundary branch returned no boundary logits.")
+        target_size = tuple(boundary_logits.shape[-2:])
+        boundary_target = formal_targets.generate_boundary_target(
+            label_inst, kernel_size=3, target_size=target_size
+        ).to(device=boundary_logits.device, dtype=torch.float32)
+        stats["boundary"] = tensor_stats(boundary_target, binary=True)
+        if boundary_target.shape != boundary_logits.shape:
+            raise AuditFailure(f"Boundary target/logit mismatch: {boundary_target.shape} vs {boundary_logits.shape}")
+        if stats["boundary"]["finite_ratio"] != 1.0 or not set(stats["boundary"]["unique_values"]).issubset({0.0, 1.0}):
+            raise AuditFailure("Boundary target is non-finite or non-binary.")
+    return {"structure_target": structure_target, "boundary_target": boundary_target, "stats": stats}
+
+
+def compute_losses(
+    formal: Any,
+    formal_targets: Any,
+    criterion: Any,
+    outputs: Sequence[Dict[str, Any]],
+    batch: Dict[str, Any],
+    targets: Dict[str, Any],
+    args: Any,
+    include_spatial: bool = True,
+) -> Dict[str, Any]:
+    import torch
+    sample_seg = []
+    sample_structure = []
+    sample_boundary = []
+    labels = batch["label"]
+    for index, output in enumerate(outputs):
+        pred_mask, pred_iou, gt_mask = formal._get_best_mask_and_iou(output, labels[index])
+        mask_loss = formal._compute_mask_loss(criterion, pred_mask, pred_iou, gt_mask)
+        heatmap_loss = formal._compute_heatmap_loss(output, labels[index])
+        hv_loss = formal._compute_hv_loss(output, labels[index], batch, index)
+        sample_seg.append(
+            args.mask_weight * mask_loss
+            + args.heatmap_weight * heatmap_loss
+            + args.hv_weight * hv_loss
+        )
+        structure_loss = torch.zeros((), device=args.device)
+        boundary_loss = torch.zeros((), device=args.device)
+        if include_spatial and targets["structure_target"] is not None:
+            logits = output["structure_logits"].unsqueeze(0)
+            structure_loss = formal_targets.compute_structure_loss(
+                logits, targets["structure_target"][index:index + 1]
+            )
+        if include_spatial and targets["boundary_target"] is not None:
+            logits = output["boundary_logits"].unsqueeze(0)
+            boundary_loss = formal_targets.compute_boundary_loss(
+                logits, targets["boundary_target"][index:index + 1]
+            )
+        sample_structure.append(structure_loss)
+        sample_boundary.append(boundary_loss)
+    segmentation = torch.stack(sample_seg).mean()
+    structure_raw = torch.stack(sample_structure).mean()
+    boundary_raw = torch.stack(sample_boundary).mean()
+    weighted_structure = structure_raw * float(args.spatial_structure_loss_weight)
+    weighted_boundary = boundary_raw * float(args.spatial_boundary_loss_weight)
+    spatial_total = weighted_structure + weighted_boundary
+    total = segmentation + spatial_total
+    for name, value in {
+        "segmentation_loss": segmentation,
+        "structure_raw_loss": structure_raw,
+        "boundary_raw_loss": boundary_raw,
+        "weighted_structure_loss": weighted_structure,
+        "weighted_boundary_loss": weighted_boundary,
+        "spatial_sb_total_loss": spatial_total,
+        "total_loss": total,
+    }.items():
+        if not torch.isfinite(value).all():
+            raise AuditFailure(f"{name} is NaN/Inf")
+    equality_error = abs(float((total - (segmentation + weighted_structure + weighted_boundary)).detach().item()))
+    if equality_error > 1e-6:
+        raise AuditFailure(f"Total-loss accounting mismatch: {equality_error}")
+    return {
+        "segmentation_tensor": segmentation,
+        "total_tensor": total,
+        "metrics": {
+            "segmentation_loss": scalar(segmentation),
+            "structure_raw_loss": scalar(structure_raw),
+            "boundary_raw_loss": scalar(boundary_raw),
+            "weighted_structure_loss": scalar(weighted_structure),
+            "weighted_boundary_loss": scalar(weighted_boundary),
+            "spatial_sb_total_loss": scalar(spatial_total),
+            "total_loss": scalar(total),
+            "loss_accounting_abs_error": equality_error,
+        },
+    }
+
+
+def parameter_group(name: str) -> str:
+    if name.startswith("spatial_structure_head."):
+        return "structure_head_output" if ".conv_out." in name else "structure_head_upstream"
+    if name.startswith("spatial_boundary_head."):
+        return "boundary_head_output" if ".conv_out." in name else "boundary_head_upstream"
+    if name.startswith("spatial_structure_adapter."):
+        return "structure_adapter_output" if ".net.3." in name else "structure_adapter_upstream"
+    if name.startswith("spatial_boundary_adapter."):
+        return "boundary_adapter_output" if ".net.3." in name else "boundary_adapter_upstream"
+    if name == "gamma_structure":
+        return "gamma_structure"
+    if name == "gamma_boundary":
+        return "gamma_boundary"
+    return "other"
+
+
+def sga_named_parameters(model: Any) -> List[Tuple[str, Any]]:
+    return [(name, param) for name, param in model.named_parameters() if name.startswith(SGA_PREFIXES)]
+
+
+def clone_params(named_params: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
+    return {name: param.detach().float().cpu().clone() for name, param in named_params}
+
+
+def optimizer_name_map(optimizer: Any) -> Dict[int, str]:
+    return {
+        id(param): group.get("name", "unnamed")
+        for group in optimizer.param_groups
+        for param in group["params"]
+    }
+
+
+def grad_norm(param: Any) -> Optional[float]:
+    if param.grad is None:
+        return None
+    return tensor_scalar(param.grad, reduction="norm")
+
+
+def aggregate_gradients(named_params: Sequence[Tuple[str, Any]], probe: str, batch_index: int) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Any]] = {}
+    for name, param in named_params:
+        grouped.setdefault(parameter_group(name), []).append(param)
+    rows = []
+    for group, params in sorted(grouped.items()):
+        squared = 0.0
+        present = 0
+        finite = True
+        for param in params:
+            if param.grad is None:
+                continue
+            present += 1
+            grad = param.grad.detach().float()
+            finite = finite and bool(grad.isfinite().all().item())
+            squared += float((grad * grad).sum().item())
+        rows.append({
+            "batch_index": batch_index,
+            "probe": probe,
+            "module_group": group,
+            "parameter_tensors": len(params),
+            "gradient_tensors_present": present,
+            "gradient_norm": math.sqrt(squared),
+            "finite": finite,
+        })
+    return rows
+
+
+def record_updates(named_params: Sequence[Tuple[str, Any]], before: Dict[str, Any], optimizer_names: Dict[int, str], batch_index: int, probe_grads: Dict[str, Optional[float]]) -> List[Dict[str, Any]]:
+    import torch
+    rows = []
+    for name, param in named_params:
+        prior = before[name].float()
+        after = param.detach().cpu().float()
+        delta = after - prior
+        before_norm = float(prior.norm().item())
+        after_norm = float(after.norm().item())
+        abs_delta_tensor = delta.detach().abs()
+        abs_delta = float(abs_delta_tensor.sum().item())
+        max_delta = float(abs_delta_tensor.max().item()) if abs_delta_tensor.numel() else 0.0
+        l2_delta = float(delta.detach().norm().item())
+        rows.append({
+            "batch_index": batch_index,
+            "state_after": f"F{batch_index + 1}",
+            "parameter_name": name,
+            "module_group": parameter_group(name),
+            "requires_grad": bool(param.requires_grad),
+            "optimizer_group": optimizer_names.get(id(param), "MISSING"),
+            "parameter_norm_before": before_norm,
+            "segmentation_probe_gradient_norm": probe_grads.get(name),
+            "total_gradient_norm": grad_norm(param),
+            "parameter_norm_after": after_norm,
+            "absolute_step_delta": abs_delta,
+            "max_step_delta": max_delta,
+            "l2_step_delta": l2_delta,
+            "relative_step_delta": l2_delta / max(before_norm, 1e-12),
+            "finite": bool(torch.isfinite(after).all().item()) and bool(torch.isfinite(delta).all().item()),
+        })
+        del after, delta, abs_delta_tensor
+    return rows
+
+
+def forward_metrics(outputs: Sequence[Dict[str, Any]], state: str) -> Dict[str, Any]:
+    def tensor_moments(key: str) -> Tuple[float, float, float]:
+        count = 0
+        total = 0.0
+        squared = 0.0
+        for output in outputs:
+            value = output.get(key)
+            if value is None:
+                continue
+            data = value.detach().float()
+            count += data.numel()
+            total += float(data.sum().item())
+            squared += float((data * data).sum().item())
+            del data
+        if count == 0:
+            return 0.0, 0.0, 0.0
+        mean = total / count
+        std = math.sqrt(max(squared / count - mean * mean, 0.0))
+        return mean, std, math.sqrt(max(squared, 0.0))
+
+    structure_mean, structure_std, _ = tensor_moments("structure_guidance_map")
+    boundary_mean, boundary_std, _ = tensor_moments("boundary_guidance_map")
+    _, _, structure_delta_norm = tensor_moments("structure_delta")
+    _, _, boundary_delta_norm = tensor_moments("boundary_delta")
+    _, _, mask_norm = tensor_moments("masks")
+    diagnostics = outputs[0].get("diagnostics", {}) if outputs else {}
+    result = {
+        "state": state,
+        "structure_probability_mean": structure_mean,
+        "structure_probability_std": structure_std,
+        "boundary_probability_mean": boundary_mean,
+        "boundary_probability_std": boundary_std,
+        "structure_delta_norm": structure_delta_norm,
+        "boundary_delta_norm": boundary_delta_norm,
+        "mask_logits_norm": mask_norm,
+    }
+    for key in (
+        "freqpath_b1_structure_norm", "freqpath_b1_output_norm", "freqpath_b1_cnn_projected_norm",
+        "freqpath_b2_structure_norm", "freqpath_b2_output_norm", "freqpath_b2_cnn_projected_norm",
+        "freqpath_b1_low_spatial_sb_delta_norm", "freqpath_b1_high_spatial_sb_delta_norm",
+        "freqpath_b2_low_spatial_sb_delta_norm", "freqpath_b2_high_spatial_sb_delta_norm",
+    ):
+        result[key] = scalar(diagnostics.get(key), 0.0)
+    return result
+
+
+def guidance_comparison(
+    model: Any,
+    model_input: Sequence[Dict[str, Any]],
+    logger: logging.Logger,
+    memory_records: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    import torch
+
+    was_training = model.training
+    safe_input = eval_safe_input(model_input)
+    gammas: Dict[str, float] = {}
+    for name in ("gamma_structure", "gamma_boundary"):
+        param = getattr(model, name, None)
+        if param is not None:
+            gammas[name] = float(param.detach().float().cpu().item())
+    try:
+        model.eval()
+        log_cuda_memory("before_guidance_comparison", logger, memory_records)
+        with torch.inference_mode():
+            for name in gammas:
+                getattr(model, name).zero_()
+            no_guidance = model(safe_input, multimask_output=True)
+            metrics_zero = forward_metrics(no_guidance, "F2_gamma_zero_eval")
+            zero_masks = torch.cat(
+                [item["masks"].detach().float().cpu().reshape(-1) for item in no_guidance]
+            )
+            del no_guidance
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            for name, value in gammas.items():
+                getattr(model, name).fill_(value)
+            active = model(safe_input, multimask_output=True)
+            metrics_active = forward_metrics(active, "F2_gamma_active_eval")
+            active_masks = torch.cat(
+                [item["masks"].detach().float().cpu().reshape(-1) for item in active]
+            )
+            del active
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            difference = (active_masks - zero_masks).abs()
+            result = {
+                "mask_logits_abs_diff_mean": float(difference.mean().item()),
+                "mask_logits_abs_diff_max": float(difference.max().item()),
+                "mask_logits_relative_diff": float(
+                    difference.norm().item() / max(zero_masks.norm().item(), 1e-12)
+                ),
+                "low_feature_norm_before": metrics_zero["freqpath_b1_output_norm"],
+                "low_feature_norm_after": metrics_active["freqpath_b1_output_norm"],
+                "high_feature_norm_before": metrics_zero["freqpath_b1_cnn_projected_norm"],
+                "high_feature_norm_after": metrics_active["freqpath_b1_cnn_projected_norm"],
+                "gamma_zero_metrics": metrics_zero,
+                "gamma_active_metrics": metrics_active,
+            }
+            del active_masks, zero_masks, difference
+            gc.collect()
+            torch.cuda.empty_cache()
+            log_cuda_memory("after_guidance_comparison", logger, memory_records)
+    finally:
+        with torch.inference_mode():
+            for name, value in gammas.items():
+                getattr(model, name).fill_(value)
+        model.train(was_training)
+        del safe_input
+    return result
+
+
+def synthetic_empty_case(formal_targets: Any, device: Any, use_structure: bool, use_boundary: bool) -> Dict[str, Any]:
+    import torch
+    empty = torch.zeros((1, 1, 512, 512), device=device, dtype=torch.float32)
+    logits = torch.zeros((1, 1, 32, 32), device=device, dtype=torch.float32)
+    structure_target = torch.zeros_like(logits)
+    boundary_target = formal_targets.generate_boundary_target(empty, kernel_size=3, target_size=(32, 32))
+    structure_loss = formal_targets.compute_structure_loss(logits, structure_target) if use_structure else torch.zeros((), device=device)
+    boundary_loss = formal_targets.compute_boundary_loss(logits, boundary_target) if use_boundary else torch.zeros((), device=device)
+    return {
+        "executed": True,
+        "structure_loss": scalar(structure_loss),
+        "boundary_loss": scalar(boundary_loss),
+        "finite": bool(torch.isfinite(structure_loss + boundary_loss).all().item()),
+        "note": "Structure zero target follows the formal train.py all-empty bypass; loss functions are project originals.",
+    }
+
+
+def apply_case_selector(cli: argparse.Namespace) -> None:
+    if cli.case is None:
+        return
+    mapping = {
+        "N0": ("none", "both"),
+        "S1": ("supervision_only", "both"),
+        "G1": ("guidance", "structure"),
+        "G2": ("guidance", "boundary"),
+        "G3": ("guidance", "both"),
+    }
+    cli.mode, cli.branch = mapping[cli.case]
+
+
+def log_cuda_memory(stage: str, logger: logging.Logger, records: List[Dict[str, Any]]) -> None:
+    import torch
+
+    if not torch.cuda.is_available():
+        record = {"stage": stage, "cuda_available": False}
+    else:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        to_mb = 1.0 / (1024.0 * 1024.0)
+        record = {
+            "stage": stage,
+            "cuda_available": True,
+            "allocated_mb": torch.cuda.memory_allocated() * to_mb,
+            "reserved_mb": torch.cuda.memory_reserved() * to_mb,
+            "max_allocated_mb": torch.cuda.max_memory_allocated() * to_mb,
+            "max_reserved_mb": torch.cuda.max_memory_reserved() * to_mb,
+            "free_mb": free_bytes * to_mb,
+            "total_mb": total_bytes * to_mb,
+        }
+    records.append(record)
+    logger.info("[CUDA_MEMORY] %s", json.dumps(record, sort_keys=True))
+
+
+def validate_cli(cli: argparse.Namespace) -> None:
+    if cli.max_batches < 1 or cli.max_batches > 2:
+        raise AuditFailure("--max_batches must be 1 or 2.")
+    if cli.batch_size < 1:
+        raise AuditFailure("--batch_size must be positive.")
+    if cli.num_workers < 0:
+        raise AuditFailure("--num_workers must be non-negative.")
+    if cli.mode != "none" and not cli.forward_only_smoke and cli.max_batches != 2:
+        raise AuditFailure("Active SGA-SB zero-init audit requires exactly two batches.")
+    if cli.forward_only_smoke and cli.max_batches != 1:
+        raise AuditFailure("--forward-only-smoke requires --max_batches 1.")
+    if Path(cli.checkpoint).as_posix() != Path(DEFAULT_CHECKPOINT).as_posix():
+        raise AuditFailure(f"P2 requires the fixed parent checkpoint: {DEFAULT_CHECKPOINT}")
+
+
+def run_case(cli: argparse.Namespace) -> int:
+    apply_case_selector(cli)
+    if cli.checkpoint_key_audit_only:
+        cli.mode = "none"
+        cli.branch = "both"
+        cli.output_dir = str(KEY_AUDIT_ROOT / "checkpoint_key_only")
+    validate_cli(cli)
+    output_dir = Path(cli.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    batch_jsonl = output_dir / "batch_metrics.jsonl"
+    if batch_jsonl.exists():
+        batch_jsonl.unlink()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logger = logging.getLogger("sga_sb_p2")
+    audit: Dict[str, Any] = {
+        "case": output_dir.name,
+        "mode": cli.mode,
+        "branch": cli.branch,
+        "result": "RUNNING",
+        "failures": [],
+    }
+    parameter_rows: List[Dict[str, Any]] = []
+    gradient_rows: List[Dict[str, Any]] = []
+    memory_records: List[Dict[str, Any]] = []
+    current_stage = "initialization"
+    try:
+        import numpy as np
+        import torch
+        import train as formal
+        from segment_anything import sam_model_registry
+
+        if not torch.cuda.is_available() and str(cli.device).startswith("cuda"):
+            raise AuditFailure(f"CUDA device requested but unavailable: {cli.device}")
+        device = torch.device(cli.device)
+        checkpoint = Path(cli.checkpoint)
+        if not checkpoint.is_file():
+            raise AuditFailure(f"Fixed checkpoint does not exist: {checkpoint}")
+        os.environ["FREQPATH_ABLATION"] = "both"
+        os.environ["FREQPATH_AUDIT_ENABLED"] = "1"
+        os.environ["PNURL_AUDIT_ENABLED"] = "0"
+        random.seed(cli.seed)
+        np.random.seed(cli.seed)
+        torch.manual_seed(cli.seed)
+        torch.cuda.manual_seed_all(cli.seed)
+        torch.cuda.reset_peak_memory_stats()
+        args = configure_formal_args(formal, cli, device)
+        checkpoint_hash = sha256_file(checkpoint)
+        logger.info("checkpoint=%s", checkpoint)
+        logger.info("checkpoint_sha256=%s", checkpoint_hash)
+        audit["checkpoint"] = str(checkpoint)
+        audit["checkpoint_sha256"] = checkpoint_hash
+        parent_audit = audit_parent_checkpoint(checkpoint, checkpoint_hash, args, logger)
+        audit["parent_audit"] = parent_audit
+        audit["fixed_features"] = {
+            "enable_numeric_attr_freqpath_guidance": False,
+            "use_pnurl": False,
+            "enable_conch_text_encoder": False,
+            "clip_text_encoder": False,
+            "enable_attr_text_alignment": False,
+            "enable_promptnu_guided_v3": False,
+            "enable_promptnu_lite_align": False,
+            "enable_pnudp_dense_train": False,
+            "enable_multilevel_attr_heads": False,
+            "enable_structure_boundary_attr_heads": False,
+            "dataset_use_structure_boundary_attrs": False,
+            "spatial_instance_attr_mode": "none", "use_asr": True,
+            "asr_variant": "freqpath", "FREQPATH_ABLATION": "both",
+        }
+
+        current_stage = "before_model_build"
+        log_cuda_memory(current_stage, logger, memory_records)
+        current_stage = "model_build"
+        model = sam_model_registry[args.model_type](args)
+        current_stage = "checkpoint_load"
+        checkpoint_audit = audit_checkpoint_load(
+            formal,
+            model,
+            checkpoint,
+            args,
+            logger,
+            parent_audit=parent_audit,
+            write_artifacts=cli.checkpoint_key_audit_only or cli.mode == "none",
+        )
+        current_stage = "after_checkpoint_load"
+        log_cuda_memory(current_stage, logger, memory_records)
+        audit["checkpoint_load"] = checkpoint_audit
+        gc.collect()
+        torch.cuda.empty_cache()
+        current_stage = "after_checkpoint_cleanup"
+        log_cuda_memory(current_stage, logger, memory_records)
+        if cli.checkpoint_key_audit_only:
+            audit.update({
+                "result": "PASS",
+                "checkpoint_key_audit_only": True,
+                "forward_executed": False,
+                "backward_executed": False,
+                "optimizer_step_executed": False,
+            })
+            return 0
+
+        if cli.constructor_smoke_only:
+            selected_structure = cli.branch in ("structure", "both")
+            selected_boundary = cli.branch in ("boundary", "both")
+            structure_head = getattr(model, "spatial_structure_head", None)
+            boundary_head = getattr(model, "spatial_boundary_head", None)
+            structure_adapter = getattr(model, "spatial_structure_adapter", None)
+            boundary_adapter = getattr(model, "spatial_boundary_adapter", None)
+            gamma_structure = getattr(model, "gamma_structure", None)
+            gamma_boundary = getattr(model, "gamma_boundary", None)
+            if cli.mode == "none":
+                if any(value is not None for value in (
+                    structure_head, boundary_head, structure_adapter, boundary_adapter,
+                    gamma_structure, gamma_boundary,
+                )):
+                    raise AuditFailure("mode=none created SGA-SB state.")
+            elif cli.mode == "supervision_only":
+                if (structure_head is not None) != selected_structure or (boundary_head is not None) != selected_boundary:
+                    raise AuditFailure("supervision_only head selection mismatch.")
+                if any(value is not None for value in (
+                    structure_adapter, boundary_adapter, gamma_structure, gamma_boundary,
+                )):
+                    raise AuditFailure("supervision_only created adapter/gamma state.")
+            else:
+                expected_structure_channels = getattr(model.mask_decoder, "structure_guidance_channels", None)
+                expected_boundary_channels = getattr(model.mask_decoder, "boundary_guidance_channels", None)
+                if selected_structure:
+                    if structure_adapter is None or structure_adapter.net[-1].out_channels != expected_structure_channels:
+                        raise AuditFailure("Structure adapter/decoder channel contract mismatch.")
+                    prob = torch.zeros(1, 1, 32, 32)
+                    delta = structure_adapter(prob)
+                    feature = torch.zeros(1, expected_structure_channels, 64, 64)
+                    synthetic_structure = feature + torch.nn.functional.interpolate(
+                        delta, size=feature.shape[-2:], mode="bilinear", align_corners=False
+                    )
+                    if synthetic_structure.shape != feature.shape:
+                        raise AuditFailure("Synthetic structure addition shape mismatch.")
+                if selected_boundary:
+                    if boundary_adapter is None or boundary_adapter.net[-1].out_channels != expected_boundary_channels:
+                        raise AuditFailure("Boundary adapter/decoder channel contract mismatch.")
+                    prob = torch.zeros(1, 1, 32, 32)
+                    delta = boundary_adapter(prob)
+                    feature = torch.zeros(1, expected_boundary_channels, 128, 128)
+                    synthetic_boundary = feature + torch.nn.functional.interpolate(
+                        delta, size=feature.shape[-2:], mode="bilinear", align_corners=False
+                    )
+                    if synthetic_boundary.shape != feature.shape:
+                        raise AuditFailure("Synthetic boundary addition shape mismatch.")
+            audit.update({
+                "result": "PASS",
+                "constructor_smoke_only": True,
+                "structure_guidance_channels": getattr(model.mask_decoder, "structure_guidance_channels", None),
+                "boundary_guidance_channels": getattr(model.mask_decoder, "boundary_guidance_channels", None),
+                "structure_adapter_present": structure_adapter is not None,
+                "boundary_adapter_present": boundary_adapter is not None,
+                "gamma_structure_present": gamma_structure is not None,
+                "gamma_boundary_present": gamma_boundary is not None,
+                "forward_executed": False,
+                "backward_executed": False,
+                "optimizer_step_executed": False,
+            })
+            return 0
+
+        current_stage = "model_to_cuda"
+        model = model.to(device)
+        current_stage = "after_model_to_cuda"
+        log_cuda_memory(current_stage, logger, memory_records)
+
+        from torch.utils.data import DataLoader
+        from DataLoader import UniversalDataset, stack_dict_batched
+        import training.spatial_sb_targets as formal_targets
+        from utils import FocalDiceloss_IoULoss
+
+        dataset = UniversalDataset(
+            data_root=args.data_path,
+            knowledge_path=args.knowledge_path,
+            image_size=args.image_size,
+            crop_size=args.crop_size,
+            mode="train",
+            prompt_mode=args.prompt_mode,
+            use_structure_boundary_attrs=False,
+            structure_boundary_attr_path=None,
+            max_instances_per_image=args.max_instances_per_image,
+            min_instance_area=args.min_instance_area,
+            skip_knowledge_loading=True,
+            phase=args.phase,
+        )
+        generator = torch.Generator()
+        generator.manual_seed(cli.seed)
+        loader = DataLoader(
+            dataset,
+            batch_size=cli.batch_size,
+            shuffle=False,
+            num_workers=cli.num_workers,
+            collate_fn=stack_dict_batched,
+            pin_memory=True,
+            persistent_workers=cli.num_workers > 0,
+            generator=generator,
+        )
+        if len(loader) < cli.max_batches:
+            raise AuditFailure(f"Dataset has only {len(loader)} batches; need {cli.max_batches}.")
+
+        optimizer = None
+        optimizer_names: Dict[int, str] = {}
+        active_missing: List[str] = []
+        sga_params = sga_named_parameters(model)
+        sga_groups: List[str] = []
+        criterion = None
+        if cli.forward_only_smoke:
+            audit["optimizer"] = {"constructed": False}
+        elif cli.mode == "none":
+            if sga_params:
+                raise AuditFailure("mode=none created SGA-SB parameters.")
+            audit["optimizer"] = {
+                "constructed": False,
+                "group_names": [],
+                "sga_group_names": [],
+                "duplicate_parameter_count": 0,
+                "trainable_missing_count": 0,
+                "active_sga_missing_count": 0,
+            }
+        else:
+            formal.apply_stage_policy(model, args.phase, args=args, logger=logger, rank=0)
+            optimizer = formal.build_optimizer_by_stage(
+                model, args.phase, args=args, logger=logger, rank=0, audit=None
+            )
+            optimizer_names = optimizer_name_map(optimizer)
+            optimizer_ids = [id(param) for group in optimizer.param_groups for param in group["params"]]
+            duplicate_count = len(optimizer_ids) - len(set(optimizer_ids))
+            trainable_missing = [
+                name for name, param in model.named_parameters()
+                if param.requires_grad and id(param) not in set(optimizer_ids)
+            ]
+            active_missing = [
+                name for name, param in sga_params
+                if param.requires_grad and id(param) not in set(optimizer_ids)
+            ]
+            sga_groups = sorted({
+                optimizer_names[id(param)] for _, param in sga_params if id(param) in optimizer_names
+            })
+            if duplicate_count or trainable_missing or active_missing:
+                raise AuditFailure(
+                    f"Optimizer coverage failed duplicate={duplicate_count} "
+                    f"missing={trainable_missing[:20]} active_missing={active_missing}"
+                )
+            audit["optimizer"] = {
+                "constructed": True,
+                "group_names": [group.get("name", "unnamed") for group in optimizer.param_groups],
+                "sga_group_names": sga_groups,
+                "duplicate_parameter_count": duplicate_count,
+                "trainable_missing_count": len(trainable_missing),
+                "active_sga_missing_count": len(active_missing),
+            }
+            criterion = FocalDiceloss_IoULoss(weight=20.0, iou_scale=1.0, ignore_index=255)
+
+        batch_records = []
+        forward_states = []
+        comparison = None
+        empty_foreground_seen = False
+        step_update_counts = []
+        gamma_grad_by_batch = []
+
+        for batch_index, raw_batch in enumerate(loader):
+            if batch_index >= cli.max_batches:
+                break
+            current_stage = "batch_to_device"
+            batch = formal.to_device(raw_batch, device)
+            model_input = build_model_input(batch, args)
+            label_inst = batch["label_inst"].to(device=device, dtype=torch.float32)
+            instance_counts = [int(torch.unique(sample[sample > 0]).numel()) for sample in label_inst]
+            foreground_flags = [bool(torch.count_nonzero(sample).item() > 0) for sample in label_inst]
+            empty_foreground_seen = empty_foreground_seen or not all(foreground_flags)
+            data_stats = {
+                "batch_index": batch_index,
+                "image_shape": list(batch["image"].shape),
+                "instance_mask_shape": list(label_inst.shape),
+                "foreground_image_count": int(sum(foreground_flags)),
+                "empty_foreground_image_count": int(len(foreground_flags) - sum(foreground_flags)),
+                "instance_count_per_sample": instance_counts,
+            }
+            state_name = "F0" if batch_index == 0 else "F1"
+            probe_grads: Dict[str, Optional[float]] = {name: None for name, _ in sga_params}
+            if cli.forward_only_smoke:
+                model.eval()
+                current_stage = "forward_only_smoke"
+                with torch.inference_mode():
+                    outputs = model(model_input, multimask_output=True)
+                feature_metrics = forward_metrics(outputs, state_name)
+                has_structure_delta = any(output.get("structure_delta") is not None for output in outputs)
+                has_boundary_delta = any(output.get("boundary_delta") is not None for output in outputs)
+                if has_structure_delta != (cli.branch in ("structure", "both")):
+                    raise AuditFailure("Forward-only structure delta presence mismatch.")
+                if has_boundary_delta != (cli.branch in ("boundary", "both")):
+                    raise AuditFailure("Forward-only boundary delta presence mismatch.")
+                audit.update({
+                    "result": "PASS",
+                    "forward_only_smoke": True,
+                    "batch_count": 1,
+                    "features": feature_metrics,
+                    "forward_executed": True,
+                    "backward_executed": False,
+                    "optimizer_step_executed": False,
+                })
+                return 0
+            if cli.mode == "none":
+                model.eval()
+                current_stage = "before_batch_forward"
+                log_cuda_memory(current_stage, logger, memory_records)
+                current_stage = "n0_forward"
+                with torch.inference_mode():
+                    outputs = model(model_input, multimask_output=True)
+                current_stage = "after_total_forward"
+                log_cuda_memory(current_stage, logger, memory_records)
+                for output in outputs:
+                    for key in ("structure_logits", "boundary_logits", "structure_delta", "boundary_delta"):
+                        if output.get(key) is not None:
+                            raise AuditFailure(f"N0 unexpectedly produced {key}.")
+                    for value in output.values():
+                        diagnostic = to_detached_float_tensor(value)
+                        if torch.is_tensor(diagnostic) and not bool(torch.isfinite(diagnostic).all().cpu().item()):
+                            raise AuditFailure("N0 produced a non-finite tensor output.")
+                        del diagnostic
+                feature_metrics = forward_metrics(outputs, state_name)
+                forward_states.append(feature_metrics)
+                update_count = 0
+                gamma_grad_by_batch.append(0.0)
+                record = {
+                    **data_stats,
+                    "state": state_name,
+                    "targets": {},
+                    "losses": {"output_finite": 1.0},
+                    "features": feature_metrics,
+                    "active_parameter_update_count": 0,
+                }
+                append_jsonl(batch_jsonl, record)
+                batch_records.append(record)
+                del outputs, batch, raw_batch, model_input, label_inst
+                gc.collect()
+                torch.cuda.empty_cache()
+                current_stage = "after_batch_cleanup"
+                log_cuda_memory(current_stage, logger, memory_records)
+                continue
+
+            model.train()
+            if cli.mode == "guidance":
+                optimizer.zero_grad(set_to_none=True)
+                current_stage = "before_batch_forward"
+                log_cuda_memory(current_stage, logger, memory_records)
+                current_stage = "probe_forward"
+                probe_output = model(model_input, multimask_output=True)
+                current_stage = "after_probe_forward"
+                log_cuda_memory(current_stage, logger, memory_records)
+                probe_losses = compute_losses(
+                    formal,
+                    formal_targets,
+                    criterion,
+                    probe_output,
+                    batch,
+                    {"structure_target": None, "boundary_target": None},
+                    args,
+                    include_spatial=False,
+                )
+                current_stage = "probe_backward"
+                probe_losses["segmentation_tensor"].backward()
+                current_stage = "after_probe_backward"
+                log_cuda_memory(current_stage, logger, memory_records)
+                probe_grads = {name: grad_norm(param) for name, param in sga_params}
+                gradient_rows.extend(aggregate_gradients(sga_params, "segmentation_only", batch_index))
+                for name, param in sga_params:
+                    if param.grad is not None and not torch.isfinite(param.grad).all():
+                        raise AuditFailure(f"Non-finite segmentation-probe gradient: {name}")
+                optimizer.zero_grad(set_to_none=True)
+                del probe_output, probe_losses
+                gc.collect()
+                torch.cuda.empty_cache()
+                current_stage = "after_probe_cleanup"
+                log_cuda_memory(current_stage, logger, memory_records)
+
+            before = clone_params(sga_params)
+            optimizer.zero_grad(set_to_none=True)
+            current_stage = "before_batch_forward"
+            log_cuda_memory(current_stage, logger, memory_records)
+            current_stage = "total_forward"
+            train_output = model(model_input, multimask_output=True)
+            current_stage = "after_total_forward"
+            log_cuda_memory(current_stage, logger, memory_records)
+            feature_metrics = forward_metrics(train_output, state_name)
+            forward_states.append(feature_metrics)
+            targets = make_targets(formal_targets, label_inst, train_output, cli.mode, cli.branch)
+            losses = compute_losses(formal, formal_targets, criterion, train_output, batch, targets, args)
+            target_stats = targets["stats"]
+            loss_metrics = losses["metrics"]
+
+            if cli.mode == "supervision_only" and any(
+                output.get("structure_delta") is not None or output.get("boundary_delta") is not None
+                for output in train_output
+            ):
+                raise AuditFailure("supervision_only produced a feature delta.")
+
+            current_stage = "total_backward"
+            losses["total_tensor"].backward()
+            current_stage = "after_total_backward"
+            log_cuda_memory(current_stage, logger, memory_records)
+            gradient_rows.extend(aggregate_gradients(sga_params, "total_loss", batch_index))
+            gamma_grad = max(
+                [grad_norm(param) or 0.0 for name, param in sga_params if name.startswith("gamma_")] or [0.0]
+            )
+            gamma_grad_by_batch.append(gamma_grad)
+            for name, param in sga_params:
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    raise AuditFailure(f"Non-finite total-loss gradient: {name}")
+            current_stage = "optimizer_step"
+            optimizer.step()
+            current_stage = "after_optimizer_step"
+            log_cuda_memory(current_stage, logger, memory_records)
+            rows = record_updates(sga_params, before, optimizer_names, batch_index, probe_grads)
+            del before
+            parameter_rows.extend(rows)
+            update_count = sum(float(row["absolute_step_delta"]) > 0 for row in rows)
+            step_update_counts.append(update_count)
+            if any(not row["finite"] for row in rows):
+                raise AuditFailure("Non-finite SGA-SB parameter/update detected.")
+            optimizer.zero_grad(set_to_none=True)
+
+            del train_output, targets, losses
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            if cli.mode == "guidance" and batch_index == 1:
+                current_stage = "guidance_comparison"
+                comparison = guidance_comparison(model, model_input, logger, memory_records)
+                if comparison["mask_logits_abs_diff_max"] == 0.0:
+                    raise AuditFailure("GUIDANCE_NOT_REACHING_OUTPUT")
+
+            record = {
+                **data_stats,
+                "state": state_name,
+                "targets": target_stats,
+                "losses": loss_metrics,
+                "features": feature_metrics,
+                "active_parameter_update_count": update_count,
+            }
+            append_jsonl(batch_jsonl, record)
+            batch_records.append(record)
+            del batch, raw_batch, model_input, label_inst
+            gc.collect()
+            torch.cuda.empty_cache()
+            current_stage = "after_batch_cleanup"
+            log_cuda_memory(current_stage, logger, memory_records)
+
+        if len(batch_records) != cli.max_batches:
+            raise AuditFailure(f"Expected {cli.max_batches} batches, got {len(batch_records)}")
+
+        synthetic = {"executed": False}
+        if cli.mode != "none" and not empty_foreground_seen:
+            synthetic = synthetic_empty_case(
+                formal_targets,
+                device,
+                cli.branch in ("structure", "both"),
+                cli.branch in ("boundary", "both"),
+            )
+            if not synthetic["finite"]:
+                raise AuditFailure("Synthetic empty-mask loss is non-finite.")
+
+        delta_f0 = max(
+            forward_states[0].get("structure_delta_norm", 0.0),
+            forward_states[0].get("boundary_delta_norm", 0.0),
+        )
+        delta_f1 = max(
+            forward_states[-1].get("structure_delta_norm", 0.0),
+            forward_states[-1].get("boundary_delta_norm", 0.0),
+        )
+        if cli.mode == "guidance":
+            if delta_f1 == 0.0:
+                raise AuditFailure("ZERO_INIT_WAKEUP_FAILED: guidance delta remains exactly zero at F1.")
+            active_head_updates = [
+                row for row in parameter_rows
+                if "head" in row["module_group"] and row["absolute_step_delta"] > 0
+            ]
+            active_adapter_output_updates = [
+                row for row in parameter_rows
+                if "adapter_output" in row["module_group"] and row["absolute_step_delta"] > 0
+            ]
+            if not active_head_updates:
+                raise AuditFailure("Active head had no update after two steps.")
+            if not active_adapter_output_updates:
+                raise AuditFailure("Active adapter output layer had no update after two steps.")
+            gamma_rows = [row for row in parameter_rows if row["parameter_name"].startswith("gamma_")]
+            gamma_woke = any((row["total_gradient_norm"] or 0.0) > 0 or row["absolute_step_delta"] > 0 for row in gamma_rows)
+            if not gamma_woke:
+                raise AuditFailure("ZERO_INIT_WAKEUP_FAILED: gamma had no gradient and no update across two steps.")
+        elif cli.mode == "supervision_only":
+            if any("adapter" in name or "gamma" in name for name, _ in sga_params):
+                raise AuditFailure("supervision_only constructed adapter/gamma parameters.")
+            if not any(row["absolute_step_delta"] > 0 for row in parameter_rows):
+                raise AuditFailure("Active supervision head had no update after two steps.")
+
+        inactive_branch_unchanged = True
+        if cli.branch == "structure":
+            inactive_branch_unchanged = not any(name.startswith("spatial_boundary") or name == "gamma_boundary" for name, _ in sga_params)
+        elif cli.branch == "boundary":
+            inactive_branch_unchanged = not any(name.startswith("spatial_structure") or name == "gamma_structure" for name, _ in sga_params)
+        if not inactive_branch_unchanged:
+            raise AuditFailure("Inactive branch exists or changed.")
+
+        summary = {
+            "loss_finite": all(all(finite_number(value) for value in row["losses"].values()) for row in batch_records),
+            "target_valid": all(
+                all(stats.get("finite_ratio", 0.0) == 1.0 for stats in row["targets"].values())
+                for row in batch_records
+            ),
+            "active_optimizer_coverage": not active_missing,
+            "step_1_active_updates": step_update_counts[0] if step_update_counts else 0,
+            "step_2_active_updates": step_update_counts[1] if len(step_update_counts) > 1 else 0,
+            "delta_f0": delta_f0,
+            "delta_f1": delta_f1,
+            "gamma_grad_f0": gamma_grad_by_batch[0] if gamma_grad_by_batch else 0.0,
+            "gamma_grad_f1": gamma_grad_by_batch[1] if len(gamma_grad_by_batch) > 1 else 0.0,
+            "inactive_branch_unchanged": inactive_branch_unchanged,
+            "mask_logits_guidance_diff": comparison["mask_logits_abs_diff_max"] if comparison else 0.0,
+        }
+        audit.update({
+            "result": "PASS",
+            "summary": summary,
+            "batch_count": len(batch_records),
+            "synthetic_empty_mask_case": synthetic,
+            "guidance_comparison": comparison,
+            "final_state": "F2" if cli.mode != "none" else "F1_no_step",
+        })
+    except Exception as exc:
+        audit["result"] = "FAIL"
+        audit["failures"].append(f"{type(exc).__name__}: {exc}")
+        audit["traceback"] = traceback.format_exc()
+        if "out of memory" in str(exc).lower() or type(exc).__name__ == "OutOfMemoryError":
+            audit["oom_stage"] = current_stage
+        logger.error("P2 audit failed: %s", exc)
+    finally:
+        if "torch" in locals() and torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+            current_stage = "case_end"
+            log_cuda_memory(current_stage, logger, memory_records)
+            audit["peak_allocated_mb"] = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            audit["peak_reserved_mb"] = torch.cuda.max_memory_reserved() / (1024.0 * 1024.0)
+        else:
+            audit["peak_allocated_mb"] = 0.0
+            audit["peak_reserved_mb"] = 0.0
+        audit.setdefault("oom_stage", None)
+        audit["cuda_memory_telemetry"] = memory_records
+        write_json(output_dir / "audit.json", audit)
+        write_tsv(
+            output_dir / "parameter_updates.tsv",
+            parameter_rows,
+            (
+                "batch_index", "state_after", "parameter_name", "module_group", "requires_grad",
+                "optimizer_group", "parameter_norm_before", "segmentation_probe_gradient_norm",
+                "total_gradient_norm", "parameter_norm_after", "absolute_step_delta",
+                "max_step_delta", "l2_step_delta", "relative_step_delta", "finite",
+            ),
+        )
+        write_tsv(
+            output_dir / "gradient_summary.tsv",
+            gradient_rows,
+            (
+                "batch_index", "probe", "module_group", "parameter_tensors",
+                "gradient_tensors_present", "gradient_norm", "finite",
+            ),
+        )
+    print(json.dumps({"case": audit.get("case"), "result": audit.get("result"), "failures": audit.get("failures")}, sort_keys=True))
+    return 0 if audit.get("result") == "PASS" else 1
+
+
+def main() -> int:
+    cli = build_cli().parse_args()
+    if cli.summarize_root:
+        output = Path(cli.summary_output or Path(cli.summarize_root).parent / "SGA_SB_P2_SUMMARY.md")
+        return summarize_cases(Path(cli.summarize_root), output)
+    return run_case(cli)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
