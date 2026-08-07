@@ -1,0 +1,31 @@
+evidence_id	claim	verdict	evidence_type	path_or_source	locator	confidence	limitations
+E001	仓库版本可追溯到 Git 提交	UNVERIFIED	filesystem	/hy-tmp/NuSeg	.git absent	HIGH	工作区没有 Git 元数据，无法确定分支、提交或脏状态
+E002	审计时没有活跃训练或 torchrun 进程	SUPPORTED	process_snapshot	process table	2026-07-22 snapshot	HIGH	仅代表审计快照时刻
+E003	审计未启动训练、完整测试或 GPU 任务	SUPPORTED	audit_protocol	audit command ledger	all executed commands	HIGH	仅覆盖本次审计行为
+E004	视觉基线具有可复核的 canonical full-test	SUPPORTED	log	workdir/audits/p0_20260713/visual_baseline_full_test_1gpu.log	FULL_COMMAND and final metrics	HIGH	单种子；历史环境不能完全重建
+E005	视觉基线 full-test 指标约为 Dice .8089、IoU .696、mAJI .6270、mPQ .6034	SUPPORTED	log	workdir/audits/p0_20260713/visual_baseline_full_test_1gpu.log	final metrics	HIGH	IoU 日志显示精度存在截断差异
+E006	Exp5 是当前最高可信结果	SUPPORTED	log	workdir/audits/promptnu_attr_aligned_5exp_seed42_20260713/exp5_best_pq_full_test_1gpu.log	FULL_COMMAND and final metrics	HIGH	“最高可信”限定于有正式 full-test 证据的现存实验
+E007	Exp5 full-test 为 Dice .8172、IoU .7048、mAJI .6361、mPQ .6094	SUPPORTED	log	workdir/audits/promptnu_attr_aligned_5exp_seed42_20260713/exp5_best_pq_full_test_1gpu.log	final metrics	HIGH	单种子，且不能归因给单一模块
+E008	Exp5 相对视觉基线的改进来自多级属性加数值路由的整体配方	PARTIALLY_SUPPORTED	config_and_log	train.py; Exp5 training/full-test logs	feature flags and commands	MEDIUM	父检查点、继续训练与参数变化混杂，不能作单模块因果结论
+E009	Exp6 的 .8091/.6945/.6269/.6047 是正式 full-test 结果	UNVERIFIED	document_claim	project historical reports	PROVIDED_CONTEXT_UNVERIFIED	HIGH	未发现对应完整测试日志
+E010	Exp7 CLIP 路线已完成正式比较	UNVERIFIED	filesystem	workdir/audits	CLIP-related evidence search	HIGH	未发现足够的训练、checkpoint 与 canonical full-test 证据链
+E011	PNuRL 在推理时仍可改变语义残差	SUPPORTED	code	sam.py	1213-1235 in test.py; 4131-4150 in sam.py	HIGH	属性对齐损失在 eval 关闭，但 use_pnurl 下残差通路仍存在
+E012	PNuRL 注入是 base 加有界语义 delta	SUPPORTED	code	models/pnurl.py; sam.py	pnurl.py 485-527; sam.py 4131-4150	HIGH	实际影响依赖开关、权重和语义缩放
+E013	FreqPath 实现了真实频域变换	CONTRADICTED	code	segment_anything/modeling/mask_decoder.py	147-421	HIGH	未发现 FFT、DCT 或显式频谱变换；当前是 low/high 特征路径与门控融合
+E014	SGA 门控真实进入前向、优化器与 checkpoint	SUPPORTED	code_and_artifacts	sam.py; train.py; workdir/models	6604-6619, 7182-7194; 2298-2339	HIGH	工程存在性不等于有效性
+E015	SGA G2 相对 N0 在 E5 同时提升 mAJI 与 mPQ	CONTRADICTED	metrics_history	workdir/models/sga_sb_p3_*	E5 rows	HIGH	G2 mAJI +.000926、mPQ -.002541，联合门槛失败
+E016	P4.1 soft boundary 值得进入正式 full-test	CONTRADICTED	metrics_history	workdir/models/sga_sb_p41_*	E5 and E4-E5 mean	HIGH	相对 legacy G2，E5 mAJI -.006571、mPQ -.005762
+E017	PNuDP Dense 已有完整训练和 full-test 证据	CONTRADICTED	logs_and_artifacts	workdir/audits; workdir/models	PNuDP traces	HIGH	仅 smoke、20-batch、1-epoch 辅助轨迹，未发现正式 checkpoint/full-test
+E018	L0 数据审计支持全局文本与局部核实例存在粒度错配	SUPPORTED	data_audit	workdir/audits	L0 JSON/report	HIGH	这是数据与表征动机证据，不是性能提升证据
+E019	L0 共覆盖 4946 个训练 tile、101812 个实例	SUPPORTED	data_audit	workdir/audits	L0 JSON/report	HIGH	依赖审计产物对应的数据版本
+E020	L1A 是训练期只读局部监督，不在特征路径注入	SUPPORTED	code	training/local_region_text_alignment.py; sam.py	90-425; sam.py 4206-4224	HIGH	当前实现不构成实例级推理语义路线
+E021	L1A 预注册 E5 主门槛通过	CONTRADICTED	metrics_history	workdir/models/*l1a*	matched C0/L1 E5	HIGH	mAJI -0.001001，虽 mPQ +.001154，但 mAJI +.003 门槛失败
+E022	L1A E4-E5 均值提供弱正信号	SUPPORTED	metrics_history	workdir/models/*l1a*	E4-E5 mean	MEDIUM	均值约 mAJI +.001895、mPQ +.003535；非预注册主判据且仅单种子验证
+E023	验证指标是所有 DDP rank 的全量严格汇总	CONTRADICTED	code	train.py	4862-5072	HIGH	默认每 rank 仅验证约 40%，且未 all_reduce；rank0 本地均值用于选模
+E024	完整测试对样本指标做 DDP sum/count 汇总	SUPPORTED	code	test.py	2167-2309	HIGH	DistributedSampler 在样本数不能整除时可能复制尾样本
+E025	训练验证与 full-test 的后处理完全一致	CONTRADICTED	code	train.py; test.py	validation/test defaults	HIGH	阈值、最小对象与滑窗策略不同，验证分数不可直接当 full-test
+E026	AJI 与 PQ 的实现大体符合实例分割定义	SUPPORTED	code	metrics.py	7-160	HIGH	PQ 匹配采用 IoU 严格大于 .5；跨项目比较仍需核对协议
+E027	动态 GT prompt 在正常评估中被禁用	SUPPORTED	code	utils/DataLoader.py	1368-1390	HIGH	eval 回退 organ_static；具体行为仍受命令行和数据文件影响
+E028	PanNuke 训练单位是 tile，增强后实例属性会重算	SUPPORTED	code	utils/DataLoader.py	1584-1630, 1766-1807, 1960-1972	HIGH	全局 prompt 仍按 tile 共享，不能替代实例级文字
+E029	当前项目已具备多种子统计因果证据	CONTRADICTED	artifact_inventory	workdir/audits; workdir/models	experiment inventory	HIGH	核心正式结论主要为 seed 42；未发现三种子 canonical full-test
+E030	论文级主创新已经闭环	CONTRADICTED	synthesis	all evidence	innovation and completion audits	HIGH	候选机制存在，但主增益、对照、随机化与多种子闭环不足

@@ -1,0 +1,40 @@
+# ============================================================
+# Environment Snapshot — NucleiSegmentation (my_env)
+# Generated: 2026-06-28
+# ============================================================
+
+# --- Conda Environment ---
+CONDA_ENV_NAME          = my_env
+CONDA_ENV_PATH          = /root/.conda/envs/my_env
+CONDA_BASE              = /base/mambaforge
+
+# Available environments:
+#   base    : /base/mambaforge
+#   my_env  : /root/.conda/envs/my_env  (*active)
+
+# --- Python ---
+WHICH_PYTHON            = /root/.conda/envs/my_env/bin/python
+PYTHON_VERSION          = 3.12.12
+
+# --- pip ---
+WHICH_PIP               = /root/.conda/envs/my_env/bin/pip
+PIP_VERSION             = pip 25.3 (python 3.12)
+
+# --- PyTorch Family ---
+PYTORCH_VERSION         = 2.9.1+cu128
+TORCHVISION_VERSION     = 0.24.1+cu128
+TORCHAUDIO_VERSION      = NOT INSTALLED
+
+# --- CUDA ---
+CUDA_VERSION            = 12.8
+CUDA_AVAILABLE          = True
+
+# --- GPU (nvidia-smi) ---
+GPU_MODEL               = NVIDIA GeForce RTX 5090
+GPU_DRIVER_VERSION      = 570.172.08
+GPU_COUNT               = 1
+GPU_0                   = NVIDIA GeForce RTX 5090 (15.9 GB VRAM)
+
+# --- Special Packages ---
+# clip  : editable git install from CLIP/CLIP-main (local subdirectory)
+# conch : git+https://github.com/Mahmoodlab/CONCH.git

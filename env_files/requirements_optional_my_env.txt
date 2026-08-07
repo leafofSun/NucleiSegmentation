@@ -1,0 +1,45 @@
+# ============================================================
+# Optional dependencies — not strictly required for training
+# (my_env version)
+# ============================================================
+
+# ---------- Test / dev ----------
+pytest
+# Used only in CLIP/CLIP-main/tests/test_consistency.py.
+# Not needed for training or inference.
+
+# ---------- Data processing (commented-out in code) ----------
+pandas
+# Import is commented out in coop/pre.py:
+#   # import pandas as pd
+# May be useful for data analysis scripts but not required for training.
+
+# ---------- NLP (commented-out in code) ----------
+transformers
+tokenizers
+# Imports commented out in coop/pre.py:
+#   # from transformers import AdamW
+#   # from transformers import T5Tokenizer, T5ForConditionalGeneration
+# Not required for current training pipeline.
+# tokenizers is a dependency of transformers, included here for clarity.
+
+# ---------- Image model zoo (NOT imported in project code) ----------
+timm
+# Installed in my_env (v1.0.26) but not directly imported in any project
+# .py file. May be a transitive dependency or used in exploratory scripts.
+# If training fails with "No module named timm", install it.
+
+# ---------- HDF5 (NOT imported in project code) ----------
+h5py
+# Installed in my_env (v3.16.0) but not directly imported in any project
+# .py file. May be a transitive dependency or used for data loading.
+# If training fails with "No module named h5py", install it.
+
+# ---------- Build tools ----------
+setuptools
+wheel
+# Build system dependencies. Usually pre-installed.
+
+# ---------- Jupyter / notebook (not imported in project code) ----------
+# jupyter, notebook, ipykernel, jupyterlab — NOT included here either,
+# as they are not imported anywhere in project source files.

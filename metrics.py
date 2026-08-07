@@ -4,6 +4,10 @@ import cv2
 from scipy.optimize import linear_sum_assignment
 from skimage import measure
 
+
+METRIC_IMPLEMENTATION_VERSION = "nuseg_segmetrics_per_image_macro_v1"
+
+
 def get_fast_aji(true, pred):
     """
     使用矩阵运算加速 AJI 计算
@@ -160,13 +164,22 @@ def get_fast_pq(true, pred, match_iou=0.5):
     return pq, dq, sq
 
 def SegMetrics(pred, label, metrics):
-    """
-    计算分割指标的总入口
+    """Compute per-image segmentation and instance metrics.
+
+    ``dice`` and ``iou`` are binary foreground metrics. ``mAJI`` and ``mPQ``
+    are legacy public keys: this function averages AJI/PQ over its input batch.
+    The evaluation entry points call it once per image and aggregate image-level
+    sums/counts, so reported dataset values are macro means over unique images,
+    not pixel-weighted or instance-count-weighted micro metrics.
     """
     results = {}
 
     if isinstance(metrics, str):
         metrics = [metrics, ]
+
+    # ── Metric name aliases: accept both 'aji' and 'mAJI', both 'pq' and 'mPQ' ──
+    _METRIC_ALIAS = {'aji': 'mAJI', 'pq': 'mPQ', 'dq': 'mDQ', 'sq': 'mSQ'}
+    metrics = [_METRIC_ALIAS.get(m, m) for m in metrics]
 
     # 1. 转换为 Numpy
     if isinstance(pred, torch.Tensor):

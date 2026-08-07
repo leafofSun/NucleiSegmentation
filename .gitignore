@@ -213,3 +213,51 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# ===== NuSeg local/heavy files =====
+
+# Python environments / caches
+.conda/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.cache/
+
+# macOS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Datasets
+data/
+dataset/
+datasets/
+
+# HuggingFace / model caches
+hf_cache/
+
+# Model weights / checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# NuSeg model directory
+workdir/models/
+
+# Large generated audit tables
+workdir/audits/**/L0_LOCAL_REGION_ATTRIBUTES.csv
+workdir/audits/**/L0_INSTANCE_STATISTICS.csv
+
+# Temporary files
+tmp*/
+*.tmp

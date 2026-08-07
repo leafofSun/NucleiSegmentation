@@ -25,15 +25,6 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from evaluation_audit import (
-    DistributedEvalSampler,
-    actual_delta_ratio,
-    fixed_subset_indices,
-    protocol_from_train_args,
-    write_evaluation_protocol,
-    write_run_manifests,
-)
-
 try:
     from torch.amp import GradScaler, autocast
 except ImportError:
@@ -44,7 +35,6 @@ from hover_loss import generate_hv_map_from_inst, msge_loss
 from metrics import SegMetrics
 from segment_anything import sam_model_registry
 from segment_anything.modeling.sam import TextSam
-from segment_anything.modeling.rsgr import optimizer_group_spec, parameter_name_hash
 from utils import FocalDiceloss_IoULoss, density_map_loss, get_logger, point_guidance_loss
 
 from training.phase_c_semantic_alignment import (
@@ -63,16 +53,12 @@ from training.phase_b_multilevel_attr import (
 )
 
 # ── Audit log gating for Stage D mainline slim-down ──
-from training.local_region_text_alignment import ATTRIBUTE_NAMES as L1A_ATTRIBUTE_NAMES
-from training.rsgr_local5 import load_local5_schema, split_local5_labels
 from training.logging_utils import AuditMode, set_global_audit_mode
 
 # ── SGA-SB v1 CORRECTION: Spatial Structure/Boundary Guidance targets and loss ──
 from training.spatial_sb_targets import (
     generate_structure_target,
     generate_boundary_target,
-    align_spatial_target_to_prediction,
-    spatial_target_alignment_method,
     compute_structure_loss,
     compute_boundary_loss,
 )
@@ -323,34 +309,6 @@ def parse_args():
         help="Learning rate for NumericAttrFreqPathProj parameters. "
              "If None, uses --lr with no multiplier. Default: None.",
     )
-    # L1-A: explicit opt-in; defaults preserve C0/backward behavior.
-    parser.add_argument("--enable_local_region_text_alignment", action="store_true", default=False)
-    parser.add_argument("--local_region_window_size", type=int, default=192)
-    parser.add_argument("--local_region_text_weight", type=float, default=0.1)
-    parser.add_argument("--local_region_text_temperature", type=float, default=0.07)
-    parser.add_argument("--local_region_text_attributes", default="density,size_heterogeneity,crowding,boundary_irregularity,elongation")
-    parser.add_argument("--local_region_policy", choices=["complete_only"], default="complete_only")
-    parser.add_argument("--local_region_text_backend", choices=["conch"], default="conch")
-    parser.add_argument("--local_region_text_supervision_only", action="store_true", default=False)
-    parser.add_argument("--local_region_text_prototype_path", default="workdir/audits/local_region_text_l1a_20260722/L1A_TEXT_PROTOTYPE_BANK.pt")
-    parser.add_argument("--local_region_thresholds_path", default="workdir/audits/local_semantic_granularity_l0_20260722/L0_ATTRIBUTE_BIN_THRESHOLDS.json")
-    parser.add_argument("--local_region_audit", action="store_true", default=False)
-    # RSGR-1 is explicit opt-in; defaults preserve all prior experiment behavior.
-    parser.add_argument("--enable_rsgr", action="store_true", default=False)
-    parser.add_argument("--rsgr_mode", choices=["no_local", "correct_local", "shuffled_region", "random_prototype"], default="no_local")
-    parser.add_argument("--rsgr_num_regions", type=int, default=4)
-    parser.add_argument("--rsgr_region_size", type=int, default=192)
-    parser.add_argument("--rsgr_local_attr_weight", type=float, default=0.05)
-    parser.add_argument("--rsgr_semantic_align_weight", type=float, default=0.0)
-    parser.add_argument("--rsgr_injection_scale", type=float, default=0.05)
-    parser.add_argument("--rsgr_max_injection_ratio", type=float, default=0.02)
-    parser.add_argument("--rsgr_prototype_source", choices=["conch", "synthetic"], default="conch")
-    parser.add_argument("--rsgr_prototype_path", default=None)
-    parser.add_argument("--rsgr_prototype_detach", type=str2bool, default=True)
-    parser.add_argument("--rsgr_attr_detach", type=str2bool, default=False)
-    parser.add_argument("--rsgr_shuffle_scope", choices=["within_sample"], default="within_sample")
-    parser.add_argument("--rsgr_random_seed", type=int, default=42)
-    parser.add_argument("--rsgr_overlap_blend", choices=["normalized"], default="normalized")
     parser.add_argument(
         "--reinit_freqpath_modulators_for_numeric_guidance",
         action="store_true",
@@ -414,18 +372,6 @@ def parse_args():
         type=int,
         default=-1,
         help="Limit val batches for debug (Phase C). -1 = no limit, 0 = skip val.",
-    )
-    parser.add_argument(
-        "--val_fraction",
-        type=float,
-        default=1.0,
-        help="Fixed global validation fraction in (0, 1]. Default 1.0; applied before rank sharding.",
-    )
-    parser.add_argument(
-        "--val_subset_seed",
-        type=int,
-        default=42,
-        help="Seed for the fixed global validation subset. Default: 42.",
     )
     parser.add_argument(
         "--debug_max_train_batches",
@@ -952,17 +898,6 @@ def parse_args():
         help="Loss weight for instance boundary map (BCE+Dice). Default: 0.1.",
     )
     parser.add_argument(
-        "--spatial_boundary_target_mode",
-        type=str,
-        default="legacy_max",
-        choices=["legacy_max", "direct_area_soft"],
-        help="Boundary supervision target. 'legacy_max' preserves the P3 path: "
-             "nearest 512->64 then adaptive max alignment to logits. "
-             "'direct_area_soft' is an opt-in target-only candidate: keep the "
-             "full-resolution binary boundary and adaptive-average it directly "
-             "to logits without thresholding. Default: legacy_max.",
-    )
-    parser.add_argument(
         "--spatial_structure_guidance_init",
         type=float,
         default=0.05,
@@ -1455,26 +1390,6 @@ def apply_stage_policy(model: nn.Module, stage: str, args=None, logger=None, ran
                         f"({_n_tensors} param tensors).",
                         flush=True,
                     )
-
-        if args is not None and getattr(args, "enable_rsgr", False):
-            _rsgr_module = getattr(raw_model, "rsgr", None)
-            if _rsgr_module is None:
-                raise RuntimeError("RSGR enabled but module is missing")
-            set_requires_grad(_rsgr_module, True)
-            if _rsgr_module.structure_prototypes.requires_grad or _rsgr_module.boundary_prototypes.requires_grad:
-                raise RuntimeError("RSGR prototypes must remain frozen")
-
-        # L1-A: only the five local visual projectors are newly trainable.
-        if args is not None and getattr(args, "enable_local_region_text_alignment", False):
-            _local_module = getattr(raw_model, "local_region_text_alignment", None)
-            if _local_module is None:
-                raise RuntimeError("L1-A enabled but local_region_text_alignment module is missing")
-            set_requires_grad(_local_module, True)
-            if _local_module.text_prototypes.requires_grad:
-                raise RuntimeError("L1-A text prototypes must remain frozen")
-            if rank == 0:
-                _local_numel = sum(p.numel() for p in _local_module.parameters())
-                print(f"[L1A_TRAINABLE] local_projector_numel={_local_numel}", flush=True)
 
         # ── NUMERIC_ATTR_FREQPATH_REQUIRES_GRAD_AUDIT ──
         if rank == 0 and args is not None and getattr(args, "enable_numeric_attr_freqpath_guidance", False):
@@ -2253,21 +2168,6 @@ def build_optimizer_by_stage(model: nn.Module, stage: str, args, logger=None, ra
                     f"  param_names_preview={_param_names_preview}"
                 )
 
-
-        # L1-A adds exactly the five projector parameter sets.
-        if args is not None and getattr(args, "enable_local_region_text_alignment", False):
-            _local_module = getattr(raw_model, "local_region_text_alignment", None)
-            if _local_module is None:
-                raise RuntimeError("L1-A enabled but optimizer cannot find local module")
-            _local_params = list(_local_module.projectors.named_parameters())
-            add_named_params("local_region_text_projectors", _local_params, float(args.lr))
-            if rank == 0 and logger is not None:
-                logger.info(
-                    f"[L1A_OPTIMIZER] group=local_region_text_projectors | "
-                    f"parameter_tensors={len(_local_params)} | "
-                    f"numel={sum(p.numel() for _, p in _local_params)} | lr={float(args.lr):.6e}"
-                )
-
     elif stage == "pnudp_dense_train":
         # Stage D PNuDP dense training: split into 3 keyword-matched groups
         #   proj.weight       → pnudp_dense_proj_lr (fallback: pnudp_dense_lr)
@@ -2392,42 +2292,6 @@ def build_optimizer_by_stage(model: nn.Module, stage: str, args, logger=None, ra
                         f"[OPTIMIZER_GROUP] name={_group['name']} | "
                         f"params={sum(p.numel() for p in _group['params'])} | lr={_group['lr']:.6e}"
                     )
-
-    if args is not None and getattr(args, "enable_rsgr", False):
-        _rsgr_module = getattr(raw_model, "rsgr", None)
-        if _rsgr_module is None:
-            raise RuntimeError("RSGR enabled but optimizer cannot find module")
-        _rsgr_predictor_params = (
-            list(_rsgr_module.local5_structure_predictor.named_parameters())
-            + list(_rsgr_module.local5_boundary_predictor.named_parameters())
-        )
-        add_named_params("rsgr_local_attr_predictor", _rsgr_predictor_params, base_lr)
-        _rsgr_projector_params = (
-            list(_rsgr_module.structure_text_norm.named_parameters())
-            + list(_rsgr_module.boundary_text_norm.named_parameters())
-            + list(_rsgr_module.structure_text_projector.named_parameters())
-            + list(_rsgr_module.boundary_text_projector.named_parameters())
-        )
-        add_named_params("rsgr_text_projector", _rsgr_projector_params, base_lr)
-        _rsgr_adapter_params = (
-            list(_rsgr_module.structure_region_adapter.named_parameters())
-            + list(_rsgr_module.boundary_region_adapter.named_parameters())
-        )
-        add_named_params("rsgr_region_adapter", _rsgr_adapter_params, base_lr)
-        _rsgr_spec, _rsgr_group_hash = optimizer_group_spec(_rsgr_module, base_lr)
-        if rank == 0 and logger is not None:
-            for _group in param_groups:
-                if str(_group.get("name", "")).startswith("rsgr_"):
-                    logger.info(
-                        f"[OPTIMIZER_GROUP] name={_group['name']} | "
-                        f"params={sum(p.numel() for p in _group['params'])} | lr={_group['lr']:.6e}"
-                    )
-            logger.info(
-                f"[RSGR_PARAMETER_PARITY] mode={args.rsgr_mode} | "
-                f"total_trainable={sum(p.numel() for p in _rsgr_module.parameters() if p.requires_grad)} | "
-                f"parameter_name_hash={parameter_name_hash(_rsgr_module)} | "
-                f"optimizer_group_hash={_rsgr_group_hash}"
-            )
 
     _optimizer_ids = [id(param) for group in param_groups for param in group["params"]]
     _duplicate_optimizer_count = len(_optimizer_ids) - len(set(_optimizer_ids))
@@ -2800,12 +2664,7 @@ _PHASE_D_AUDIT_GROUPS = ("semantic_gate", "pnurl_semantic_delta_adapter", "mask_
 
 
 def _phase_d_gate_audit_forward(outputs, raw_model, batch_idx, args):
-    """Log existing injection norms with unambiguous ratio definitions.
-
-    DeltaRMSControl is legacy ``semantic_delta_ratio`` adapter control, not
-    DeltaNorm/BaseNorm. ActualDeltaRatio and InjRatio are measured before and
-    after gate/scale injection respectively.
-    """
+    """Print gate forward diagnostics: GateMean/Min/Max/Std, DeltaNorm, BaseNorm, InjectedNorm, InjRatio."""
     global _PHASE_D_GATE_AUDIT_BATCH_COUNTER
     if not args.debug_phase_d_gate_audit:
         return
@@ -2840,10 +2699,8 @@ def _phase_d_gate_audit_forward(outputs, raw_model, batch_idx, args):
     ixn = diag.get("injected_delta_norm", float("nan"))
     ir = diag.get("injection_ratio", float("nan"))
     dr = diag.get("semantic_delta_ratio", float("nan"))
-    actual_dr = actual_delta_ratio(dn, bn, eps=1e-12)
 
-    # DeltaRMSControl retains the old DeltaRatio field for log compatibility.
-    # It is an adapter RMS control value, not measured DeltaNorm/BaseNorm.
+    # Warn if DeltaNorm=0 but DeltaRatio>0 (suggests read error or zeroed tensor)
     if dn is not None and not (isinstance(dn, float) and (dn != dn)) and dn == 0.0 and dr is not None and dr > 0:
         print(
             f"[PHASE_D_GATE_AUDIT][WARNING] DeltaNorm=0 but DeltaRatio={dr:.6e}>0: "
@@ -2852,10 +2709,10 @@ def _phase_d_gate_audit_forward(outputs, raw_model, batch_idx, args):
         )
 
     print(
-        f"\n[SEMANTIC_INJECTION_DIAG] batch={batch_idx} | "
-        f"BaseNorm={bn:.6e} | DeltaNorm={dn:.6e} | InjectedNorm={ixn:.6e} | "
-        f"DeltaRMSControl={dr:.6e} | ActualDeltaRatio={actual_dr:.6e} | "
-        f"InjRatio={ir:.6e} | GateMean={gm:.6e} | GateMin={gmin:.6e} | GateMax={gmax:.6e}",
+        f"\n[PHASE_D_GATE_AUDIT][forward] batch={batch_idx} | "
+        f"GateMean={gm:.6e} | GateMin={gmin:.6e} | GateMax={gmax:.6e} | "
+        f"DeltaNorm={dn:.6e} | BaseNorm={bn:.6e} | InjectedNorm={ixn:.6e} | "
+        f"InjRatio={ir:.6e} | DeltaRatio={dr:.6e}",
         flush=True,
     )
 
@@ -3474,200 +3331,6 @@ def collect_semantic_diagnostics(outputs: List[Dict]):
     }
 
 
-def collect_spatial_sb_diagnostics(outputs: List[Dict]):
-    """Collect detached P3 diagnostics without participating in autograd."""
-    keys = {
-        "spatial_structure_prob_mean": "spatial_structure_prob_mean",
-        "spatial_structure_prob_std": "spatial_structure_prob_std",
-        "spatial_boundary_prob_mean": "spatial_boundary_prob_mean",
-        "spatial_boundary_prob_std": "spatial_boundary_prob_std",
-        "spatial_structure_delta_norm": "spatial_structure_delta_norm",
-        "spatial_boundary_delta_norm": "spatial_boundary_delta_norm",
-        "spatial_structure_injected_ratio": "freqpath_b1_low_spatial_sb_injected_ratio",
-        "spatial_boundary_injected_ratio": "freqpath_b2_high_spatial_sb_injected_ratio",
-        "gamma_structure_value": "gamma_structure",
-        "gamma_boundary_value": "gamma_boundary",
-    }
-    collected = {name: [] for name in keys}
-    for out in outputs:
-        nested = out.get("diagnostics", {}) or {}
-        for meter_name, source_key in keys.items():
-            value = out.get(source_key, nested.get(source_key))
-            if value is None:
-                continue
-            if torch.is_tensor(value):
-                if value.numel() == 0:
-                    continue
-                value = float(value.detach().float().mean().cpu().item())
-            else:
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    continue
-            if np.isfinite(value):
-                collected[meter_name].append(value)
-    return {
-        name: (float(np.mean(values)) if values else float("nan"))
-        for name, values in collected.items()
-    }
-
-
-_BOUNDARY_LOG_HISTOGRAM_BINS = 4096
-
-
-def _new_boundary_epoch_logging_state(device) -> Dict[str, torch.Tensor]:
-    """Create detached epoch accumulators for P4.1 boundary logging.
-
-    The histogram is a bounded-memory representation of prediction
-    probabilities.  It permits DDP-wide Q90/Q99 calculation without retaining
-    any prediction tensor and without another forward pass.
-    """
-    return {
-        "target_mass": torch.zeros((), device=device, dtype=torch.float64),
-        "target_count": torch.zeros((), device=device, dtype=torch.float64),
-        "target_max": torch.zeros((), device=device, dtype=torch.float64),
-        "target_nonzero": torch.zeros((), device=device, dtype=torch.float64),
-        "pos_weight_sum": torch.zeros((), device=device, dtype=torch.float64),
-        "pos_weight_count": torch.zeros((), device=device, dtype=torch.float64),
-        "pred_sum": torch.zeros((), device=device, dtype=torch.float64),
-        "pred_sum_sq": torch.zeros((), device=device, dtype=torch.float64),
-        "pred_count": torch.zeros((), device=device, dtype=torch.float64),
-        "pred_histogram": torch.zeros(
-            (_BOUNDARY_LOG_HISTOGRAM_BINS,), device=device, dtype=torch.float64
-        ),
-    }
-
-
-def _boundary_pos_weight_value_for_logging(
-    target: torch.Tensor,
-    target_mode: str,
-) -> torch.Tensor:
-    """Return the exact dynamic pos_weight used by compute_boundary_loss()."""
-    pos_mass = target.sum(dtype=torch.float64)
-    neg_mass = target.numel() - pos_mass
-    if bool((pos_mass > 0).item()) and bool((neg_mass > 0).item()):
-        denominator = pos_mass + 1e-6 if target_mode == "direct_area_soft" else pos_mass
-        return (neg_mass / denominator).clamp(0.1, 10.0)
-    return torch.ones((), device=target.device, dtype=torch.float64)
-
-
-def _accumulate_boundary_epoch_logging(
-    state: Dict[str, torch.Tensor],
-    aligned_target: torch.Tensor,
-    boundary_logits: torch.Tensor,
-    target_mode: str,
-) -> None:
-    """Accumulate detached sufficient statistics; never changes autograd."""
-    with torch.no_grad():
-        target = aligned_target.detach().float()
-        prediction = torch.sigmoid(boundary_logits.detach().float())
-        state["target_mass"].add_(target.sum(dtype=torch.float64))
-        state["target_count"].add_(float(target.numel()))
-        state["target_max"].copy_(
-            torch.maximum(state["target_max"], target.max().to(dtype=torch.float64))
-        )
-        state["target_nonzero"].add_(torch.count_nonzero(target).to(dtype=torch.float64))
-        state["pos_weight_sum"].add_(
-            _boundary_pos_weight_value_for_logging(target, target_mode)
-        )
-        state["pos_weight_count"].add_(1.0)
-        state["pred_sum"].add_(prediction.sum(dtype=torch.float64))
-        state["pred_sum_sq"].add_((prediction * prediction).sum(dtype=torch.float64))
-        state["pred_count"].add_(float(prediction.numel()))
-        bin_indices = torch.clamp(
-            (prediction.reshape(-1) * _BOUNDARY_LOG_HISTOGRAM_BINS).to(torch.int64),
-            min=0,
-            max=_BOUNDARY_LOG_HISTOGRAM_BINS - 1,
-        )
-        state["pred_histogram"].add_(
-            torch.bincount(
-                bin_indices,
-                minlength=_BOUNDARY_LOG_HISTOGRAM_BINS,
-            ).to(dtype=torch.float64)
-        )
-
-
-def _histogram_quantile(histogram: torch.Tensor, quantile: float) -> float:
-    total = float(histogram.sum().item())
-    if total <= 0:
-        return float("nan")
-    threshold = torch.tensor(
-        quantile * total,
-        device=histogram.device,
-        dtype=histogram.dtype,
-    )
-    index = int(torch.searchsorted(torch.cumsum(histogram, dim=0), threshold).item())
-    index = min(max(index, 0), _BOUNDARY_LOG_HISTOGRAM_BINS - 1)
-    return float((index + 0.5) / _BOUNDARY_LOG_HISTOGRAM_BINS)
-
-
-def _finalize_boundary_epoch_logging(
-    state: Dict[str, torch.Tensor],
-) -> Dict[str, float]:
-    """All-reduce sufficient statistics and return DDP-global epoch fields."""
-    if dist.is_available() and dist.is_initialized():
-        for name, value in state.items():
-            operation = dist.ReduceOp.MAX if name == "target_max" else dist.ReduceOp.SUM
-            dist.all_reduce(value, op=operation)
-
-    target_count = float(state["target_count"].item())
-    pred_count = float(state["pred_count"].item())
-    pos_weight_count = float(state["pos_weight_count"].item())
-    if target_count > 0:
-        target_mass = float(state["target_mass"].item())
-        target_mean = target_mass / target_count
-        target_max = float(state["target_max"].item())
-        target_nonzero_ratio = float(state["target_nonzero"].item()) / target_count
-    else:
-        target_mass = target_mean = target_max = target_nonzero_ratio = float("nan")
-
-    if pred_count > 0:
-        pred_mean = float(state["pred_sum"].item()) / pred_count
-        pred_variance = max(
-            float(state["pred_sum_sq"].item()) / pred_count - pred_mean * pred_mean,
-            0.0,
-        )
-        pred_std = math.sqrt(pred_variance)
-        pred_q90 = _histogram_quantile(state["pred_histogram"], 0.90)
-        pred_q99 = _histogram_quantile(state["pred_histogram"], 0.99)
-    else:
-        pred_mean = pred_std = pred_q90 = pred_q99 = float("nan")
-
-    return {
-        "boundary_target_mass": target_mass,
-        "boundary_target_mean": target_mean,
-        "boundary_target_max": target_max,
-        "boundary_target_nonzero_ratio": target_nonzero_ratio,
-        "boundary_pos_weight": (
-            float(state["pos_weight_sum"].item()) / pos_weight_count
-            if pos_weight_count > 0 else float("nan")
-        ),
-        "boundary_pred_mean": pred_mean,
-        "boundary_pred_std": pred_std,
-        "boundary_pred_q90": pred_q90,
-        "boundary_pred_q99": pred_q99,
-    }
-
-
-def collect_spatial_sb_gradient_norms(model: nn.Module):
-    """Read active SGA-SB gradients after unscale and before clipping."""
-    raw_model = unwrap_model(model)
-    head_sq = 0.0
-    adapter_sq = 0.0
-    for name, param in raw_model.named_parameters():
-        if param.grad is None:
-            continue
-        grad_norm = float(param.grad.detach().float().norm().cpu().item())
-        if name.startswith(("spatial_structure_head.", "spatial_boundary_head.")):
-            head_sq += grad_norm * grad_norm
-        elif name.startswith(("spatial_structure_adapter.", "spatial_boundary_adapter.")):
-            adapter_sq += grad_norm * grad_norm
-    return {
-        "spatial_head_grad_norm": head_sq ** 0.5,
-        "spatial_adapter_grad_norm": adapter_sq ** 0.5,
-    }
-
-
 def _write_scalar_if_finite(writer, tag: str, value: float, step: int):
     if value is None:
         return
@@ -3764,8 +3427,6 @@ def _autocast_context(args):
 def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scaler, writer, rank):
     model.train()
     stage = args.phase
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(args.device)
 
     # Reset per-epoch warning counter for PHASE_D_INSTANCE_ALIGN_WARNING frequency limiting
     _raw_model_for_reset = unwrap_model(model)
@@ -3841,36 +3502,11 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         "spatial_structure": [],
         "spatial_boundary": [],
         "spatial_sb": [],
-        "spatial_structure_prob_mean": [],
-        "spatial_structure_prob_std": [],
-        "spatial_boundary_prob_mean": [],
-        "spatial_boundary_prob_std": [],
-        "spatial_structure_delta_norm": [],
-        "spatial_boundary_delta_norm": [],
-        "spatial_structure_injected_ratio": [],
-        "spatial_boundary_injected_ratio": [],
-        "gamma_structure_value": [],
-        "gamma_boundary_value": [],
-        "spatial_head_grad_norm": [],
-        "spatial_adapter_grad_norm": [],
-        "local_region_text_loss": [],
-        "local_region_projector_grad_norm": [],
-        "rsgr_local_structure_loss": [],
-        "rsgr_local_boundary_loss": [],
-        **{f"local_region_loss_{name}": [] for name in L1A_ATTRIBUTE_NAMES},
-        **{f"local_region_accuracy_{name}": [] for name in L1A_ATTRIBUTE_NAMES},
-        **{f"local_region_valid_count_{name}": [] for name in L1A_ATTRIBUTE_NAMES},
     }
-    _boundary_epoch_logging = _new_boundary_epoch_logging_state(args.device)
 
     optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, batched_input in enumerate(pbar):
-        _spatial_grad_diag = {
-            "spatial_head_grad_norm": float("nan"),
-            "spatial_adapter_grad_norm": float("nan"),
-        }
-        _local_projector_grad_norm = float("nan")
         if train_limit is not None and batch_idx >= train_limit:
             break
         batched_input = to_device(batched_input, args.device)
@@ -3892,16 +3528,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
         _d_per_instance_attr_labels = batched_input.get("per_instance_attr_labels", None)
         _d_per_instance_ids = batched_input.get("per_instance_ids", None)
         _d_label_inst = batched_input.get("label_inst", None)
-        _l1a_labels = batched_input.get("local_region_attr_labels", None)
-        _l1a_valid = batched_input.get("local_region_attr_valid", None)
-        _rsgr_structure_labels = None
-        _rsgr_boundary_labels = None
-        if getattr(args, "enable_rsgr", False):
-            if _l1a_labels is None or _l1a_labels.ndim != 3 or tuple(_l1a_labels.shape[1:]) != (4, 5):
-                raise RuntimeError("RSGR training requires augmented-mask L1-A labels [B,4,5]")
-            _rsgr_structure_labels, _rsgr_boundary_labels = split_local5_labels(
-                _l1a_labels, L1A_ATTRIBUTE_NAMES, load_local5_schema()
-            )
 
         # ── [SB_ATTR_BATCH_AUDIT]: verify SB attrs in batch (pnudp_dense_train, rank0, first batch) ──
         if batch_idx == 0 and rank == 0 and args.phase == "pnudp_dense_train":
@@ -3960,14 +3586,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 item["per_instance_ids"] = _d_per_instance_ids[i] if isinstance(_d_per_instance_ids, list) else _d_per_instance_ids
             if _d_label_inst is not None:
                 item["label_inst"] = _d_label_inst[i]
-            if _l1a_labels is not None:
-                item["local_region_attr_labels"] = _l1a_labels[i]
-            if _l1a_valid is not None:
-                item["local_region_attr_valid"] = _l1a_valid[i]
-            if _rsgr_structure_labels is not None:
-                item["rsgr_local_structure_labels"] = _rsgr_structure_labels[i]
-            if _rsgr_boundary_labels is not None:
-                item["rsgr_local_boundary_labels"] = _rsgr_boundary_labels[i]
             model_input.append(item)
 
         # ── Phase D model_input audit (rank0, first train batch only) ──
@@ -4008,24 +3626,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
 
         with _autocast_context(args):
             outputs = model(model_input, multimask_output=True)
-
-            _local_output = outputs[0] if outputs else {}
-            _local_text_loss = _local_output.get(
-                "local_region_text_loss", torch.zeros((), device=args.device)
-            )
-            _local_attr_losses = _local_output.get("local_region_attribute_losses", {})
-            _local_attr_accuracies = _local_output.get("local_region_attribute_accuracies", {})
-            _local_valid_counts = _local_output.get("local_region_valid_counts", {})
-            _rsgr_struct_loss = _local_output.get("rsgr_local_structure_loss", torch.zeros((), device=args.device))
-            _rsgr_bound_loss = _local_output.get("rsgr_local_boundary_loss", torch.zeros((), device=args.device))
-            if getattr(args, "enable_rsgr", False):
-                if not all(torch.is_tensor(value) and torch.isfinite(value).all() for value in (_rsgr_struct_loss, _rsgr_bound_loss)):
-                    raise RuntimeError("RSGR local attribute losses are missing or non-finite")
-            if getattr(args, "enable_local_region_text_alignment", False):
-                if not torch.is_tensor(_local_text_loss) or not torch.isfinite(_local_text_loss).all():
-                    raise RuntimeError("L1-A local text loss is missing or non-finite")
-                if bool(_local_output.get("local_region_feature_injection", True)):
-                    raise RuntimeError("L1-A feature injection must remain false")
 
             # ── Phase D gate audit: forward diagnostics (rank0, first 2 batches) ──
             if rank == 0 and args.phase == "semantic_injection":
@@ -4089,13 +3689,10 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                             or _structure_target.max() > 1):
                         raise RuntimeError("Invalid SGA-SB structure target: expected finite float values in [0, 1].")
                 if _use_boundary:
-                    _boundary_target_mode = str(
-                        getattr(args, "spatial_boundary_target_mode", "legacy_max")
-                    )
                     _boundary_target = generate_boundary_target(
                         _label_inst_batch,
                         kernel_size=3,
-                        target_size=(64, 64) if _boundary_target_mode == "legacy_max" else None,
+                        target_size=(64, 64),
                     ).to(device=args.device, dtype=torch.float32)
                     if (not torch.isfinite(_boundary_target).all()
                             or not torch.all((_boundary_target == 0) | (_boundary_target == 1))):
@@ -4335,73 +3932,16 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                 if _spatial_sb_targets is not None:
                     _struct_tgt = _spatial_sb_targets.get("structure_target", None)
                     _bound_tgt = _spatial_sb_targets.get("boundary_target", None)
-                    _structure_prediction = (
-                        structure_logits_i.unsqueeze(0) if structure_logits_i is not None else None
-                    )
-                    _boundary_prediction = (
-                        boundary_logits_i.unsqueeze(0) if boundary_logits_i is not None else None
-                    )
-                    _aligned_struct_tgt = None
-                    _aligned_bound_tgt = None
-                    _structure_resize = "inactive"
-                    _boundary_resize = "inactive"
                     if structure_logits_i is not None and _struct_tgt is not None:
-                        _raw_struct_tgt = _struct_tgt[i:i+1].to(
-                            device=structure_logits_i.device, dtype=torch.float32
-                        )
-                        _structure_resize = spatial_target_alignment_method(
-                            _raw_struct_tgt, _structure_prediction, "structure"
-                        )
-                        _aligned_struct_tgt = align_spatial_target_to_prediction(
-                            _raw_struct_tgt, _structure_prediction, "structure"
-                        )
                         loss_structure = compute_structure_loss(
-                            _structure_prediction,
-                            _aligned_struct_tgt,
+                            structure_logits_i.unsqueeze(0),  # [1, 1, 64, 64]
+                            _struct_tgt[i:i+1].to(device=structure_logits_i.device, dtype=torch.float32),
                         ) * args.spatial_structure_loss_weight
                     if boundary_logits_i is not None and _bound_tgt is not None:
-                        _raw_bound_tgt = _bound_tgt[i:i+1].to(
-                            device=boundary_logits_i.device, dtype=torch.float32
-                        )
-                        _boundary_target_mode = str(
-                            getattr(args, "spatial_boundary_target_mode", "legacy_max")
-                        )
-                        _boundary_target_kind = (
-                            "boundary_soft" if _boundary_target_mode == "direct_area_soft" else "boundary"
-                        )
-                        _boundary_resize = spatial_target_alignment_method(
-                            _raw_bound_tgt, _boundary_prediction, _boundary_target_kind
-                        )
-                        _aligned_bound_tgt = align_spatial_target_to_prediction(
-                            _raw_bound_tgt, _boundary_prediction, _boundary_target_kind
-                        )
                         loss_boundary = compute_boundary_loss(
-                            _boundary_prediction,
-                            _aligned_bound_tgt,
-                            target_mode=_boundary_target_mode,
+                            boundary_logits_i.unsqueeze(0),  # [1, 1, 64, 64]
+                            _bound_tgt[i:i+1].to(device=boundary_logits_i.device, dtype=torch.float32),
                         ) * args.spatial_boundary_loss_weight
-                        _accumulate_boundary_epoch_logging(
-                            _boundary_epoch_logging,
-                            _aligned_bound_tgt,
-                            _boundary_prediction,
-                            _boundary_target_mode,
-                        )
-                    if (rank == 0 and batch_idx == 0 and i == 0
-                            and not getattr(train_one_epoch, "_sga_sb_loss_shape_audit_printed", False)):
-                        train_one_epoch._sga_sb_loss_shape_audit_printed = True
-                        print(
-                            "[SGA_SB_LOSS_SHAPE_AUDIT]\n"
-                            f"structure_logits={tuple(_structure_prediction.shape) if _structure_prediction is not None else None}\n"
-                            f"structure_target_raw={tuple(_raw_struct_tgt.shape) if _structure_prediction is not None and _struct_tgt is not None else None}\n"
-                            f"structure_target_aligned={tuple(_aligned_struct_tgt.shape) if _aligned_struct_tgt is not None else None}\n"
-                            f"boundary_logits={tuple(_boundary_prediction.shape) if _boundary_prediction is not None else None}\n"
-                            f"boundary_target_raw={tuple(_raw_bound_tgt.shape) if _boundary_prediction is not None and _bound_tgt is not None else None}\n"
-                            f"boundary_target_aligned={tuple(_aligned_bound_tgt.shape) if _aligned_bound_tgt is not None else None}\n"
-                            f"structure_resize={_structure_resize}\n"
-                            f"boundary_resize={_boundary_resize}\n"
-                            f"boundary_target_mode={getattr(args, 'spatial_boundary_target_mode', 'legacy_max')}",
-                            flush=True,
-                        )
                     loss_spatial_sb = loss_structure + loss_boundary
                     if not torch.isfinite(loss_spatial_sb).all():
                         raise RuntimeError("SGA-SB produced NaN/Inf loss.")
@@ -4523,14 +4063,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                     )
 
             final_loss = loss_batch / max(len(images), 1)
-            if getattr(args, "enable_local_region_text_alignment", False):
-                final_loss = final_loss + float(args.local_region_text_weight) * _local_text_loss
-            if getattr(args, "enable_rsgr", False):
-                if float(args.rsgr_semantic_align_weight) != 0.0:
-                    raise ValueError("RSGR-1 semantic alignment weight must remain 0.0")
-                final_loss = final_loss + float(args.rsgr_local_attr_weight) * (
-                    _rsgr_struct_loss + _rsgr_bound_loss
-                )
             final_loss = final_loss / args.accumulation_steps
 
         is_accumulating = (batch_idx + 1) % args.accumulation_steps != 0 and (batch_idx + 1) != len(train_loader)
@@ -4790,23 +4322,12 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
                                 flush=True,
                             )
 
-            if getattr(args, "enable_local_region_text_alignment", False):
-                _local_module = getattr(unwrap_model(model), "local_region_text_alignment", None)
-                _local_gn_sq = 0.0
-                if _local_module is not None:
-                    for _param in _local_module.projectors.parameters():
-                        if _param.grad is not None:
-                            _local_gn_sq += _param.grad.detach().float().norm().item() ** 2
-                _local_projector_grad_norm = _local_gn_sq ** 0.5
-
             if scaler:
                 scaler.unscale_(optimizer)
-                _spatial_grad_diag = collect_spatial_sb_gradient_norms(model)
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                _spatial_grad_diag = collect_spatial_sb_gradient_norms(model)
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
 
@@ -4844,33 +4365,15 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
 
         current_loss_val = final_loss.detach().item() * args.accumulation_steps
         diag = collect_semantic_diagnostics(outputs)
-        spatial_diag = collect_spatial_sb_diagnostics(outputs)
-        spatial_diag.update(_spatial_grad_diag)
 
         n = max(len(images), 1)
         meters["total"].append(current_loss_val)
-        meters["local_region_text_loss"].append(float(_local_text_loss.detach().float().item()))
-        meters["local_region_projector_grad_norm"].append(_local_projector_grad_norm)
-        meters["rsgr_local_structure_loss"].append(float(_rsgr_struct_loss.detach().float().item()))
-        meters["rsgr_local_boundary_loss"].append(float(_rsgr_bound_loss.detach().float().item()))
-        for _local_name in L1A_ATTRIBUTE_NAMES:
-            _loss_value = _local_attr_losses.get(_local_name)
-            _acc_value = _local_attr_accuracies.get(_local_name)
-            meters[f"local_region_loss_{_local_name}"].append(
-                float(_loss_value.detach().float().item()) if torch.is_tensor(_loss_value) else 0.0
-            )
-            meters[f"local_region_accuracy_{_local_name}"].append(
-                float(_acc_value.detach().float().item()) if torch.is_tensor(_acc_value) else float("nan")
-            )
-            meters[f"local_region_valid_count_{_local_name}"].append(float(_local_valid_counts.get(_local_name, 0)))
 
         for key in ["mask", "heatmap", "hv", "pnurl", "density", "semantic_stability", "injection_penalty", "promptnu_lite_align_loss", "promptnu_guided_v3_align_loss", "spatial_structure", "spatial_boundary", "spatial_sb"]:
             meters[key].append(accum[key] / n)
 
         for key, val in diag.items():
             meters.setdefault(key, []).append(val)
-        for key, val in spatial_diag.items():
-            meters[key].append(val)
 
         for key in ATTRIBUTE_LOGIT_KEYS:
             meter_key = f"attr_acc_{key}"
@@ -4897,12 +4400,6 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             writer.add_scalar("Train/Loss_Injection_Penalty", meters["injection_penalty"][-1], global_step)
             writer.add_scalar("Train/Loss_PromptNuLite_Align", meters["promptnu_lite_align_loss"][-1], global_step)
             writer.add_scalar("Train/Loss_PromptNuGuidedV3_Align", meters["promptnu_guided_v3_align_loss"][-1], global_step)
-            writer.add_scalar("Train/Loss_LocalRegionText", meters["local_region_text_loss"][-1], global_step)
-            _write_scalar_if_finite(writer, "Train/GradNorm_LocalProjectors", meters["local_region_projector_grad_norm"][-1], global_step)
-            for _local_name in L1A_ATTRIBUTE_NAMES:
-                _write_scalar_if_finite(writer, f"Train/LocalLoss_{_local_name}", meters[f"local_region_loss_{_local_name}"][-1], global_step)
-                _write_scalar_if_finite(writer, f"Train/LocalAccuracy_{_local_name}", meters[f"local_region_accuracy_{_local_name}"][-1], global_step)
-                writer.add_scalar(f"Train/LocalValidCount_{_local_name}", meters[f"local_region_valid_count_{_local_name}"][-1], global_step)
             writer.add_scalar("Train/SBStructLoss", meters["spatial_structure"][-1], global_step)
             writer.add_scalar("Train/SBBoundLoss", meters["spatial_boundary"][-1], global_step)
             writer.add_scalar("Train/SBLoss", meters["spatial_sb"][-1], global_step)
@@ -4968,12 +4465,11 @@ def train_one_epoch(args, model, optimizer, train_loader, epoch, criterion, scal
             epoch_stats[k] = float("nan")
         else:
             epoch_stats[k] = float(np.nanmean(arr))
-    epoch_stats.update(_finalize_boundary_epoch_logging(_boundary_epoch_logging))
     return epoch_stats
 
 
 # ==================================================================================================
-# 6. Validation logic. Per-image metrics are globally sum/count aggregated.
+# 6. Validation logic. Kept as the original fast validation route.
 # ==================================================================================================
 @torch.no_grad()
 def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
@@ -4982,28 +4478,27 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
     model.eval()
 
     val_results = {k: [] for k in args.metrics}
-    local_sample_ids = []
-    local_sample_id_set = set()
     visualize_done = False
 
     total_val_batches = len(val_loader)
 
-    # Formal validation consumes the fixed global subset selected before rank sharding.
-    # Explicit max/debug limits remain debug-only and are never interpreted as a fraction per rank.
+    # --- Batch limit logic: debug_max_* takes priority over hardcoded 40% ---
     _debug_max_val = getattr(args, "debug_max_val_batches", None)
     _max_val = getattr(args, "max_val_batches", None)
     if _debug_max_val is not None and int(_debug_max_val) > 0:
-        limit_batches = min(int(_debug_max_val), total_val_batches)
+        limit_batches = int(_debug_max_val)
         _limit_source = "debug_max_val_batches"
     elif _max_val is not None and int(_max_val) > 0:
-        limit_batches = min(int(_max_val), total_val_batches)
-        _limit_source = "max_val_batches_debug_only"
+        limit_batches = int(_max_val)
+        _limit_source = "max_val_batches"
     else:
-        limit_batches = total_val_batches
-        _limit_source = "fixed_global_subset"
+        limit_batches = int(total_val_batches * 0.4)
+        _limit_source = "40% default"
+    if limit_batches < 1:
+        limit_batches = 1
 
     if rank == 0:
-        if _limit_source != "fixed_global_subset":
+        if _limit_source != "40% default":
             print(
                 f"[PHASE_D_LIMIT] val_limit={limit_batches} | source={_limit_source} | "
                 f"total_dataloader={total_val_batches}",
@@ -5158,19 +4653,10 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
                     interpolation=cv2.INTER_NEAREST,
                 )
 
-            rel_paths = batched_input.get("rel_path", None)
-            if not isinstance(rel_paths, list) or i >= len(rel_paths) or not rel_paths[i]:
-                raise RuntimeError("validation requires a stable non-empty rel_path sample_id")
-            sample_id = str(rel_paths[i])
-            if sample_id in local_sample_id_set:
-                raise RuntimeError(f"duplicate validation sample_id on rank {rank}: {sample_id}")
-            local_sample_id_set.add(sample_id)
-            local_sample_ids.append(sample_id)
-
             res = SegMetrics(pred_mask, gt_valid, args.metrics)
             for k in args.metrics:
                 if k in res:
-                    val_results[k].append(float(res[k]))
+                    val_results[k].append(res[k])
 
             if rank == 0 and writer is not None and not visualize_done:
                 img_vis = images[i].cpu().numpy().transpose(1, 2, 0)
@@ -5187,64 +4673,7 @@ def validate_one_epoch(args, model, val_loader, epoch, writer, rank):
     gc.collect()
     torch.cuda.empty_cache()
 
-    ddp_active = dist.is_available() and dist.is_initialized()
-    world_size = dist.get_world_size() if ddp_active else 1
-    gathered_ids = [None for _ in range(world_size)]
-    if ddp_active:
-        dist.all_gather_object(gathered_ids, local_sample_ids)
-    else:
-        gathered_ids[0] = local_sample_ids
-    all_sample_ids = [sample_id for rank_ids in gathered_ids for sample_id in rank_ids]
-    global_unique_ids = set(all_sample_ids)
-    duplicates_removed = len(all_sample_ids) - len(global_unique_ids)
-    if duplicates_removed:
-        raise RuntimeError(
-            f"validation sample_id collision before aggregation: duplicates={duplicates_removed}"
-        )
-
-    metric_keys = list(args.metrics)
-    local_sums = [float(np.sum(val_results[k], dtype=np.float64)) for k in metric_keys]
-    local_counts = [len(val_results[k]) for k in metric_keys]
-    # Each metric is computed per image. Global sum/count therefore yields the
-    # dataset macro mean; rank means are never averaged.
-    packed = []
-    for metric_sum, metric_count in zip(local_sums, local_counts):
-        packed.extend((metric_sum, float(metric_count)))
-    packed_tensor = torch.tensor(packed, dtype=torch.float64, device=args.device)
-    if ddp_active:
-        dist.all_reduce(packed_tensor, op=dist.ReduceOp.SUM)
-    reduced = packed_tensor.cpu().tolist()
-    global_sums = {name: reduced[2 * idx] for idx, name in enumerate(metric_keys)}
-    global_counts = {name: int(reduced[2 * idx + 1]) for idx, name in enumerate(metric_keys)}
-    avg_results = {
-        name: global_sums[name] / global_counts[name] if global_counts[name] else 0.0
-        for name in metric_keys
-    }
-
-    print(
-        "[DDP_SAMPLE_AUDIT] "
-        f"rank={rank} local_seen={len(local_sample_ids)} "
-        f"global_seen_before_dedup={len(all_sample_ids)} "
-        f"global_unique={len(global_unique_ids)} duplicates_removed={duplicates_removed}",
-        flush=True,
-    )
-    if rank == 0:
-        print(
-            "[VAL_DDP_AGG] "
-            f"world_size={world_size} local_samples={len(local_sample_ids)} "
-            f"per_rank_samples={[len(ids) for ids in gathered_ids]} "
-            f"global_samples={len(global_unique_ids)} "
-            f"dice_sum={global_sums.get('dice', 0.0):.8f} "
-            f"iou_sum={global_sums.get('iou', 0.0):.8f} "
-            f"aji_sum={global_sums.get('mAJI', 0.0):.8f} "
-            f"pq_sum={global_sums.get('mPQ', 0.0):.8f} "
-            f"global_dice={avg_results.get('dice', 0.0):.8f} "
-            f"global_iou={avg_results.get('iou', 0.0):.8f} "
-            f"global_mAJI={avg_results.get('mAJI', 0.0):.8f} "
-            f"global_mPQ={avg_results.get('mPQ', 0.0):.8f}",
-            flush=True,
-        )
-
+    avg_results = {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in val_results.items()}
     if rank == 0 and writer is not None:
         for metric_name, metric_value in avg_results.items():
             writer.add_scalar(f"Val/{metric_name}", metric_value, epoch)
@@ -5380,8 +4809,6 @@ def main(args):
     # ── Initialise audit mode for Stage D log slim-down ──
     audit = AuditMode.from_args(args)
     set_global_audit_mode(audit)
-    os.environ["SGA_SB_VERBOSE_TARGETS"] = "1" if audit.is_debug else "0"
-    os.environ["SGA_SB_VERBOSE_DIAGNOSTICS"] = "1" if audit.is_debug else "0"
 
     platform_tb_roots = ["/home/pod", "/root/shared-nvme/tensorboard/logs"]
     platform_tb_root = None
@@ -5440,13 +4867,6 @@ def main(args):
             max_instances_per_image=args.max_instances_per_image,
             min_instance_area=args.min_instance_area,
             phase=args.phase,
-            enable_local_region_text_alignment=(
-                bool(getattr(args, "enable_local_region_text_alignment", False))
-                or bool(getattr(args, "enable_rsgr", False))
-            ),
-            local_region_window_size=int(getattr(args, "local_region_window_size", 192)),
-            local_region_thresholds_path=getattr(args, "local_region_thresholds_path", None),
-            local_region_audit=bool(getattr(args, "local_region_audit", False)),
         )
         val_dataset = UniversalDataset(
             data_root=args.data_path,
@@ -5460,47 +4880,10 @@ def main(args):
             max_instances_per_image=args.max_instances_per_image,
             min_instance_area=args.min_instance_area,
             phase=args.phase,
-            enable_local_region_text_alignment=False,
-            local_region_window_size=int(getattr(args, "local_region_window_size", 192)),
-            local_region_thresholds_path=None,
-            local_region_audit=False,
         )
 
         train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
-        val_indices = fixed_subset_indices(
-            len(val_dataset), float(args.val_fraction), int(args.val_subset_seed)
-        )
-        val_sampler = DistributedEvalSampler(
-            val_indices, num_replicas=world_size, rank=rank
-        )
-
-        if rank == 0:
-            evaluation_protocol = protocol_from_train_args(args)
-            run_audit_dir = os.path.join(model_save_dir, f"run_audit_{timestamp}")
-            protocol_path = write_evaluation_protocol(evaluation_protocol, run_audit_dir)
-            manifest_paths = write_run_manifests(
-                run_dir=run_audit_dir,
-                run_name=args.run_name,
-                args=args,
-                protocol=evaluation_protocol,
-                project_root=os.path.dirname(os.path.abspath(__file__)),
-                parent_checkpoint=args.resume if args.resume else args.sam_checkpoint,
-                evaluation_context={
-                    "data_split": "test_as_train_validation",
-                    "sample_count": len(val_indices),
-                    "unique_sample_count": len(val_indices),
-                    "duplicate_sample_count": 0,
-                    "world_size": world_size,
-                    "sampler_type": "DistributedEvalSampler(no_padding)",
-                },
-            )
-            logger.info("[EVALUATION_PROTOCOL] " + evaluation_protocol.to_json().replace("\n", " "))
-            logger.info(
-                f"[VAL_SUBSET] validation_fraction={args.val_fraction} "
-                f"global_target_sample_count={len(val_indices)} fixed=True "
-                f"subset_seed={args.val_subset_seed} sampler=DistributedEvalSampler(no_padding)"
-            )
-            logger.info(f"[RUN_MANIFEST] protocol={protocol_path} files={manifest_paths}")
+        val_sampler = DistributedSampler(val_dataset, shuffle=True) if world_size > 1 else None
 
         # ── DataLoader configuration (container-safe defaults) ──────────────
         train_num_workers = args.num_workers
@@ -6329,7 +5712,6 @@ def main(args):
 
                 if rank == 0:
                     dice = float(val_res.get("dice", 0.0))
-                    iou = float(val_res.get("iou", 0.0))
                     aji = float(val_res.get("mAJI", 0.0))
                     pq = float(val_res.get("mPQ", 0.0))
 
@@ -6358,8 +5740,6 @@ def main(args):
                         f"PG3Struct:{_v3_struct_loss:.6f} PG3Bound:{_v3_bound_loss:.6f} "
                         f"PG3SimS:{_v3_sim_s:.4f} PG3SimB:{_v3_sim_b:.4f} "
                         f"PG3ScaleStd:{_v3_scale_std:.6f} PG3DeltaRatio:{_v3_delta_ratio:.6f} | "
-                        f"L1A:{train_stats['local_region_text_loss']:.6f} "
-                        f"L1AGrad:{train_stats['local_region_projector_grad_norm']:.6e} | "
                         f"D:{train_stats['density']:.3f}, "
                         f"SBStructLoss:{train_stats['spatial_structure']:.6f}, "
                         f"SBBoundLoss:{train_stats['spatial_boundary']:.6f}, "
@@ -6376,7 +5756,7 @@ def main(args):
                         f"InjectedNorm:{train_stats['injected_delta_norm']:.6e} | "
                         f"InjRatio:{train_stats['injection_ratio']:.6e} | "
                         f"DeltaRatio:{train_stats['semantic_delta_ratio']:.6e} | "
-                        f"Dice:{dice:.4f} | IoU:{iou:.4f} | AJI:{aji:.4f} | PQ:{pq:.4f}"
+                        f"Dice:{dice:.4f} | AJI:{aji:.4f} | PQ:{pq:.4f}"
                     )
 
                     # ── Phase D checkpoint: latest + best-by-metric ──
@@ -6426,55 +5806,6 @@ def main(args):
                         best_pq_path = os.path.join(model_dir, "best_pq_model.pth")
                         torch.save(checkpoint_dict, best_pq_path)
                         logger.info(f"[PHASE_D_CKPT] New Best PQ: {pq:.4f}. Saved best_pq_model.pth")
-
-                    # Strict C0/L1 history, one record per epoch.
-                    _local_weight = float(getattr(args, "local_region_text_weight", 0.1))
-                    _local_loss_epoch = float(train_stats.get("local_region_text_loss", 0.0))
-                    _local_enabled = bool(getattr(args, "enable_local_region_text_alignment", False))
-                    _projector_grad = float(train_stats.get("local_region_projector_grad_norm", 0.0))
-                    if _local_enabled and not math.isfinite(_projector_grad):
-                        raise RuntimeError(
-                            "L1-A projector_grad_norm must be finite when local alignment is enabled"
-                        )
-                    if not _local_enabled:
-                        # C0 has no local projectors. Record the inactive branch as
-                        # an explanatory finite zero so strict JSON remains valid.
-                        _projector_grad = 0.0
-                    _record = {
-                        "epoch": epoch + 1,
-                        "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                        "segmentation_loss": float(train_stats["total"] - _local_weight * _local_loss_epoch),
-                        "numeric_attribute_loss": 0.0,
-                        "numeric_attribute_loss_definition": "no separate GT numeric loss in Exp5 semantic-injection route",
-                        "local_text_total_loss": _local_loss_epoch,
-                        "local_text_weight": _local_weight,
-                        "projector_grad_norm": _projector_grad,
-                        "gpu_peak_memory_bytes": int(torch.cuda.max_memory_allocated(args.device)) if torch.cuda.is_available() else 0,
-                        "Dice": dice,
-                        "IoU": iou,
-                        "mAJI": aji,
-                        "mPQ": pq,
-                    }
-                    for _name in L1A_ATTRIBUTE_NAMES:
-                        _record[f"local_loss_{_name}"] = float(train_stats.get(f"local_region_loss_{_name}", 0.0))
-                        _acc = float(train_stats.get(f"local_region_accuracy_{_name}", float("nan")))
-                        _record[f"local_accuracy_{_name}"] = _acc if math.isfinite(_acc) else None
-                        _record[f"mean_valid_regions_per_batch_{_name}"] = float(train_stats.get(f"local_region_valid_count_{_name}", 0.0))
-                    _history_path = os.path.join(model_dir, "metrics_history.json")
-                    _history = []
-                    if os.path.isfile(_history_path):
-                        with open(_history_path, "r", encoding="utf-8") as _f:
-                            _history = json.load(_f)
-                    _history = [row for row in _history if int(row.get("epoch", -1)) != epoch + 1]
-                    _history.append(_record)
-                    _history.sort(key=lambda row: int(row["epoch"]))
-                    _tmp_history = _history_path + ".tmp"
-                    with open(_tmp_history, "w", encoding="utf-8") as _f:
-                        json.dump(_history, _f, indent=2, allow_nan=False)
-                    os.replace(_tmp_history, _history_path)
-                    logger.info("[L1A_EPOCH_SUMMARY] " + " ".join(f"{key}={value}" for key, value in _record.items() if not isinstance(value, str)))
-                    if epoch + 1 == args.epochs:
-                        torch.save(checkpoint_dict, os.path.join(model_dir, "epoch_005_model.pth"))
 
             # ────────────────────────────────────────────────────────────
             # PNuDP Dense Training (Stage D): segmentation with pnudp_dense fusion
@@ -6682,28 +6013,26 @@ def main(args):
 
                 if rank == 0:
                     dice = float(val_res.get("dice", 0.0))
-                    iou = float(val_res.get("iou", 0.0))
                     aji = float(val_res.get("mAJI", 0.0))
                     pq = float(val_res.get("mPQ", 0.0))
 
-                    if os.environ.get("SGA_SB_P3_MODE", "0") != "1":
-                        logger.info(
-                            f"Ep {epoch + 1}/{args.epochs} | Stage: {args.phase} | "
-                            f"ASR:{args.asr_variant}/{args.asr_regression_stage if args.asr_regression else 'normal'} | "
-                            f"Loss: {train_stats['total']:.4f} "
-                            f"(M:{train_stats['mask']:.3f}, H:{train_stats['heatmap']:.3f}, "
-                            f"HV:{train_stats['hv']:.3f}, P:{train_stats['pnurl']:.3f}, D:{train_stats['density']:.3f}, "
-                            f"S:{train_stats['semantic_stability']:.4f}) | "
-                            f"AttrAcc({_format_attr_acc(train_stats)}) | "
-                            f"AttrLoss({_format_attr_loss(train_stats)}) | "
-                            f"GateMean:{train_stats['semantic_channel_gate_mean']:.6e} | "
-                            f"DeltaNorm:{train_stats['semantic_delta_norm']:.6e} | "
-                            f"BaseNorm:{train_stats['base_feat_norm']:.6e} | "
-                            f"InjectedNorm:{train_stats['injected_delta_norm']:.6e} | "
-                            f"InjRatio:{train_stats['injection_ratio']:.6e} | "
-                            f"DeltaRatio:{train_stats['semantic_delta_ratio']:.6e} | "
-                            f"Dice:{dice:.4f} | AJI:{aji:.4f} | PQ:{pq:.4f}"
-                        )
+                    logger.info(
+                        f"Ep {epoch + 1}/{args.epochs} | Stage: {args.phase} | "
+                        f"ASR:{args.asr_variant}/{args.asr_regression_stage if args.asr_regression else 'normal'} | "
+                        f"Loss: {train_stats['total']:.4f} "
+                        f"(M:{train_stats['mask']:.3f}, H:{train_stats['heatmap']:.3f}, "
+                        f"HV:{train_stats['hv']:.3f}, P:{train_stats['pnurl']:.3f}, D:{train_stats['density']:.3f}, "
+                        f"S:{train_stats['semantic_stability']:.4f}) | "
+                        f"AttrAcc({_format_attr_acc(train_stats)}) | "
+                        f"AttrLoss({_format_attr_loss(train_stats)}) | "
+                        f"GateMean:{train_stats['semantic_channel_gate_mean']:.6e} | "
+                        f"DeltaNorm:{train_stats['semantic_delta_norm']:.6e} | "
+                        f"BaseNorm:{train_stats['base_feat_norm']:.6e} | "
+                        f"InjectedNorm:{train_stats['injected_delta_norm']:.6e} | "
+                        f"InjRatio:{train_stats['injection_ratio']:.6e} | "
+                        f"DeltaRatio:{train_stats['semantic_delta_ratio']:.6e} | "
+                        f"Dice:{dice:.4f} | AJI:{aji:.4f} | PQ:{pq:.4f}"
+                    )
 
                     checkpoint_dict = {
                         "epoch": epoch,
@@ -6723,76 +6052,6 @@ def main(args):
 
                     latest_model_path = os.path.join(args.work_dir, "models", args.run_name, "latest_model.pth")
                     torch.save(checkpoint_dict, latest_model_path)
-
-                    if os.environ.get("SGA_SB_P3_MODE", "0") == "1":
-                        _record = {
-                            "epoch": epoch + 1,
-                            "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                            "segmentation_loss": float(train_stats["total"] - train_stats["spatial_sb"]),
-                            "SBStructLoss": float(train_stats["spatial_structure"]),
-                            "SBBoundLoss": float(train_stats["spatial_boundary"]),
-                            "SBLoss": float(train_stats["spatial_sb"]),
-                            "structure_probability_mean": float(train_stats["spatial_structure_prob_mean"]),
-                            "structure_probability_std": float(train_stats["spatial_structure_prob_std"]),
-                            "boundary_probability_mean": float(train_stats["spatial_boundary_prob_mean"]),
-                            "boundary_probability_std": float(train_stats["spatial_boundary_prob_std"]),
-                            "BoundaryTargetMass": float(train_stats["boundary_target_mass"]),
-                            "BoundaryTargetMean": float(train_stats["boundary_target_mean"]),
-                            "BoundaryTargetMax": float(train_stats["boundary_target_max"]),
-                            "BoundaryTargetNonzeroRatio": float(train_stats["boundary_target_nonzero_ratio"]),
-                            "BoundaryPosWeight": float(train_stats["boundary_pos_weight"]),
-                            "BoundaryPredMean": float(train_stats["boundary_pred_mean"]),
-                            "BoundaryPredStd": float(train_stats["boundary_pred_std"]),
-                            "BoundaryPredQ90": float(train_stats["boundary_pred_q90"]),
-                            "BoundaryPredQ99": float(train_stats["boundary_pred_q99"]),
-                            "structure_delta_norm": float(train_stats["spatial_structure_delta_norm"]),
-                            "boundary_delta_norm": float(train_stats["spatial_boundary_delta_norm"]),
-                            "structure_injected_ratio": float(train_stats["spatial_structure_injected_ratio"]),
-                            "boundary_injected_ratio": float(train_stats["spatial_boundary_injected_ratio"]),
-                            "gamma_structure": float(train_stats["gamma_structure_value"]),
-                            "gamma_boundary": float(train_stats["gamma_boundary_value"]),
-                            "active_adapter_gradient_norm": float(train_stats["spatial_adapter_grad_norm"]),
-                            "active_head_gradient_norm": float(train_stats["spatial_head_grad_norm"]),
-                            "Dice": dice, "IoU": iou, "mAJI": aji, "mPQ": pq,
-                        }
-                        _history_path = os.path.join(args.work_dir, "models", args.run_name, "metrics_history.json")
-                        _history = []
-                        if os.path.isfile(_history_path):
-                            with open(_history_path, "r", encoding="utf-8") as _f:
-                                _history = json.load(_f)
-                        _history = [item for item in _history if int(item.get("epoch", -1)) != epoch + 1]
-                        _history.append(_record)
-                        _history.sort(key=lambda item: int(item["epoch"]))
-                        _history_tmp = _history_path + ".tmp"
-                        with open(_history_tmp, "w", encoding="utf-8") as _f:
-                            json.dump(_history, _f, indent=2, allow_nan=True)
-                        os.replace(_history_tmp, _history_path)
-                        logger.info(
-                            "[P3_EPOCH_SUMMARY] "
-                            f"epoch={epoch + 1} learning_rate={_record['learning_rate']:.6e} "
-                            f"segmentation_loss={_record['segmentation_loss']:.6f} "
-                            f"SBStructLoss={_record['SBStructLoss']:.6f} SBBoundLoss={_record['SBBoundLoss']:.6f} "
-                            f"SBLoss={_record['SBLoss']:.6f} StructDeltaNorm={_record['structure_delta_norm']:.6e} "
-                            f"BoundDeltaNorm={_record['boundary_delta_norm']:.6e} "
-                            f"StructInjRatio={_record['structure_injected_ratio']:.6e} "
-                            f"BoundInjRatio={_record['boundary_injected_ratio']:.6e} "
-                            f"GammaStruct={_record['gamma_structure']:.6f} GammaBound={_record['gamma_boundary']:.6f} "
-                            f"BoundaryTargetMass={_record['BoundaryTargetMass']:.6f} "
-                            f"BoundaryTargetMean={_record['BoundaryTargetMean']:.6e} "
-                            f"BoundaryTargetMax={_record['BoundaryTargetMax']:.6f} "
-                            f"BoundaryTargetNonzeroRatio={_record['BoundaryTargetNonzeroRatio']:.6e} "
-                            f"BoundaryPosWeight={_record['BoundaryPosWeight']:.6f} "
-                            f"BoundaryPredMean={_record['BoundaryPredMean']:.6e} "
-                            f"BoundaryPredStd={_record['BoundaryPredStd']:.6e} "
-                            f"BoundaryPredQ90={_record['BoundaryPredQ90']:.6e} "
-                            f"BoundaryPredQ99={_record['BoundaryPredQ99']:.6e} "
-                            f"Dice={dice:.6f} IoU={iou:.6f} mAJI={aji:.6f} mPQ={pq:.6f}"
-                        )
-                        if epoch + 1 == 5:
-                            torch.save(
-                                checkpoint_dict,
-                                os.path.join(args.work_dir, "models", args.run_name, "epoch_005_model.pth"),
-                            )
 
                     if aji > best_aji:
                         best_aji = aji

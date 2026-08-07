@@ -13,16 +13,8 @@ from .image_encoder import ImageEncoderViT
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
 from .pnurl import PNuRL
-from .rsgr import RegionSemanticGrounding, load_prototype_banks
 from training.pnudp_dense_diag import PNuDPDenseTrain, NUM_SB_PROMPTS
 from training.logging_utils import audit_print
-from training.local_region_text_alignment import (
-    ATTRIBUTE_NAMES as L1A_ATTRIBUTE_NAMES,
-    LocalRegionTextAlignment,
-    canonical_attribute_names,
-    maybe_compute_local_alignment,
-    validate_no_eval_gt,
-)
 
 
 def _build_sam_print(*args, **kwargs):
@@ -2025,28 +2017,6 @@ class TextSam(Sam):
         enable_numeric_attr_freqpath_guidance: bool = False,
         numeric_attr_freqpath_hidden_dim: int = 128,
         numeric_attr_freqpath_init: str = "zero",
-        # --- L1-A: Local Region Text Alignment (supervision only) ---
-        enable_local_region_text_alignment: bool = False,
-        local_region_text_prototype_path: Optional[str] = None,
-        local_region_window_size: int = 192,
-        local_region_text_temperature: float = 0.07,
-        local_region_text_attributes: str = "density,size_heterogeneity,crowding,boundary_irregularity,elongation",
-        local_region_policy: str = "complete_only",
-        local_region_text_supervision_only: bool = False,
-        # --- RSGR-1: Region-Semantic Grounding Randomization ---
-        enable_rsgr: bool = False,
-        rsgr_mode: str = "no_local",
-        rsgr_num_regions: int = 4,
-        rsgr_region_size: int = 192,
-        rsgr_injection_scale: float = 0.05,
-        rsgr_max_injection_ratio: float = 0.02,
-        rsgr_prototype_source: str = "conch",
-        rsgr_prototype_path: Optional[str] = None,
-        rsgr_prototype_detach: bool = True,
-        rsgr_attr_detach: bool = False,
-        rsgr_shuffle_scope: str = "within_sample",
-        rsgr_random_seed: int = 42,
-        rsgr_overlap_blend: str = "normalized",
         # --- PromptNu-lite v2: Residual-Coupled Semantic Alignment ---
         enable_promptnu_lite_align: bool = False,
         promptnu_lite_target: str = "semantic_delta",
@@ -2142,33 +2112,6 @@ class TextSam(Sam):
     ):
         super().__init__(image_encoder, prompt_encoder, mask_decoder, pixel_mean, pixel_std)
 
-        # L1-A is a read-only supervision branch over image_embeddings.
-        self.enable_local_region_text_alignment = bool(enable_local_region_text_alignment)
-        self.local_region_text_alignment: Optional[LocalRegionTextAlignment] = None
-        self.local_region_text_supervision_only = bool(local_region_text_supervision_only)
-        self.local_region_feature_injection = False
-        if self.enable_local_region_text_alignment:
-            if not self.local_region_text_supervision_only:
-                raise ValueError("L1-A must use --local_region_text_supervision_only")
-            if int(local_region_window_size) != 192:
-                raise ValueError("L1-A local_region_window_size must be 192")
-            if str(local_region_policy).strip().lower() != "complete_only":
-                raise ValueError("L1-A local_region_policy must be complete_only")
-            canonical_attribute_names(local_region_text_attributes)
-            if not local_region_text_prototype_path:
-                raise ValueError("local_region_text_prototype_path is required when L1-A is enabled")
-            # Fork RNG so enabling L1-A cannot perturb initialization of any
-            # existing numeric/segmentation parameter created later.
-            _l1a_seed = int(torch.initial_seed())
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed((_l1a_seed + 15485863) % (2**63 - 1))
-                self.local_region_text_alignment = LocalRegionTextAlignment.from_file(
-                    local_region_text_prototype_path,
-                    temperature=float(local_region_text_temperature),
-                    input_dim=256,
-                    hidden_dim=256,
-                )
-
         # ── SGA-SB v1 CORRECTION: Spatial Guidance Mode ──
         spatial_sb_mode = str(spatial_sb_mode).lower().strip()
         spatial_sb_branch = str(spatial_sb_branch).lower().strip()
@@ -2228,83 +2171,31 @@ class TextSam(Sam):
             _use_struct = spatial_sb_branch in ("structure", "both")
             _use_bound = spatial_sb_branch in ("boundary", "both")
 
-            # Branch-local RNG scopes make a branch's initialization independent
-            # of whether the other branch is present. This is an initialization
-            # control for causal ablation only; it does not alter forward math.
-            _spatial_sb_seed = int(torch.initial_seed())
-
             if _use_struct:
-                with torch.random.fork_rng(devices=[]):
-                    torch.manual_seed((_spatial_sb_seed + 104729) % (2**63 - 1))
-                    self.spatial_structure_head = SpatialStructureHead(in_dim=256, hidden_dim=128)
-                    if self.spatial_sb_mode == "guidance":
-                        self.spatial_structure_adapter = SpatialStructureAdapter(
-                            in_dim=1,
-                            out_dim=self.structure_guidance_channels,
-                            hidden_dim=32,
-                        )
+                self.spatial_structure_head = SpatialStructureHead(in_dim=256, hidden_dim=128)
                 if self.spatial_sb_mode == "guidance":
+                    self.spatial_structure_adapter = SpatialStructureAdapter(
+                        in_dim=1,
+                        out_dim=self.structure_guidance_channels,
+                        hidden_dim=32,
+                    )
                     assert self.spatial_structure_adapter.net[-1].out_channels == self.structure_guidance_channels
                     self.gamma_structure = nn.Parameter(
                         torch.tensor(float(spatial_structure_guidance_init))
                     )
 
             if _use_bound:
-                with torch.random.fork_rng(devices=[]):
-                    torch.manual_seed((_spatial_sb_seed + 130363) % (2**63 - 1))
-                    self.spatial_boundary_head = SpatialBoundaryHead(in_dim=256, hidden_dim=128)
-                    if self.spatial_sb_mode == "guidance":
-                        self.spatial_boundary_adapter = SpatialBoundaryAdapter(
-                            in_dim=1,
-                            out_dim=self.boundary_guidance_channels,
-                            hidden_dim=32,
-                        )
+                self.spatial_boundary_head = SpatialBoundaryHead(in_dim=256, hidden_dim=128)
                 if self.spatial_sb_mode == "guidance":
+                    self.spatial_boundary_adapter = SpatialBoundaryAdapter(
+                        in_dim=1,
+                        out_dim=self.boundary_guidance_channels,
+                        hidden_dim=32,
+                    )
                     assert self.spatial_boundary_adapter.net[-1].out_channels == self.boundary_guidance_channels
                     self.gamma_boundary = nn.Parameter(
                         torch.tensor(float(spatial_boundary_guidance_init))
                     )
-
-        # RSGR uses the existing decoder branch-delta contract; no decoder math changes.
-        self.enable_rsgr = bool(enable_rsgr)
-        self.rsgr = None
-        self.rsgr_prototype_source = str(rsgr_prototype_source)
-        if self.enable_rsgr:
-            if int(rsgr_num_regions) != 4 or int(rsgr_region_size) != 192:
-                raise ValueError("RSGR-1 requires four 192x192 regions")
-            if str(rsgr_shuffle_scope) != "within_sample":
-                raise ValueError("RSGR-1 shuffle scope must be within_sample")
-            if str(rsgr_overlap_blend) != "normalized":
-                raise ValueError("RSGR-1 overlap blending must be normalized")
-            if self.spatial_sb_mode != "none":
-                raise ValueError("RSGR and SGA-SB branch deltas cannot be enabled together")
-            if str(asr_variant).lower().strip() != "freqpath" or not use_asr:
-                raise ValueError("RSGR requires use_asr=True and asr_variant='freqpath'")
-            if not isinstance(self.structure_guidance_channels, int) or not isinstance(self.boundary_guidance_channels, int):
-                raise RuntimeError("RSGR requires decoder structure/detail channel contracts")
-            if not rsgr_prototype_path:
-                raise ValueError("all RSGR Local-5 modes require --rsgr_prototype_path and metadata")
-            _rsgr_structure_bank, _rsgr_boundary_bank = load_prototype_banks(rsgr_prototype_path)
-            self.rsgr_prototype_source = str(rsgr_prototype_source)
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(int(rsgr_random_seed) + 32452843)
-                self.rsgr = RegionSemanticGrounding(
-                    input_dim=256,
-                    structure_channels=self.structure_guidance_channels,
-                    boundary_channels=self.boundary_guidance_channels,
-                    structure_prototypes=_rsgr_structure_bank,
-                    boundary_prototypes=_rsgr_boundary_bank,
-                    mode=str(rsgr_mode),
-                    injection_scale=float(rsgr_injection_scale),
-                    max_injection_ratio=float(rsgr_max_injection_ratio),
-                    random_seed=int(rsgr_random_seed),
-                    attr_detach=bool(rsgr_attr_detach),
-                    prototype_detach=bool(rsgr_prototype_detach),
-                )
-            _build_sam_print(
-                f"[RSGR_INIT] mode={rsgr_mode} source={self.rsgr_prototype_source} "
-                f"trainable={sum(p.numel() for p in self.rsgr.parameters() if p.requires_grad)}"
-            )
 
         # ── Legacy spatial_instance_attr_mode (ablation) ──
         spatial_instance_attr_mode = str(spatial_instance_attr_mode).lower().strip()
@@ -4241,7 +4132,6 @@ class TextSam(Sam):
         )
 
     def forward(self, batched_input, multimask_output=False):
-        validate_no_eval_gt(self.training, batched_input)
         # ═══════════════════════════════════════════════════════════════
         # GT Leakage Protection: reject oracle spatial maps in eval mode
         # ═══════════════════════════════════════════════════════════════
@@ -4258,46 +4148,6 @@ class TextSam(Sam):
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         image_embeddings = self.image_encoder(input_images)
         device = image_embeddings.device
-
-        rsgr_output = None
-        if self.enable_rsgr and self.rsgr is not None:
-            if not self.training:
-                forbidden = ("rsgr_local_structure_labels", "rsgr_local_boundary_labels", "label_inst", "instance_ids")
-                leaked = sorted({key for item in batched_input for key in forbidden if key in item})
-                if leaked:
-                    raise RuntimeError("[RSGR_GT_GUARD] eval/test received forbidden keys: " + ",".join(leaked))
-            _rsgr_s_labels = None
-            _rsgr_b_labels = None
-            if self.training and all("rsgr_local_structure_labels" in item for item in batched_input):
-                _rsgr_s_labels = torch.stack([item["rsgr_local_structure_labels"].to(device) for item in batched_input])
-            if self.training and all("rsgr_local_boundary_labels" in item for item in batched_input):
-                _rsgr_b_labels = torch.stack([item["rsgr_local_boundary_labels"].to(device) for item in batched_input])
-            rsgr_output = self.rsgr(
-                image_embeddings,
-                boundary_feature=image_embeddings,
-                local_structure_labels=_rsgr_s_labels,
-                local_boundary_labels=_rsgr_b_labels,
-            )
-
-        # L1-A reads exact 24x24 ROIs but never writes to image_embeddings.
-        local_region_alignment_output = None
-        if self.enable_local_region_text_alignment and self.training:
-            _local_labels = None
-            _local_valid = None
-            if all("local_region_attr_labels" in item for item in batched_input):
-                _local_labels = torch.stack([
-                    item["local_region_attr_labels"].to(device) for item in batched_input
-                ], dim=0)
-            if all("local_region_attr_valid" in item for item in batched_input):
-                _local_valid = torch.stack([
-                    item["local_region_attr_valid"].to(device) for item in batched_input
-                ], dim=0)
-            local_region_alignment_output = maybe_compute_local_alignment(
-                self.local_region_text_alignment,
-                image_embeddings,
-                _local_labels,
-                _local_valid,
-            )
 
         # ==============================================================
         # SGA-SB v1 CORRECTION: Spatial Structure/Boundary Guidance
@@ -4318,12 +4168,8 @@ class TextSam(Sam):
         boundary_logits: Optional[torch.Tensor] = None
         structure_guidance_map: Optional[torch.Tensor] = None
         boundary_guidance_map: Optional[torch.Tensor] = None
-        structure_delta: Optional[torch.Tensor] = (
-            rsgr_output["structure_delta"] if rsgr_output is not None else None
-        )
-        boundary_delta: Optional[torch.Tensor] = (
-            rsgr_output["boundary_delta"] if rsgr_output is not None else None
-        )
+        structure_delta: Optional[torch.Tensor] = None
+        boundary_delta: Optional[torch.Tensor] = None
 
         if self.spatial_sb_mode != "none":
             # ── Structure head (low-res occupancy) ──
@@ -4356,7 +4202,7 @@ class TextSam(Sam):
         # SPATIAL_SB_FORWARD_AUDIT: diagnostic logging (first 2 forward calls)
         # ═══════════════════════════════════════════════════════════════
         _spatial_sb_audit_count = getattr(self, "_spatial_sb_audit_count", 0)
-        if os.environ.get("SGA_SB_VERBOSE_DIAGNOSTICS", "0") == "1" and _spatial_sb_audit_count < 2:
+        if _spatial_sb_audit_count < 2:
             self._spatial_sb_audit_count = _spatial_sb_audit_count + 1
             _spatial_sb_mode = self.spatial_sb_mode
             _spatial_sb_branch = self.spatial_sb_branch
@@ -6808,14 +6654,6 @@ class TextSam(Sam):
                 # Structure & Boundary Attribute Heads outputs (GT-derived)
                 "structure_attr_logits": structure_attr_logits,  # [B,5,3] or None
                 "boundary_attr_logits": boundary_attr_logits,    # [B,4,3] or None
-                # RSGR-1 outputs; GT labels supervise predictors only and never build injection.
-                "rsgr_local_structure_logits": rsgr_output["local_structure_logits"][i:i + 1] if rsgr_output is not None else None,
-                "rsgr_local_boundary_logits": rsgr_output["local_boundary_logits"][i:i + 1] if rsgr_output is not None else None,
-                "rsgr_local_structure_loss": rsgr_output["local_structure_loss"] if rsgr_output is not None else None,
-                "rsgr_local_boundary_loss": rsgr_output["local_boundary_loss"] if rsgr_output is not None else None,
-                "rsgr_valid_structure_labels": rsgr_output["valid_structure_labels"] if rsgr_output is not None else 0,
-                "rsgr_valid_boundary_labels": rsgr_output["valid_boundary_labels"] if rsgr_output is not None else 0,
-                "rsgr_diagnostics": rsgr_output["diagnostics"] if rsgr_output is not None else {},
                 # MultiLevel Attribute Heads outputs (Phase B)
                 "multilevel_attr_logits": multilevel_attr_logits,  # Dict or None
                 # SGA-SB v1 CORRECTION: Spatial Structure/Boundary Guidance (train.py consumes for loss)
@@ -6831,8 +6669,6 @@ class TextSam(Sam):
                 "spatial_boundary_logit_norm": boundary_logits[i].detach().float().norm() if boundary_logits is not None else None,
                 "spatial_structure_prob_mean": structure_guidance_map[i].detach().float().mean() if structure_guidance_map is not None else None,
                 "spatial_boundary_prob_mean": boundary_guidance_map[i].detach().float().mean() if boundary_guidance_map is not None else None,
-                "spatial_structure_prob_std": structure_guidance_map[i].detach().float().std() if structure_guidance_map is not None else None,
-                "spatial_boundary_prob_std": boundary_guidance_map[i].detach().float().std() if boundary_guidance_map is not None else None,
                 "spatial_structure_delta_norm": structure_delta[i].detach().float().norm() if structure_delta is not None else None,
                 "spatial_boundary_delta_norm": boundary_delta[i].detach().float().norm() if boundary_delta is not None else None,
                 # Legacy spatial_instance_attr_mode (ablation)
@@ -7667,11 +7503,6 @@ class TextSam(Sam):
                     dummy = dummy + p.sum() * 0.0
 
             outputs[0]["heatmap_logits"] = outputs[0]["heatmap_logits"] + dummy
-
-        # Attach the shared L1-A batch supervision output. It is diagnostic/loss
-        # metadata only and cannot change segmentation tensors.
-        if local_region_alignment_output is not None and isinstance(outputs, list) and outputs:
-            outputs[0].update(local_region_alignment_output)
 
         # Attach diagnostics to every output item so train.py/test.py can collect them.
         # Without this, train.py will report FreqPath diagnostics as nan even when

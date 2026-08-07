@@ -1,0 +1,72 @@
+NuSeg 全项目只读审计摘要（2026-07-22）
+项目根：/hy-tmp/NuSeg
+任务：纯 CPU 静态审计；未使用 GPU；未训练；未 full test；未修改源码/配置。
+Git：.git 缺失，branch/commit/status UNKNOWN；当前源码无法绑定 commit。
+活动训练：未检测到 train.py/torchrun。
+
+一句话定义：
+SAM/SamMed2D+CNN/HV+FreqPath 视觉底座上的 PanNuke 核实例分割工程原型，
+研究数值/文本属性与空间结构-边界引导。
+
+真实方法：
+1. SAM image encoder 提取 tile/patch 特征。
+2. prompt generator、mask decoder、HV map 与 watershed 式后处理产生实例。
+3. 可选 PNuRL 用预测属性和文本产生 low/high 全局向量与 semantic delta。
+4. semantic delta 经 channel gate 残差注入 image embeddings。
+5. Exp5 不用文本，把预测 structure/boundary logits 经 MLP 路由到 decoder 两路。
+6. SGA-SB 用空间结构/边界预测图，经 adapter×gamma 注入 decoder。
+7. PNuDP Dense 可给 mask logits 加 text-bank bias，但仅有短程审计。
+
+关键结论：
+1. low/high 不是真实频域；没有 FFT/DCT/显式滤波器组。
+2. 最佳可信结果来自无文本 Exp5 整体配方，不是已证明的 CONCH 语义创新。
+3. canonical full test：Exp5 Dice 0.8172、IoU 0.7048、mAJI 0.6361、mPQ 0.6094。
+4. 同流程视觉 baseline：0.8089、约0.696–0.697、0.6270、0.6034。
+5. 以上仅 seed 42；Exp5 仍有继续训练、父 checkpoint、额外参数等混杂。
+6. Exp6 历史 full-test 数字在仓库无正式日志，标记 CLAIMED_ONLY。
+7. CONCH 未被证明有效；CLIP ablation 也无正式可比证据。
+8. test 默认关闭 attr alignment/PromptNu-lite loss，但 use_pnurl 时 residual 可继续活跃。
+9. baseline/Exp5 canonical 日志中 PNuRL semantic delta 不活跃；Exp5 是 numeric route。
+10. 全局一 tile 一文本不能定位粘连、小核和困难边界。
+11. L0 显示核心属性局部/全局类别不一致约 26.5%–36.3%，粒度错配有数据支持。
+12. L1-A 在增强后重算 4 个局部区域标签，但只加辅助 loss，不注入 segmentation feature。
+13. L1-A E5 ΔmAJI=-0.001001，未达 +0.003；停止推进合理。
+14. SGA-SB 已接入 forward、loss、optimizer、checkpoint，并完成 5 组 E5 validation。
+15. SGA G2 E5 相对 N0：mAJI +0.000926，但 mPQ -0.002541；主张未成立。
+16. P4.1 soft boundary 相对 legacy G2：E5 mAJI -0.006571、mPQ -0.005762。
+17. PNuDP Dense 无正式 checkpoint/full test，不应进入论文主线。
+18. train validation 默认仅每 rank 40%，且无 all-reduce；best checkpoint 可能基于 rank0 局部子集。
+19. full test 的 per-sample sum/count all-reduce 正确，但 sampler 在不能整除时可能重复样本。
+20. train val 与 full test 的阈值、滑窗流程不同，validation 不等于 full test。
+
+完成度（0–5）：
+工程3；数据4；视觉基线4；属性监督3；文本语义3；推理语义2；
+主线消融2；因果验证1；多种子0；论文准备1。
+
+保留：
+Visual baseline 与 Exp5 canonical checkpoint/log；Phase B/C 父 checkpoint；
+SGA P3/P4.1、L0/L1-A 的日志、metrics、manifest 和负结果。
+
+暂停：
+P4.1、PNuDP 参数扫、CONCH/CLIP 换底座、全局文本 gate 强度继续微调。
+
+推荐主路线：
+路线 B——局部区域语义与空间路由；路线 A 只作冻结对照；路线 C 暂缓。
+
+下一项最小实验：
+固定 Exp5 父 checkpoint/参数/预算/full-test，比较：
+correct local text、shuffled-region text、random/frozen prototype、no-local。
+
+算力：
+非纯 CPU；推荐 2×24GB GPU；峰值约16–19GB/卡；
+4组×5epoch 筛选约7–10 GPU-hours；不与其他训练并行。
+
+ADVANCE：3 seeds mean mAJI +0.003；mPQ下降不超过0.002；correct显著优于shuffled/random。
+HOLD：只有单种子/validation 小提升。
+STOP：full-test 不超 matched baseline，或 correct≈shuffled/random。
+
+论文判断：当前不足以形成可信方法论文；现实定位是工程原型。
+FINAL_DECISION=RESTRUCTURE
+
+未验证：Git commit；Exp6/Exp7 正式 full test；Phase B 原始正式日志；
+所有核心多种子方差；checkpoint 内未在现有 manifest 中记录的完整环境参数。
