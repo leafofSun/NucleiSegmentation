@@ -1024,10 +1024,22 @@ def _load_conch_low_memory_mmap(
     unexpected = list(incompatible.unexpected_keys)
     del state_dict
     remaining_meta = [name for name, value in model.state_dict().items() if value.is_meta]
-    if remaining_meta:
+    disallowed_meta = [
+        name for name in remaining_meta if not name.startswith("text_decoder.")
+    ]
+    if disallowed_meta:
         raise RuntimeError(
-            "low-memory CONCH load left meta tensors: " + ", ".join(remaining_meta[:10])
+            "low-memory CONCH load left required meta tensors: "
+            + ", ".join(disallowed_meta[:10])
         )
+    # The released CONCH checkpoint intentionally omits all caption decoder
+    # weights (the official factory also ignores them with strict=False).
+    # encode_text never reads this module, so discard only that known-unused
+    # meta subtree while retaining and validating every text-tower tensor.
+    if remaining_meta:
+        if any(not name.startswith("text_decoder.") for name in missing):
+            raise RuntimeError("checkpoint is missing non-decoder CONCH parameters")
+        model.text_decoder = None
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
