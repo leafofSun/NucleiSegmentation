@@ -1,0 +1,4 @@
+response_source,area_bin,gt_instance_count,any_prediction_overlap_count,coverage_rate,independent_instance_count_iou_gt_0_5,independent_instance_rate,gt_pixel_coverage_rate,prob_mean_median,prob_max_median,marker_max_median
+final_instance_map_degraded_RAW_NOT_AVAILABLE,"[10,50)",2564,497,0.1938377535101404,6,0.00234009360374415,0.1738092347537534,UNVERIFIED,UNVERIFIED,UNVERIFIED
+final_instance_map_degraded_RAW_NOT_AVAILABLE,"[50,100)",3882,1535,0.39541473467284904,480,0.12364760432766615,0.364045226900541,UNVERIFIED,UNVERIFIED,UNVERIFIED
+final_instance_map_degraded_RAW_NOT_AVAILABLE,"[200,+inf)",49996,46573,0.9315345227618209,36601,0.7320785662853029,0.8634795732553339,UNVERIFIED,UNVERIFIED,UNVERIFIED
