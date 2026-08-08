@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterator
 from dataclasses import dataclass
+from bisect import bisect_right
 import hashlib
 from io import BytesIO
 import json
@@ -143,6 +144,56 @@ class RawFoldParquet:
     def __iter__(self) -> Iterator[RawRecord]:
         for index in range(len(self)):
             yield self[index]
+
+
+class StreamingRawFoldParquet:
+    """Row-group-cached view for memory-constrained CPU audit environments."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        parquet = _pyarrow_parquet()
+        self._file = parquet.ParquetFile(path)
+        self._row_group_starts = [0]
+        for group_index in range(self._file.num_row_groups):
+            rows = self._file.metadata.row_group(group_index).num_rows
+            self._row_group_starts.append(self._row_group_starts[-1] + rows)
+        self._cached_group_index: int | None = None
+        self._cached_group: Any | None = None
+
+    def __len__(self) -> int:
+        return self._row_group_starts[-1]
+
+    def __getitem__(self, index: int) -> RawRecord:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        group_index = bisect_right(self._row_group_starts, index) - 1
+        if group_index != self._cached_group_index:
+            self._cached_group = self._file.read_row_group(
+                group_index,
+                columns=["image", "instances", "categories", "tissue"],
+            )
+            self._cached_group_index = group_index
+        assert self._cached_group is not None
+        local_index = index - self._row_group_starts[group_index]
+        image = self._cached_group["image"][local_index].as_py()
+        instances = self._cached_group["instances"][local_index].as_py()
+        categories = tuple(
+            int(value)
+            for value in self._cached_group["categories"][local_index].as_py()
+        )
+        instance_bytes = tuple(item["bytes"] for item in instances)
+        if len(instance_bytes) != len(categories):
+            raise ValueError(
+                f"raw row {index} instance/category mismatch: "
+                f"{len(instance_bytes)} != {len(categories)}"
+            )
+        return RawRecord(
+            index=index,
+            image_bytes=image["bytes"],
+            instance_bytes=instance_bytes,
+            categories=categories,
+            tissue_id=int(self._cached_group["tissue"][local_index].as_py()),
+        )
 
 
 def load_mapping(path: Path) -> list[dict[str, Any]]:

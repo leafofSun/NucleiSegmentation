@@ -32,7 +32,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from diagnostics.quantify_conversion_loss import build_instance_map  # noqa: E402
 from diagnostics.rebuild_index_mapping import (  # noqa: E402
-    RawFoldParquet,
+    StreamingRawFoldParquet,
     load_mapping,
     sha256_file,
     write_json,
@@ -87,6 +87,16 @@ class Decomposition:
     bpq: float
     aji: float
     matched_iou_sum: float
+
+
+@dataclass
+class CompactDecomposition:
+    counts: Counter[str]
+    gt_records: list[dict[str, Any]]
+    pred_instance_count: int
+    bpq: float
+    aji: float
+    area_metrics: dict[str, tuple[float, float] | None]
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | None = None) -> None:
@@ -456,7 +466,7 @@ def aggregate(items: list[dict[str, Any]]) -> dict[str, Any]:
     for item in items:
         summed.update(item["result"].counts)
     gt_total = sum(len(item["result"].gt_records) for item in items)
-    pred_total = sum(len(item["result"].pred_records) for item in items)
+    pred_total = sum(item["result"].pred_instance_count for item in items)
     fn_total = summed["pq_fn_total"]
     fp_total = summed["pq_fp_total"]
     tissue_bpq = {
@@ -573,6 +583,25 @@ def area_conditioned_metrics(
     return pq.pq, aji
 
 
+def compact_decomposition(result: Decomposition) -> CompactDecomposition:
+    conditioned: dict[str, tuple[float, float] | None] = {}
+    for low, high, label in AREA_BINS:
+        selected = {
+            int(record["gt_id"])
+            for record in result.gt_records
+            if low <= int(record["area"]) < high
+        }
+        conditioned[label] = area_conditioned_metrics(result, selected)
+    return CompactDecomposition(
+        counts=Counter(result.counts),
+        gt_records=result.gt_records,
+        pred_instance_count=len(result.pred_records),
+        bpq=result.bpq,
+        aji=result.aji,
+        area_metrics=conditioned,
+    )
+
+
 def area_strata(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for low, high, label in AREA_BINS:
@@ -586,12 +615,7 @@ def area_strata(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         fn_total = len(fn_records)
         conditioned: list[tuple[float, float]] = []
         for item in items:
-            selected = {
-                int(record["gt_id"])
-                for record in item["result"].gt_records
-                if low <= int(record["area"]) < high
-            }
-            value = area_conditioned_metrics(item["result"], selected)
+            value = item["result"].area_metrics[label]
             if value is not None:
                 conditioned.append(value)
         rows.append(
@@ -754,6 +778,7 @@ def main() -> int:
         "gt_source": {
             "raw_fold3_path": str(args.raw_fold3.resolve()),
             "raw_fold3_sha256": sha256_file(args.raw_fold3),
+            "raw_fold_loading": "streaming one Parquet row group at a time",
             "converted_path": str(args.converted_dir.resolve()),
             "official_binarize_rule": "channels 0..4 and ascending IDs; later instances overwrite overlap pixels",
         },
@@ -769,7 +794,7 @@ def main() -> int:
     print("[V1_CONFIG] " + json.dumps(config, sort_keys=True), flush=True)
     write_json(args.output_dir / "v1_config.json", config)
 
-    raw_fold = RawFoldParquet(args.raw_fold3)
+    raw_fold = StreamingRawFoldParquet(args.raw_fold3)
     per_image_rows: dict[str, list[dict[str, Any]]] = {method: [] for method in METHODS}
     analysis_items: dict[str, dict[str, list[dict[str, Any]]]] = {
         method: {variant: [] for variant in VARIANTS} for method in METHODS
@@ -810,7 +835,7 @@ def main() -> int:
                         "raw_index": raw_index,
                         "tissue": record.tissue_name,
                         "density_bin": image_density_bin,
-                        "result": result,
+                        "result": compact_decomposition(result),
                     }
                 )
             merge_rows[method].extend(
