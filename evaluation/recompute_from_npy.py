@@ -366,6 +366,7 @@ def main() -> int:
     write_json(args.output_dir / "input_file_manifest.json", input_manifest)
 
     metric_module = REPO_ROOT / "evaluation" / "metrics_standard.py"
+    entrypoint_module = Path(__file__).resolve()
     legacy_module = REPO_ROOT / "metrics.py"
     config = {
         "training_started": False,
@@ -399,6 +400,8 @@ def main() -> int:
             },
         },
         "local_implementations": {
+            "entrypoint_path": str(entrypoint_module),
+            "entrypoint_sha256": sha256_file(entrypoint_module),
             "standard_path": str(metric_module),
             "standard_sha256": sha256_file(metric_module),
             "legacy_path": str(legacy_module),
