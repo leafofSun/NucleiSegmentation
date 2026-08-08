@@ -1,0 +1,223 @@
+{
+  "d1_e3_crosscheck": {
+    "aji_kumar_per_image_avg": {
+      "abs_difference": 0.0,
+      "actual": 0.5839704510548933,
+      "expected": 0.5839704510548933,
+      "passes_lt_1e_6": true
+    },
+    "bpq_tissue_macro": {
+      "abs_difference": 0.0,
+      "actual": 0.593471982510069,
+      "expected": 0.593471982510069,
+      "passes_lt_1e_6": true
+    }
+  },
+  "error_decomposition": {
+    "E1": {
+      "fn_decomposition": {
+        "complex": 3847,
+        "low_iou": 1327,
+        "merged": 8883,
+        "sum": 25659,
+        "true_miss": 11602
+      },
+      "fp_decomposition": {
+        "complex": 1537,
+        "low_iou": 3639,
+        "split": 802,
+        "spurious": 4386,
+        "sum": 10364
+      },
+      "pq_counts": {
+        "fn": 25659,
+        "fp": 10364,
+        "tp": 40994
+      },
+      "r_merge": 0.34619431778323395,
+      "r_miss": 0.4521610351143848
+    },
+    "E2": {
+      "fn_decomposition": {
+        "complex": 3847,
+        "low_iou": 1327,
+        "merged": 8883,
+        "sum": 25659,
+        "true_miss": 11602
+      },
+      "fp_decomposition": {
+        "complex": 1537,
+        "low_iou": 3639,
+        "split": 802,
+        "spurious": 4386,
+        "sum": 10364
+      },
+      "pq_counts": {
+        "fn": 25659,
+        "fp": 10364,
+        "tp": 40994
+      },
+      "r_merge": 0.34619431778323395,
+      "r_miss": 0.4521610351143848
+    },
+    "E3": {
+      "fn_decomposition": {
+        "complex": 3847,
+        "low_iou": 1327,
+        "merged": 8883,
+        "sum": 25659,
+        "true_miss": 11602
+      },
+      "fp_decomposition": {
+        "complex": 1537,
+        "low_iou": 3639,
+        "split": 802,
+        "spurious": 4386,
+        "sum": 10364
+      },
+      "pq_counts": {
+        "fn": 25659,
+        "fp": 10364,
+        "tp": 40994
+      },
+      "r_merge": 0.34619431778323395,
+      "r_miss": 0.4521610351143848
+    }
+  },
+  "eval_protocol_v2_sha256": "0cb82dee5eeb3dbe05826cf1daf52ee1f88fe69311bac045d12e87a891f016d6",
+  "gt_manifest_sha256": "0ce3ad621a88c58fe8982a8d2d2f9fd5e959fdb6ac305cd251eec8095075030a",
+  "inference_rerun": false,
+  "method": "visual",
+  "metric_implementation_sha256": "6a050d7996924b4a2a947cadb4603d5bec5a56fcdafcf84949d680cb92601233",
+  "prediction_manifest_sha256": "00b99be6fc116ab1199e093008d8235dd189e0503fd6aa8c2a93426780bbb70b",
+  "protocol_id": "pannuke_v2_e1",
+  "protocols": {
+    "E1": {
+      "actual_evaluated_sample_count": 2607,
+      "aji_kumar_per_image_avg": 0.5839704510548933,
+      "aji_plus_per_image_avg": 0.6067779675043856,
+      "bpq_by_tissue": {
+        "Adrenal Gland": 0.575373459509846,
+        "Bile Duct": 0.6119871076637583,
+        "Bladder": 0.6375218592185763,
+        "Breast": 0.5977930287797775,
+        "Cervix": 0.6473005221443641,
+        "Colon": 0.4922246879214611,
+        "Esophagus": 0.5457435958613941,
+        "Head & Neck": 0.5292348708601072,
+        "Kidney": 0.6282961775912853,
+        "Liver": 0.6583000766207144,
+        "Lung": 0.5829791682240983,
+        "Ovarian": 0.5404747695392245,
+        "Pancreatic": 0.6061983949145684,
+        "Prostate": 0.6083405677777053,
+        "Skin": 0.5238227035884697,
+        "Stomach": 0.6465069592989848,
+        "Testis": 0.6366459029409216,
+        "Thyroid": 0.6517109933728873,
+        "Uterus": 0.5555128218631664
+      },
+      "bpq_global_agg": 0.5720757446288356,
+      "bpq_per_image_avg": 0.5761092821923856,
+      "bpq_tissue_macro": 0.593471982510069,
+      "complete_protocol_status": "COMPLETE_DENOMINATOR_A; FULL_DENOMINATOR_B_NOT_EVALUATED_1",
+      "dice_per_image_avg": 0.8084821312262879,
+      "dq_global_agg": 0.6947487946038928,
+      "evaluated_sample_count": 2607,
+      "fn": 25659,
+      "fp": 10364,
+      "gt_instance_total": 66653,
+      "matched_iou_sum": 33755.61534969676,
+      "pred_instance_total": 51358,
+      "protocol_expected_sample_count": 2608,
+      "sq_global_agg": 0.8234281931428199,
+      "status": "COMPLETE_AVAILABLE_PREDICTIONS",
+      "tp": 40994
+    },
+    "E2": {
+      "actual_evaluated_sample_count": 2607,
+      "aji_kumar_per_image_avg": 0.5839704510548933,
+      "aji_plus_per_image_avg": 0.6067779675043856,
+      "bpq_by_tissue": {
+        "Adrenal Gland": 0.575373459509846,
+        "Bile Duct": 0.6119871076637583,
+        "Bladder": 0.6375218592185763,
+        "Breast": 0.5977930287797775,
+        "Cervix": 0.6473005221443641,
+        "Colon": 0.4922246879214611,
+        "Esophagus": 0.5457435958613941,
+        "Head & Neck": 0.5292348708601072,
+        "Kidney": 0.6282961775912853,
+        "Liver": 0.6583000766207144,
+        "Lung": 0.5829791682240983,
+        "Ovarian": 0.5404747695392245,
+        "Pancreatic": 0.6061983949145684,
+        "Prostate": 0.6083405677777053,
+        "Skin": 0.5238227035884697,
+        "Stomach": 0.6465069592989848,
+        "Testis": 0.6366459029409216,
+        "Thyroid": 0.6517109933728873,
+        "Uterus": 0.5555128218631664
+      },
+      "bpq_global_agg": 0.5720757446288356,
+      "bpq_per_image_avg": 0.5761092821923856,
+      "bpq_tissue_macro": 0.593471982510069,
+      "complete_protocol_status": "UNVERIFIED_FULL_E2_MISSING_PREDICTIONS_115",
+      "dice_per_image_avg": 0.8084821312262879,
+      "dq_global_agg": 0.6947487946038928,
+      "evaluated_sample_count": 2607,
+      "fn": 25659,
+      "fp": 10364,
+      "gt_instance_total": 66653,
+      "matched_iou_sum": 33755.61534969676,
+      "pred_instance_total": 51358,
+      "protocol_expected_sample_count": 2722,
+      "sq_global_agg": 0.8234281931428199,
+      "status": "COMPLETE_AVAILABLE_PREDICTIONS",
+      "tp": 40994
+    },
+    "E3": {
+      "actual_evaluated_sample_count": 2607,
+      "aji_kumar_per_image_avg": 0.5839704510548933,
+      "aji_plus_per_image_avg": 0.6067779675043856,
+      "bpq_by_tissue": {
+        "Adrenal Gland": 0.575373459509846,
+        "Bile Duct": 0.6119871076637583,
+        "Bladder": 0.6375218592185763,
+        "Breast": 0.5977930287797775,
+        "Cervix": 0.6473005221443641,
+        "Colon": 0.4922246879214611,
+        "Esophagus": 0.5457435958613941,
+        "Head & Neck": 0.5292348708601072,
+        "Kidney": 0.6282961775912853,
+        "Liver": 0.6583000766207144,
+        "Lung": 0.5829791682240983,
+        "Ovarian": 0.5404747695392245,
+        "Pancreatic": 0.6061983949145684,
+        "Prostate": 0.6083405677777053,
+        "Skin": 0.5238227035884697,
+        "Stomach": 0.6465069592989848,
+        "Testis": 0.6366459029409216,
+        "Thyroid": 0.6517109933728873,
+        "Uterus": 0.5555128218631664
+      },
+      "bpq_global_agg": 0.5720757446288356,
+      "bpq_per_image_avg": 0.5761092821923856,
+      "bpq_tissue_macro": 0.593471982510069,
+      "complete_protocol_status": "COMPLETE",
+      "dice_per_image_avg": 0.8084821312262879,
+      "dq_global_agg": 0.6947487946038928,
+      "evaluated_sample_count": 2607,
+      "fn": 25659,
+      "fp": 10364,
+      "gt_instance_total": 66653,
+      "matched_iou_sum": 33755.61534969676,
+      "pred_instance_total": 51358,
+      "protocol_expected_sample_count": 2607,
+      "sq_global_agg": 0.8234281931428199,
+      "status": "COMPLETE_AVAILABLE_PREDICTIONS",
+      "tp": 40994
+    }
+  },
+  "training_started": false
+}

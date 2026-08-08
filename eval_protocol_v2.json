@@ -1,0 +1,53 @@
+{
+  "aji_variant": "kumar_greedy",
+  "anchor_denominator_A_sample_ids_sha256": "2ad9142d5ac586923ab9be337f65958fd23d1930ad1e1e9f61ebfb0532cf85b5",
+  "anchor_evaluated_samples_denominator_A": 2607,
+  "anchor_values_denominator_A": {
+    "exp5_bpq_tissue_macro": 0.5998214838700427,
+    "visual_bpq_tissue_macro": 0.593471982510069
+  },
+  "area_bins": [
+    "[1,10)",
+    "[10,20)",
+    "[20,50)",
+    "[50,100)",
+    "[100,200)",
+    "[200,+inf)"
+  ],
+  "created_utc": "2026-08-08T09:52:14.609914+00:00",
+  "density_bins": [
+    "[0,1)",
+    "[1,10)",
+    "[10,25)",
+    "[25,50)",
+    "[50,+inf)"
+  ],
+  "e2_full_status": "UNVERIFIED: 115 samples have no historical prediction; missing files are not imputed as empty predictions",
+  "expected_valid_samples_full_test": 2608,
+  "full_test_denominator_B": 2608,
+  "full_test_denominator_B_sample_ids_sha256": "6a0b561d70dc72d85dc87b80729d2dd78b3af3573e021e5f1ba918b3e1340faa",
+  "gt_manifest_sha256": "0ce3ad621a88c58fe8982a8d2d2f9fd5e959fdb6ac305cd251eec8095075030a",
+  "gt_source": "data/PanNuke_v2/fold3",
+  "inference_rerun": false,
+  "metric_implementation_sha256": "6a050d7996924b4a2a947cadb4603d5bec5a56fcdafcf84949d680cb92601233",
+  "min_instance_area_at_eval": 0,
+  "not_evaluated_nonempty_samples": [
+    {
+      "instance_count": 1,
+      "sample_id": "fold3_0001084"
+    }
+  ],
+  "pq_iou_threshold": "strict_greater_than_0.5",
+  "primary_protocol": "E1",
+  "protocol_id": "pannuke_v2_e1",
+  "r22_preregistered_criteria": {
+    "MODERATE": "0.01 <= delta global tissue-macro bPQ <= 0.03",
+    "STRONG_RECOVERY": "delta global tissue-macro bPQ > 0.03 AND bPQ [50,100) > 0.25",
+    "WEAK": "delta global tissue-macro bPQ < 0.01"
+  },
+  "r22_required_comparison": "Primary historical comparison uses denominator A. Also report denominator B for the complete new test.",
+  "skip_empty_gt": true,
+  "tissue_macro": true,
+  "training_started": false,
+  "v1_error_decomposition_sha256": "c8469d2f19ffc36397b46c51f349ffcf5e4b3d076a9eade5fadb2bb475ff3e36"
+}
