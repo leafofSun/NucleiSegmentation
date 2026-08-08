@@ -225,6 +225,8 @@ def main() -> int:
         },
         "original_all_gt": "all verified per-instance binary masks from raw Fold3 mirror",
         "original_area_ge10_gt": "raw instances filtered by decoded binary pixel area >= 10",
+        "raw_channel_merge_rule": "official PanNuke-metrics binarize(): iterate channels 0..4 and ascending IDs; later instances overwrite overlap pixels",
+        "raw_channel_merge_source": "https://github.com/TIA-Lab/PanNuke-metrics/blob/c00014d766ca1be142b81bea19d9ef4315cde65a/utils.py",
         "pq_match_rule": "strict IoU > 0.5",
         "metric_implementation": "evaluation/metrics_standard.py (P0.3 verified HoVer-Net/PanNuke port)",
         "converted_decoder": "evaluation.recompute_from_npy.load_gt_like_test_py; exact port of test.py:880-926",
@@ -236,6 +238,8 @@ def main() -> int:
     all_rows: dict[str, dict[str, list[dict[str, Any]]]] = {
         method: {variant: [] for variant in VARIANTS} for method in METHODS
     }
+    raw_overlap_pixels_total = 0
+    raw_area10_overlap_pixels_total = 0
     for position, entry in enumerate(mapping):
         sample_id = str(entry["sample_id"])
         raw_index = int(entry["raw_index"])
@@ -243,10 +247,8 @@ def main() -> int:
         raw_masks = record.instance_masks()
         original_all, overlap_pixels = build_instance_map(raw_masks, minimum_area=1)
         original_area_ge10, overlap_pixels_area10 = build_instance_map(raw_masks, minimum_area=10)
-        if overlap_pixels or overlap_pixels_area10:
-            raise RuntimeError(
-                f"raw instance masks overlap at raw index {raw_index}; instance-map semantics UNVERIFIED"
-            )
+        raw_overlap_pixels_total += overlap_pixels
+        raw_area10_overlap_pixels_total += overlap_pixels_area10
         converted, _ = load_gt_like_test_py(args.converted_dir / f"{sample_id}.json")
         ground_truth = {
             "converted": converted,
@@ -322,6 +324,11 @@ def main() -> int:
             "remaining_gap_assignment": "UNKNOWN; D1 isolates conversion only and does not assign the remainder to a particular model/training/protocol factor",
         },
         "fairness_note": config["fairness_note"],
+        "raw_channel_overlap_audit": {
+            "official_overwrite_rule_used": True,
+            "original_all_overlap_pixels": raw_overlap_pixels_total,
+            "original_area_ge10_overlap_pixels": raw_area10_overlap_pixels_total,
+        },
         "gates": {
             "converted_p0_3_crosscheck_pass": all(
                 item["passes_le_1e_12"]
