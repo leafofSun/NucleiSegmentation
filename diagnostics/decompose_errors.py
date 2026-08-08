@@ -12,6 +12,7 @@ from collections import Counter, defaultdict, deque
 import csv
 from dataclasses import dataclass
 import hashlib
+from io import BytesIO
 import json
 import math
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+from PIL import Image
 from scipy.ndimage import distance_transform_edt
 from scipy.stats import spearmanr
 
@@ -659,16 +661,39 @@ def parquet_audit(path: Path, url: str, revision: str) -> dict[str, Any]:
         "categories": str(schema.field("categories").type),
         "tissue": str(schema.field("tissue").type),
     }
+    first = file.read_row_group(0, columns=["image", "instances", "categories", "tissue"])
+    image_value = first["image"][0].as_py()
+    instance_values = first["instances"][0].as_py()
+    with Image.open(BytesIO(image_value["bytes"])) as image:
+        image_mode = image.mode
+        image_size = list(image.size)
+    instance_modes: set[str] = set()
+    instance_sizes: set[tuple[int, int]] = set()
+    for value in instance_values:
+        with Image.open(BytesIO(value["bytes"])) as instance:
+            instance_modes.add(instance.mode)
+            instance_sizes.add(instance.size)
+    file_hash = sha256_file(path)
     return {
         "url": url,
+        "retrieval_url": url.replace("https://huggingface.co", "https://hf-mirror.com"),
         "revision": revision,
         "available": True,
         "path": str(path.resolve()),
         "size_bytes": path.stat().st_size,
-        "sha256": sha256_file(path),
+        "sha256": file_hash,
+        "source_linked_etag": file_hash,
         "row_count": file.metadata.num_rows,
         "instance_total": instance_total,
         "logical_schema": logical_schema,
+        "decoded_schema_probe": {
+            "image_mode": image_mode,
+            "image_size": image_size,
+            "instance_modes": sorted(instance_modes),
+            "instance_sizes": [list(value) for value in sorted(instance_sizes)],
+            "categories_type": type(first["categories"][0].as_py()).__name__,
+            "tissue_type": type(first["tissue"][0].as_py()).__name__,
+        },
     }
 
 
@@ -878,6 +903,13 @@ def main() -> int:
         "schema_equal_all_folds": schema_equal,
         "schema_expected_fields_pass": all(
             fold["logical_schema"]["columns"] == ["image", "instances", "categories", "tissue"]
+            for fold in folds.values()
+        ),
+        "decoded_schema_expected_pass": all(
+            fold["decoded_schema_probe"]["image_mode"] == "RGB"
+            and fold["decoded_schema_probe"]["image_size"] == [256, 256]
+            and fold["decoded_schema_probe"]["instance_modes"] == ["1"]
+            and fold["decoded_schema_probe"]["instance_sizes"] == [[256, 256]]
             for fold in folds.values()
         ),
         "three_fold_instance_total": instance_total,
