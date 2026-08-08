@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from diagnostics.rebuild_index_mapping import (  # noqa: E402
     StreamingRawFoldParquet,
+    load_mapping,
     sha256_file,
     sha256_pixels,
 )
@@ -61,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     for fold in (1, 2, 3):
         parser.add_argument(f"--fold{fold}-parquet", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--fold3-mapping", type=Path, required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--compressed", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -72,6 +74,10 @@ def main() -> int:
     for source in sources.values():
         if not source.is_file():
             raise FileNotFoundError(source)
+    mapping = load_mapping(args.fold3_mapping)
+    if len(mapping) != 2607 or any(int(entry["max_abs_diff"]) != 0 for entry in mapping):
+        raise RuntimeError("Fold3 legacy-test mapping hard gate failed")
+    legacy_by_raw = {int(entry["raw_index"]): str(entry["sample_id"]) for entry in mapping}
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"refusing to overwrite non-empty output dir: {args.output_dir}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -159,6 +165,15 @@ def main() -> int:
                 "file_sha256": file_sha,
                 "file_size": output.stat().st_size,
             }
+            if fold == 3:
+                legacy_sample_id = legacy_by_raw.get(record.index)
+                entry.update(
+                    {
+                        "legacy_test_sample_id": legacy_sample_id,
+                        "overlaps_legacy_test": legacy_sample_id is not None,
+                        "is_new_vs_legacy_test": legacy_sample_id is None,
+                    }
+                )
             manifest["samples"].append(entry)
             fold_instances += instance_count
             fold_empty += int(instance_count == 0)
@@ -193,6 +208,24 @@ def main() -> int:
         "empty_sample_count": sum(value["empty_sample_count"] for value in manifest["folds"].values()),
         "category_distribution": {str(k): global_categories[k] for k in range(1, 6)},
         "tissue_distribution": dict(sorted(global_tissues.items())),
+    }
+    new_test_samples = [
+        {
+            "sample_id": entry["sample_id"],
+            "orig_index": entry["orig_index"],
+            "image_sha256": entry["image_sha256"],
+        }
+        for entry in manifest["samples"]
+        if entry["fold"] == 3 and entry["is_new_vs_legacy_test"]
+    ]
+    if len(new_test_samples) != 115:
+        raise RuntimeError(f"new-vs-legacy Fold3 count {len(new_test_samples)} != 115")
+    manifest["legacy_test_correspondence"] = {
+        "mapping_path": str(args.fold3_mapping),
+        "mapping_sha256": sha256_file(args.fold3_mapping),
+        "overlap_sample_count": len(legacy_by_raw),
+        "new_sample_count": len(new_test_samples),
+        "new_samples": new_test_samples,
     }
     manifest_path = args.output_dir / "dataset_manifest.json"
     manifest_path.write_bytes(canonical_json_bytes(manifest))

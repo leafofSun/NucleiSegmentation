@@ -135,6 +135,14 @@ def main() -> int:
                 test_image_sha.append({"orig_index": record.index, "image_sha256": image_sha})
                 if image_sha != entry["image_sha256"]:
                     raise RuntimeError(f"test image SHA mismatch: {path}")
+                expected_legacy = mapped_by_raw.get(record.index)
+                if (
+                    entry.get("legacy_test_sample_id")
+                    != (str(expected_legacy["sample_id"]) if expected_legacy else None)
+                    or bool(entry.get("overlaps_legacy_test")) != (expected_legacy is not None)
+                    or bool(entry.get("is_new_vs_legacy_test")) != (expected_legacy is None)
+                ):
+                    raise RuntimeError(f"legacy/new correspondence mismatch: {path}")
                 if record.index in mapped_by_raw:
                     sample_id = str(mapped_by_raw[record.index]["sample_id"])
                     legacy_path = args.legacy_test_dir / f"{sample_id}.png"
@@ -182,6 +190,11 @@ def main() -> int:
         "instance_total_exact": total_instances == 189744,
         "legacy_test_compared": legacy_compared,
         "legacy_test_max_abs_diff": legacy_max_abs_diff,
+        "new_vs_legacy_test_count": sum(
+            int(entry.get("is_new_vs_legacy_test", False))
+            for entry in manifest["samples"]
+            if int(entry["fold"]) == 3
+        ),
         "foreground_iou": foreground_iou,
         "instance_identity_all_samples": True,
         "category_distribution_exact": dict(category_counts) == manifest_categories,
@@ -193,6 +206,7 @@ def main() -> int:
         gates["instance_total_exact"]
         and legacy_compared == 2607
         and legacy_max_abs_diff == 0
+        and gates["new_vs_legacy_test_count"] == 115
         and foreground_iou == 1.0
         and gates["category_distribution_exact"]
         and gates["hole_retention_pass"]
