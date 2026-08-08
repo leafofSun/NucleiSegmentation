@@ -182,16 +182,6 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         tissue: mean(float(row["bpq"]) for row in rows if row["tissue_name"] == tissue)
         for tissue in tissues
     }
-
-
-def protocol_completion_status(protocol: str, evaluated_count: int) -> str:
-    if protocol == "E1" and evaluated_count == 2607:
-        return "COMPLETE_DENOMINATOR_A; FULL_DENOMINATOR_B_NOT_EVALUATED_1"
-    if protocol == "E2" and evaluated_count == 2607:
-        return "UNVERIFIED_FULL_E2_MISSING_PREDICTIONS_115"
-    if protocol == "E3" and evaluated_count == 2607:
-        return "COMPLETE"
-    return "UNVERIFIED_UNEXPECTED_SAMPLE_COUNT"
     return {
         "status": "COMPLETE_AVAILABLE_PREDICTIONS",
         "evaluated_sample_count": len(rows),
@@ -211,6 +201,16 @@ def protocol_completion_status(protocol: str, evaluated_count: int) -> str:
         "fn": global_pq.fn,
         "matched_iou_sum": global_pq.matched_iou_sum,
     }
+
+
+def protocol_completion_status(protocol: str, evaluated_count: int) -> str:
+    if protocol == "E1" and evaluated_count == 2607:
+        return "COMPLETE_DENOMINATOR_A; FULL_DENOMINATOR_B_NOT_EVALUATED_1"
+    if protocol == "E2" and evaluated_count == 2607:
+        return "UNVERIFIED_FULL_E2_MISSING_PREDICTIONS_115"
+    if protocol == "E3" and evaluated_count == 2607:
+        return "COMPLETE"
+    return "UNVERIFIED_UNEXPECTED_SAMPLE_COUNT"
 
 
 def error_summary(counts: Counter[str]) -> dict[str, Any]:
