@@ -46,7 +46,7 @@
 | 每张匹配图 `max_abs_diff` | 0 |
 | 未进入转换 test 的原始图像 | 115 |
 
-因此匹配率高于 95% 停止门槛，且预测输入图像没有被转换改写。`index_mapping.json` 是 2607 项双射，SHA256 `39847f31717690c9aaa9f1a84ff82a195b4ba3bc57cfe17653c8a72a21ecd4bb`。
+因此匹配率高于 95% 停止门槛，且预测输入图像没有被转换改写。`mapping_v2/index_mapping.json` 是 2607 项双射，SHA256 `39847f31717690c9aaa9f1a84ff82a195b4ba3bc57cfe17653c8a72a21ecd4bb`。
 
 ## 2. 样本级损失
 
@@ -140,7 +140,7 @@ Visual 的文献低位差距为 `0.6596 - 0.621168 = 0.038432`。数据转换作
 
 ## 9. 可复算产物
 
-- `mapping/index_mapping.json`：2607 项精确双射。
+- `mapping_v2/index_mapping.json`：2607 项精确双射；同目录含 `source_provenance.json`。
 - `conversion_v2/per_image_conversion_loss.csv`：2607 行。
 - `conversion_v2/size_retention_curve.csv` 和 PNG。
 - `conversion_v2/removed_samples.csv`、`sample_loss_by_organ.csv`、`conversion_summary.json`、`topology_summary.json`。
