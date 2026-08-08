@@ -69,9 +69,12 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str] | None 
 
 def tree_manifest_sha256(paths: list[Path], root: Path) -> str:
     digest = hashlib.sha256()
+    resolved_root = root.resolve()
     for path in sorted(paths):
+        resolved_path = path.resolve()
         digest.update(
-            f"{path.relative_to(root).as_posix()}\t{sha256_file(path)}\t{path.stat().st_size}\n".encode()
+            f"{resolved_path.relative_to(resolved_root).as_posix()}\t"
+            f"{sha256_file(path)}\t{path.stat().st_size}\n".encode()
         )
     return digest.hexdigest()
 
