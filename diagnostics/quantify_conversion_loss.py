@@ -270,13 +270,19 @@ def main() -> int:
     total_raw_instances = 0
     total_raw_overlap_pixels = 0
     topology = Counter()
+    raw_organ_counts: Counter[str] = Counter()
+    matched_organ_counts: Counter[str] = Counter()
+    raw_instances_per_removed_sample: list[int] = []
+    raw_instances_per_matched_sample: list[int] = []
 
     for raw_index, record in enumerate(raw_fold):
         raw_masks = record.instance_masks()
         raw_binary = np.logical_or.reduce(raw_masks) if raw_masks else np.zeros((256, 256), dtype=bool)
         raw_instance_count = len(raw_masks)
         total_raw_instances += raw_instance_count
+        raw_organ_counts[record.tissue_name] += 1
         if raw_index not in mapped_by_raw:
+            raw_instances_per_removed_sample.append(raw_instance_count)
             contours, _ = cv2.findContours(raw_binary.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             eligible = [contour for contour in contours if cv2.contourArea(contour) >= 10 and len(contour) >= 3]
             if not raw_binary.any():
@@ -299,6 +305,8 @@ def main() -> int:
             continue
 
         sample_id = mapped_by_raw[raw_index]
+        matched_organ_counts[record.tissue_name] += 1
+        raw_instances_per_matched_sample.append(raw_instance_count)
         json_path = args.converted_dir / f"{sample_id}.json"
         reconstructed, converted_organ = load_gt_like_test_py(json_path)
         raw_map, overlap_pixels = build_instance_map(raw_masks)
@@ -425,6 +433,20 @@ def main() -> int:
     removed_reasons = Counter(row["reason"] for row in removed_rows)
     matched_raw_instances = sum(int(row["raw_channel_instance_count"]) for row in per_image)
     raw_lt20 = sum(row["raw_instance_count"] for row in size_rows[:3])
+    organ_rows = []
+    for organ in sorted(raw_organ_counts):
+        raw_count = raw_organ_counts[organ]
+        removed_count = removed_organs[organ]
+        organ_rows.append(
+            {
+                "organ_type": organ,
+                "raw_sample_count": raw_count,
+                "converted_sample_count": matched_organ_counts[organ],
+                "removed_sample_count": removed_count,
+                "removed_sample_rate": removed_count / raw_count,
+            }
+        )
+    write_csv(args.output_dir / "sample_loss_by_organ.csv", organ_rows)
     summary = {
         "training_started": False,
         "inference_rerun": False,
@@ -433,8 +455,27 @@ def main() -> int:
         "removed_sample_count": len(removed_rows),
         "removed_reason_distribution": dict(sorted(removed_reasons.items())),
         "removed_organ_distribution": dict(sorted(removed_organs.items())),
+        "raw_organ_distribution": dict(sorted(raw_organ_counts.items())),
+        "removed_sample_rate_by_organ": {
+            row["organ_type"]: row["removed_sample_rate"] for row in organ_rows
+        },
+        "raw_instances_per_removed_sample": summarize(raw_instances_per_removed_sample),
+        "raw_instances_per_matched_sample": summarize(raw_instances_per_matched_sample),
         "raw_fold_original_instance_total": total_raw_instances,
         "matched_raw_original_instance_total": matched_raw_instances,
+        "raw_channel_instance_vs_converted": {
+            "raw_channel_instance_total": matched_raw_instances,
+            "converted_instance_total": sum(int(row["n_conv"]) for row in per_image),
+            "absolute_identity_loss": matched_raw_instances - sum(int(row["n_conv"]) for row in per_image),
+            "relative_identity_loss_percent": 100.0 * (matched_raw_instances - sum(int(row["n_conv"]) for row in per_image)) / matched_raw_instances,
+            "note": "supplementary identity-preserving count; D1.3 primary remains the preregistered binary connected-component count",
+        },
+        "class_information": {
+            "raw_instances_with_five_class_labels": matched_raw_instances,
+            "converted_instances_with_original_class_labels": 0,
+            "converted_category_id_constant": 1,
+            "class_labels_destroyed_fraction": 1.0,
+        },
         "d1_3_preregistered": {
             "n_orig_binary_cc_total": sum(int(row["n_orig_binary_connected_components"]) for row in per_image),
             "n_conv_total": sum(int(row["n_conv"]) for row in per_image),
@@ -453,6 +494,10 @@ def main() -> int:
             "curve_plot_status": plot_status,
         },
         "pixel": {
+            "raw_foreground_pixel_total": global_orig_fg,
+            "reconstructed_foreground_pixel_total": global_conv_fg,
+            "foreground_intersection_pixel_total": global_intersection,
+            "foreground_union_pixel_total": global_union,
             "global_foreground_iou": global_intersection / global_union,
             "global_foreground_pixel_ratio_conv_over_raw": global_conv_fg / global_orig_fg,
             "per_image_foreground_iou": summarize([float(row["foreground_iou"]) for row in per_image]),
@@ -464,6 +509,7 @@ def main() -> int:
             "raw_instance_overlap_pixels_total": total_raw_overlap_pixels,
             "raw_boundary_point_count_distribution": summarize(all_boundary_points),
             "converted_polygon_vertex_count_distribution": summarize(all_vertex_counts),
+            "global_converted_vertices_over_raw_boundary_points": sum(all_vertex_counts) / sum(all_boundary_points),
             "nearest_other_converted_boundary_distance_distribution": summarize(all_boundary_distances),
             "nearest_other_boundary_unresolved_instance_count_k128": unresolved_boundary_instances,
         },
