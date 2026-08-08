@@ -7,12 +7,12 @@
 本任务仅用 CPU 读取已存盘预测与 GT；未启动训练、未重跑推理、未改写任何预测文件。最终可复算产物位于远端：
 
 ```text
-/hy-tmp/NuSeg/workdir/audits/p0_3_metric_recompute_20260808_v2/
+/hy-tmp/NuSeg/workdir/audits/p0_3_metric_recompute_20260808_v3/
 ```
 
 ## 0. 环境、输入哈希、.npy 内容确认
 
-- 执行代码 commit：`8588ccf2ec808c6477be0872cff28b3b09b6ae0b`（远端 detached HEAD，执行后工作树干净）。
+- 执行代码 commit：`66d697f765908056f690eff1d2d8efb02ecccb66`（远端 detached HEAD，执行后工作树干净）。
 - 执行方式：`CUDA_VISIBLE_DEVICES="" python3 evaluation/recompute_from_npy.py ...`，纯 CPU。
 - Visual baseline 输入：`/hy-tmp/NuSeg/workdir/audits/p0_20260713/results_1gpu_canonical/visual_baseline/`
   - 2607 `.npy` + 2607 `.png`
@@ -68,7 +68,7 @@ five_class_labels_in_current_gt=false
   - `utils.py` SHA256：`53890787f039e98e1d2b64a5421de8b89aee42a9f6608a388dc2aa7dbc6044a4`
   - `run.py` SHA256：`506c50f6295a6d96f58ab574d9e23b682e4d896a0f12d36b1ee1576e93f5313e`
 
-本地移植 `evaluation/metrics_standard.py` SHA256 为 `6a050d7996924b4a2a947cadb4603d5bec5a56fcdafcf84949d680cb92601233`。对应代码位置：PQ `109-159`、Kumar AJI `162-193`、AJI+ `196-226`、Dice `229-238`、独立 PQ 交叉实现 `241-284`、全局聚合 `287-295`。
+入口 `evaluation/recompute_from_npy.py` SHA256 为 `16dda201cc493f0dd9fe9027d6daaf035dc2f6f2c9d9e7d795fd7ad0b1985471`。本地移植 `evaluation/metrics_standard.py` SHA256 为 `6a050d7996924b4a2a947cadb4603d5bec5a56fcdafcf84949d680cb92601233`。对应代码位置：PQ `109-159`、Kumar AJI `162-193`、AJI+ `196-226`、Dice `229-238`、独立 PQ 交叉实现 `241-284`、全局聚合 `287-295`。
 
 旧指标直接调用当前项目 `metrics.py`；其 SHA256 为 `5e78a57a248c9ab373407bcc28e932e0d1674f5b2c700eb31504eaec50d63181`。
 
@@ -194,7 +194,7 @@ PanNuke 官方论文规定 bPQ/mPQ 先对每种组织计算，再对 19 种组�
 | `test_set_manifest.json` | `05fe7486608a42bdd1afa1f089e58f39a1017b23ed4fd841db5b30d5b6658d7d` |
 | `summary.json` | `7ab8bd1f5b679690c9fad87e5c87d929128310c831ef5bc787b9405d9aaa89e6` |
 | `crosscheck.json` | `68dc293442e97eaabb92aad777546e185ed105ee45019c6886c7c82c1917210f` |
-| `recompute_config.json` | `1e8772da81d8853a7c67d15cda90c3418b97677657bf5e5663410486a8b94265` |
+| `recompute_config.json` | `af8534d4c3741759a9f779a763d6a66e175f0b266636ab7fb201ad8adc8d47bd` |
 | `input_file_manifest.json` | `dafaea92e8b25311edb1d9219a5b197f905a324d182966ada6a86df793463d1a` |
 
 ## 8. 对 P0.1 路线选择的输入
