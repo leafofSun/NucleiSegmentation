@@ -40,6 +40,7 @@ except ImportError:
     from torch.cuda.amp import GradScaler, autocast
 
 from DataLoader import UniversalDataset, stack_dict_batched
+from datasets.instance_dataset import InstanceNPZDataset, stack_instance_dict_batched
 from hover_loss import generate_hv_map_from_inst, msge_loss
 from metrics import SegMetrics
 from segment_anything import sam_model_registry
@@ -140,6 +141,12 @@ def parse_args():
     parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation")
 
     parser.add_argument("--data_path", type=str, default="data/PanNuke", help="Root directory of dataset")
+    parser.add_argument(
+        "--data_format",
+        choices=("legacy_json", "instance_npz"),
+        default="legacy_json",
+        help="Dataset representation; instance_npz selects the lossless R1 pipeline.",
+    )
     parser.add_argument(
         "--knowledge_path",
         type=str,
@@ -478,8 +485,8 @@ def parse_args():
     parser.add_argument(
         "--min_instance_area",
         type=int,
-        default=8,
-        help="Minimum instance area in pixels; smaller instances are filtered out (default: 8).",
+        default=0,
+        help="Training-time minimum instance area; R1 data itself remains lossless (default: 0).",
     )
 
     parser.add_argument("--epochs", type=int, default=300)
@@ -5428,7 +5435,16 @@ def main(args):
         _use_sb_attrs = bool(getattr(args, "use_structure_boundary_attrs", False))
         _sb_attr_path = getattr(args, "structure_boundary_attr_path", None)
 
-        train_dataset = UniversalDataset(
+        dataset_class = (
+            InstanceNPZDataset if args.data_format == "instance_npz" else UniversalDataset
+        )
+        dataset_collate = (
+            stack_instance_dict_batched
+            if args.data_format == "instance_npz"
+            else stack_dict_batched
+        )
+
+        train_dataset = dataset_class(
             data_root=args.data_path,
             knowledge_path=args.knowledge_path,
             image_size=args.image_size,
@@ -5448,7 +5464,7 @@ def main(args):
             local_region_thresholds_path=getattr(args, "local_region_thresholds_path", None),
             local_region_audit=bool(getattr(args, "local_region_audit", False)),
         )
-        val_dataset = UniversalDataset(
+        val_dataset = dataset_class(
             data_root=args.data_path,
             knowledge_path=args.knowledge_path,
             image_size=args.image_size,
@@ -5516,7 +5532,7 @@ def main(args):
             batch_size=args.batch_size,
             shuffle=(train_sampler is None),
             num_workers=train_num_workers,
-            collate_fn=stack_dict_batched,
+            collate_fn=dataset_collate,
             pin_memory=args.pin_memory,
             sampler=train_sampler,
             persistent_workers=train_persistent,
@@ -5527,7 +5543,7 @@ def main(args):
             batch_size=1,
             shuffle=(val_sampler is None),
             num_workers=val_workers,
-            collate_fn=stack_dict_batched,
+            collate_fn=dataset_collate,
             pin_memory=args.pin_memory,
             sampler=val_sampler,
             persistent_workers=val_persistent,
