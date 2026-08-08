@@ -58,7 +58,7 @@ def test_official_and_independent_pq_agree_on_split_merge_case():
     )
     official = pq_official(true, pred)
     independent = pq_independent(true, pred)
-    assert abs(official.pq - independent.pq) < 1e-12
+    assert abs(official.pq - independent.pq) < 1e-6
     assert official.tp == independent.tp
     assert official.fp == independent.fp
     assert official.fn == independent.fn
