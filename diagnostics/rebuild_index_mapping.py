@@ -170,6 +170,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--expected-converted-count", type=int, default=2607)
     parser.add_argument("--minimum-match-rate", type=float, default=0.95)
+    parser.add_argument("--source-url", default="UNVERIFIED")
+    parser.add_argument("--retrieval-url", default="UNVERIFIED")
+    parser.add_argument("--source-revision", default="UNVERIFIED")
+    parser.add_argument("--source-linked-etag", default="UNVERIFIED")
     return parser.parse_args()
 
 
@@ -248,6 +252,10 @@ def main() -> int:
         "cpu_only": True,
         "raw_parquet": str(args.raw_parquet.resolve()),
         "raw_parquet_sha256": sha256_file(args.raw_parquet),
+        "source_url": args.source_url,
+        "retrieval_url": args.retrieval_url,
+        "source_revision": args.source_revision,
+        "source_linked_etag": args.source_linked_etag,
         "raw_sample_count": len(raw_fold),
         "converted_dir": str(args.converted_dir.resolve()),
         "converted_sample_count": len(converted_paths),
@@ -285,6 +293,19 @@ def main() -> int:
     print("[DIAG_CONFIG] " + json.dumps(config, sort_keys=True), flush=True)
     write_json(args.output_dir / "index_mapping.json", mapping)
     write_json(args.output_dir / "mapping_summary.json", summary)
+    write_json(
+        args.output_dir / "source_provenance.json",
+        {
+            "source_url": args.source_url,
+            "retrieval_url": args.retrieval_url,
+            "source_revision": args.source_revision,
+            "source_linked_etag": args.source_linked_etag,
+            "downloaded_file": str(args.raw_parquet.resolve()),
+            "downloaded_file_sha256": summary["raw_parquet_sha256"],
+            "downloaded_file_size_bytes": args.raw_parquet.stat().st_size,
+            "raw_sample_count": len(raw_fold),
+        },
+    )
     write_json(args.output_dir / "raw_duplicate_hashes.json", raw_duplicates)
     write_json(args.output_dir / "converted_duplicate_hashes.json", converted_duplicates)
     print("[MAPPING_RESULT] " + json.dumps(summary, sort_keys=True), flush=True)
