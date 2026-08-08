@@ -154,9 +154,8 @@ def pq_official(
     denominator = tp + 0.5 * fp + 0.5 * fn
     dq = float(tp / denominator) if denominator else 1.0
     matched_iou_sum = float(paired_iou.sum())
-    # Upstream uses tp + 1e-6. Its only observable effect is when tp == 0,
-    # where both forms return zero; using the exact quotient avoids biasing SQ.
-    sq = matched_iou_sum / tp if tp else 0.0
+    # Preserve HoVer-Net/PanNuke's published numerical convention exactly.
+    sq = matched_iou_sum / (tp + 1.0e-6)
     return PQResult(dq, sq, dq * sq, tp, fp, fn, matched_iou_sum)
 
 

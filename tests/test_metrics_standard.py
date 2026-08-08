@@ -20,7 +20,8 @@ def test_remap_label_handles_gapped_ids():
 def test_perfect_match_scores_one_with_noncontiguous_ids():
     true = np.array([[0, 2, 2], [0, 0, 7]], dtype=np.int32)
     pred = np.array([[0, 9, 9], [0, 0, 4]], dtype=np.int32)
-    assert pq_official(true, pred).pq == 1.0
+    # The public HoVer-Net/PanNuke implementation divides SQ by TP + 1e-6.
+    assert abs(pq_official(true, pred).pq - 1.0) < 1e-6
     assert pq_independent(true, pred).pq == 1.0
     assert aji_kumar_greedy(true, pred) == 1.0
     assert aji_plus(true, pred) == 1.0
