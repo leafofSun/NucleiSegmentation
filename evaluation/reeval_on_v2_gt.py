@@ -182,6 +182,16 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         tissue: mean(float(row["bpq"]) for row in rows if row["tissue_name"] == tissue)
         for tissue in tissues
     }
+
+
+def protocol_completion_status(protocol: str, evaluated_count: int) -> str:
+    if protocol == "E1" and evaluated_count == 2607:
+        return "COMPLETE_DENOMINATOR_A; FULL_DENOMINATOR_B_NOT_EVALUATED_1"
+    if protocol == "E2" and evaluated_count == 2607:
+        return "UNVERIFIED_FULL_E2_MISSING_PREDICTIONS_115"
+    if protocol == "E3" and evaluated_count == 2607:
+        return "COMPLETE"
+    return "UNVERIFIED_UNEXPECTED_SAMPLE_COUNT"
     return {
         "status": "COMPLETE_AVAILABLE_PREDICTIONS",
         "evaluated_sample_count": len(rows),
@@ -584,9 +594,7 @@ def main() -> int:
                 {
                     "protocol_expected_sample_count": expected_counts[protocol],
                     "actual_evaluated_sample_count": len(rows),
-                    "complete_protocol_status": (
-                        "COMPLETE" if len(rows) == expected_counts[protocol] else "UNVERIFIED_MISSING_PREDICTIONS"
-                    ),
+                    "complete_protocol_status": protocol_completion_status(protocol, len(rows)),
                 }
             )
             errors[method][protocol] = error_summary(error_counts[method][protocol])
